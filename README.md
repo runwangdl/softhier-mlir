@@ -11,21 +11,40 @@ leaving a **thin `softhier` dialect** for only the irreducible hardware ops.
 Backend reuse follows [`snax-mlir`](https://github.com/KULeuven-MICAS/snax-mlir)
 (Snitch/RISC-V dialects) rather than a from-scratch codegen.
 
-> Status: **early scaffold (iteration 1).** The `softhier` dialect parses,
-> verifies, and round-trips. Lowering passes are next. See
-> [`docs/DESIGN.md`](docs/DESIGN.md).
+> Status: **working end-to-end.** A network's GEMMs written in standard
+> `linalg.matmul` lower to the `softhier` dialect, generate C against the SoftHier
+> `flex_` runtime, and run on GVSoC with numerically-verified results — including
+> a 2-layer MLP and multi-tile (512³) GEMMs. See [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## Working end-to-end pipeline
+
+```
+linalg.matmul  --softhier-opt -p linalg-to-softhier-->  softhier dialect
+               --softhier-translate-->  main.c (flex_ runtime)
+               --SDK build + GVSoC-->  runs, self-checks (MLP_PASS / GEMM_PASS)
+```
+
+Verified on GVSoC (`../softhier/gvsoc`, RedMule traces + on-device checks):
+- **256³ GEMM** — one RedMule tile.
+- **2-layer MLP** `Z = ReLU(X@W1)@W2` — two chained GEMMs, `MLP_PASS` (all outputs 1.0).
+- **512³ GEMM** — tiled loop-nest, 8 RedMule tiles with K-accumulation, `GEMM_PASS`.
+- **linalg-form** of the MLP and the 512³ GEMM — lower + run, same results.
+- **non-constant input** (col-parity X) — `GEMM_PASS` (Z=0.75), correctness beyond constants.
 
 ## The `softhier` dialect
 
 | Op | Meaning |
 |---|---|
-| `softhier.redmule %x, %w into %y {fmt}` | RedMule GEMM, in-place `y += x·w` |
+| `softhier.redmule %x, %w into %y {fmt}` | RedMule GEMM tile, in-place `y += x·w` |
+| `softhier.gemm %x, %w into %z {fmt}` | full (multi-tile) HBM GEMM; backend tiles it |
 | `softhier.dma_2d %src -> %dst` | strided HBM↔TCDM copy |
-| `softhier.dma_broadcast %src -> %dst` | multicast along a mesh row/col (SUMMA) |
-| `softhier.dma_reduce %src -> %dst {kind}` | in-network REDADD/REDMAX |
+| `softhier.dma_broadcast` / `dma_reduce {kind}` | mesh row/col multicast / in-network REDADD·REDMAX |
 | `softhier.group_barrier {grid_x,grid_y}` | two-phase XY group barrier |
+| `softhier.relu` / `vexp` / `transpose` | Spatz ReLU / `vfexp` / transpose engine |
+| `softhier.l1_zero` / `l1_fill` / `l1_buffer` | TCDM tile clear / fill / declare |
+| `softhier.hbm_buffer` / `hbm_fill` / `hbm_fill_col_parity` | HBM buffer declare / fill |
+| `softhier.check_const` / `hbm_check_const` | on-device self-verify (prints PASS/FAIL) |
 | `softhier.cluster_pos` | this cluster's (x,y) |
-| `softhier.transpose` / `softhier.vexp` | transpose engine / Spatz `vfexp` |
 
 Memref memory spaces select the physical space / HBM edge:
 `"tcdm"`, `"remote_tcdm"`, `"hbm_west" | "hbm_south" | "hbm_north" | "hbm_east"`.
@@ -36,9 +55,16 @@ Memref memory spaces select the physical space / HBM edge:
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 
-# parse + verify + reprint the example SUMMA GEMM tile
-softhier-opt tests/filecheck/gemm_tile.mlir
+# lower a standard-linalg 512^3 GEMM onto SoftHier, then emit runnable C
+softhier-opt examples/gemm512_linalg.mlir -p linalg-to-softhier | \
+  softhier-translate /dev/stdin      # (or: -o main.c)
+
+# run the FileCheck suite
+for f in tests/filecheck/*.mlir; do echo "$f"; done   # see each file's RUN line
 ```
+
+To run generated C on GVSoC, drop it into `soft_hier_sdk/generated/<name>/`
+(with a one-line CMakeLists) and `make sh-old-hs app=... && make sh-old-run`.
 
 ## Layout
 
