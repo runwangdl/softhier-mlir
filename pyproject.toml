@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "softhier-mlir"
+version = "0.0.1"
+description = "An xDSL/MLIR dialect and lowering flow for the SoftHier RISC-V many-cluster accelerator"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Run Wang" }]
+dependencies = ["xdsl>=0.69"]
+
+[project.optional-dependencies]
+dev = ["pytest", "filecheck", "lit"]
+
+[project.scripts]
+softhier-opt = "softhier_mlir.tools.softhier_opt:main"
+
+[tool.setuptools.packages.find]
+include = ["softhier_mlir*"]
