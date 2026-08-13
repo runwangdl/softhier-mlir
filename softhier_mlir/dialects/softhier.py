@@ -187,6 +187,50 @@ class L1FillOp(IRDLOperation):
 
 
 @irdl_op_definition
+class GemmOp(IRDLOperation):
+    """A full (multi-tile) GEMM ``z = x @ w`` on HBM-resident matrices.
+
+    The backend tiles it into 256x256x256 RedMule ops with K-accumulation and
+    per-tile HBM<->TCDM DMA (matrices assumed tile-major in HBM). ``x``:MxK,
+    ``w``:KxN, ``z``:MxN.
+    """
+
+    name = "softhier.gemm"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    w = operand_def(MemRefType)
+    z = operand_def(MemRefType)
+    fmt = prop_def(StringAttr)
+    assembly_format = (
+        "$x `,` $w `into` $z attr-dict `:` type($x) `,` type($w) `,` type($z)"
+    )
+
+
+@irdl_op_definition
+class HbmFillOp(IRDLOperation):
+    """Fill an HBM matrix with a constant fp16 bit pattern (tile by tile)."""
+
+    name = "softhier.hbm_fill"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
+    value_bits = prop_def(IntegerAttr)
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
+class HbmCheckConstOp(IRDLOperation):
+    """Verify an HBM matrix ~= ``value_bits`` (fp16) within ``tol`` ULPs, tile by
+    tile; prints ``GEMM_PASS`` / ``GEMM_FAIL``."""
+
+    name = "softhier.hbm_check_const"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
+    value_bits = prop_def(IntegerAttr)
+    tol = prop_def(IntegerAttr)
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
 class CheckConstOp(IRDLOperation):
     """Verify every element of a TCDM tile equals ``value_bits`` (fp16) within
     ``tol`` ULPs; prints ``MLP_PASS`` / ``MLP_FAIL`` via the runtime log."""
@@ -242,6 +286,9 @@ SoftHier = Dialect(
         L1ZeroOp,
         L1FillOp,
         CheckConstOp,
+        GemmOp,
+        HbmFillOp,
+        HbmCheckConstOp,
     ],
     [],
 )
