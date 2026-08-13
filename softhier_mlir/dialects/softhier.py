@@ -176,6 +176,19 @@ class L1ZeroOp(IRDLOperation):
 
 
 @irdl_op_definition
+class L1AddOp(IRDLOperation):
+    """Elementwise add of two TCDM tiles, in place: ``dst += src`` (fp16).
+
+    Useful for residual/bias adds when composing layers.
+    """
+
+    name = "softhier.l1_add"
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    assembly_format = "$src `into` $dst attr-dict `:` type($src) `,` type($dst)"
+
+
+@irdl_op_definition
 class L1FillOp(IRDLOperation):
     """Fill a TCDM tile with a constant fp16 bit pattern (for test inputs)."""
 
@@ -298,6 +311,7 @@ SoftHier = Dialect(
         VExpOp,
         ReluOp,
         L1ZeroOp,
+        L1AddOp,
         L1FillOp,
         CheckConstOp,
         GemmOp,

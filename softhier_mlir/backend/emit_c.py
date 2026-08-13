@@ -23,6 +23,7 @@ from softhier_mlir.dialects.softhier import (
     HbmCheckConstOp,
     HbmFillColParityOp,
     HbmFillOp,
+    L1AddOp,
     L1BufferOp,
     L1FillOp,
     L1ZeroOp,
@@ -252,6 +253,19 @@ def emit_kernel(fn: func.FuncOp, bufs: _Buffers) -> str:
             b("    if (flex_is_first_core() && flex_get_cluster_id() == 0) {")
             b(f'        flex_print((char *)"GEMM_CHECK ok="); flex_print_int({ok});')
             b(f'        flex_print((char *)({ok} == {total} ? " GEMM_PASS\\n" : " GEMM_FAIL\\n"));')
+            b("    }")
+            b("    flex_intra_cluster_sync();")
+
+        elif isinstance(op, L1AddOp):
+            src_off = bufs.raw_off(op.src)
+            dst_off = bufs.raw_off(op.dst)
+            n = _nelem(bufs.memref(op.dst))
+            a, d, i = f"a{ew}", f"d{ew}", f"i{ew}"
+            ew += 1
+            b("    if (flex_is_first_core()) {  // dst += src (fp16)")
+            b(f"        volatile _Float16 *{a} = (volatile _Float16 *)local({src_off});")
+            b(f"        volatile _Float16 *{d} = (volatile _Float16 *)local({dst_off});")
+            b(f"        for (int {i} = 0; {i} < {n}; ++{i}) {d}[{i}] += {a}[{i}];")
             b("    }")
             b("    flex_intra_cluster_sync();")
 
