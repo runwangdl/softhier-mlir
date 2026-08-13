@@ -218,6 +218,20 @@ class HbmFillOp(IRDLOperation):
 
 
 @irdl_op_definition
+class HbmFillColParityOp(IRDLOperation):
+    """Fill an HBM matrix with a column-parity pattern: even columns get
+    ``even_bits``, odd columns get ``odd_bits`` (fp16). A non-uniform input for
+    correctness testing beyond constants."""
+
+    name = "softhier.hbm_fill_col_parity"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
+    even_bits = prop_def(IntegerAttr)
+    odd_bits = prop_def(IntegerAttr)
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
 class HbmCheckConstOp(IRDLOperation):
     """Verify an HBM matrix ~= ``value_bits`` (fp16) within ``tol`` ULPs, tile by
     tile; prints ``GEMM_PASS`` / ``GEMM_FAIL``."""
@@ -288,6 +302,7 @@ SoftHier = Dialect(
         CheckConstOp,
         GemmOp,
         HbmFillOp,
+        HbmFillColParityOp,
         HbmCheckConstOp,
     ],
     [],

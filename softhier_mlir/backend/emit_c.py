@@ -21,6 +21,7 @@ from softhier_mlir.dialects.softhier import (
     GroupBarrierOp,
     HbmBufferOp,
     HbmCheckConstOp,
+    HbmFillColParityOp,
     HbmFillOp,
     L1BufferOp,
     L1FillOp,
@@ -206,6 +207,22 @@ def emit_kernel(fn: func.FuncOp, bufs: _Buffers) -> str:
             b(f"    // fill HBM {rows}x{cols} = fp16 {v} ({ntiles} tiles)")
             b(f"    if (flex_is_first_core()) {{ volatile uint16_t *fp = (volatile uint16_t *)local(0);"
               f" for (int {i} = 0; {i} < {_T * _T}; ++{i}) fp[{i}] = {v}u; }}")
+            b("    flex_intra_cluster_sync();")
+            b(f"    if (flex_is_dm_core()) for (int {t} = 0; {t} < {ntiles}; ++{t}) {{"
+              f" flex_dma_async_1d(hbm_addr({hb} + {t}*{_TB}), local(0), {_TB}); flex_dma_async_wait_all(); }}")
+            b("    flex_intra_cluster_sync();")
+
+        elif isinstance(op, HbmFillColParityOp):
+            hb = bufs.raw_off(op.buf)
+            rows, cols = bufs.memref(op.buf).get_shape()
+            ntiles = (rows // _T) * (cols // _T)
+            ev = op.even_bits.value.data & 0xFFFF
+            od = op.odd_bits.value.data & 0xFFFF
+            t, i = f"t{ew}", f"i{ew}"
+            ew += 1
+            b(f"    // fill HBM {rows}x{cols} col-parity even={ev}/odd={od} ({ntiles} tiles)")
+            b(f"    if (flex_is_first_core()) {{ volatile uint16_t *fp = (volatile uint16_t *)local(0);"
+              f" for (int {i} = 0; {i} < {_T * _T}; ++{i}) fp[{i}] = ({i} % 2 == 0) ? {ev}u : {od}u; }}")
             b("    flex_intra_cluster_sync();")
             b(f"    if (flex_is_dm_core()) for (int {t} = 0; {t} < {ntiles}; ++{t}) {{"
               f" flex_dma_async_1d(hbm_addr({hb} + {t}*{_TB}), local(0), {_TB}); flex_dma_async_wait_all(); }}")
