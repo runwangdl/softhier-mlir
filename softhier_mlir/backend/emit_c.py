@@ -188,31 +188,62 @@ def emit_kernel(fn: func.FuncOp, bufs: _Buffers, multi: bool = False) -> str:
                 # from the multi-cluster prologue. Diagonal clusters load X (row)
                 # and W (col) panels from HBM and broadcast along their row/column.
                 ks, ns = k, n
-                lx, lw, lz = 0, _TB, 2 * _TB
                 cxrow, cwkstep, czrow = _T * ks * 2, _T * ns * 2, _T * ns * 2
-                b(f"    // SUMMA GEMM {m}x{n}x{k}: cluster (px,py) owns Z[py,px], {kt} K-steps, mesh-wide")
-                b("    flex_global_barrier_xy();  // ensure HBM inputs are filled")
-                b(f"    if (flex_is_dm_core()) {{ flex_dma_async_1d(local({lz}), zomem(0), {_TB}); flex_dma_async_wait_all(); }}  // zero Z acc")
-                b("    grid_sync_group_barrier_xy(&grp);")
-                b(f"    for (int {kk} = 0; {kk} < {kt}; ++{kk}) {{")
-                b("        if (flex_is_dm_core() && px == py) {  // diagonal: load panels + broadcast")
-                b(f"            flex_dma_async_2d(local({lx}), hbm_addr({xb} + py*{cxrow} + {kk}*{_T * 2}), {_T * 2}, {_T * 2}, {ks * 2}, {_T});")
-                b("            flex_dma_async_wait_all();")
-                b(f"            flex_dma_async_broadcast(local({lx}), local({lx}), {_TB}, grp.wakeup_row_mask, ARCH_NUM_CLUSTER_Y - 1);")
-                b("            flex_dma_async_wait_all();")
-                b(f"            flex_dma_async_2d(local({lw}), hbm_addr({wb} + px*{_T * 2} + {kk}*{cwkstep}), {_T * 2}, {_T * 2}, {ns * 2}, {_T});")
-                b("            flex_dma_async_wait_all();")
-                b(f"            flex_dma_async_broadcast(local({lw}), local({lw}), {_TB}, ARCH_NUM_CLUSTER_X - 1, grp.wakeup_col_mask);")
-                b("            flex_dma_async_wait_all();")
-                b("        }")
-                b("        grid_sync_group_barrier_xy(&grp);")
-                b("        if (flex_is_first_core()) {")
-                b(f"            flex_redmule_config({_T}, {_T}, {_T});")
-                b(f"            flex_redmule_trigger({lx}, {lw}, {lz}, {fmt});")
-                b("            flex_redmule_wait();")
-                b("        }")
-                b("        grid_sync_group_barrier_xy(&grp);")
-                b("    }")
+
+                def _diag_load(xdst, wdst, kexpr):
+                    # diagonal cluster: load X/W panels for K-tile `kexpr` + broadcast
+                    b(f"            flex_dma_async_2d(local({xdst}), hbm_addr({xb} + py*{cxrow} + ({kexpr})*{_T * 2}), {_T * 2}, {_T * 2}, {ks * 2}, {_T});")
+                    b("            flex_dma_async_wait_all();")
+                    b(f"            flex_dma_async_broadcast(local({xdst}), local({xdst}), {_TB}, grp.wakeup_row_mask, ARCH_NUM_CLUSTER_Y - 1);")
+                    b("            flex_dma_async_wait_all();")
+                    b(f"            flex_dma_async_2d(local({wdst}), hbm_addr({wb} + px*{_T * 2} + ({kexpr})*{cwkstep}), {_T * 2}, {_T * 2}, {ns * 2}, {_T});")
+                    b("            flex_dma_async_wait_all();")
+                    b(f"            flex_dma_async_broadcast(local({wdst}), local({wdst}), {_TB}, ARCH_NUM_CLUSTER_X - 1, grp.wakeup_col_mask);")
+                    b("            flex_dma_async_wait_all();")
+
+                if not pipelined:
+                    lx, lw, lz = 0, _TB, 2 * _TB
+                    b(f"    // SUMMA GEMM {m}x{n}x{k}: cluster (px,py) owns Z[py,px], {kt} K-steps, mesh-wide")
+                    b("    flex_global_barrier_xy();  // ensure HBM inputs are filled")
+                    b(f"    if (flex_is_dm_core()) {{ flex_dma_async_1d(local({lz}), zomem(0), {_TB}); flex_dma_async_wait_all(); }}  // zero Z acc")
+                    b("    grid_sync_group_barrier_xy(&grp);")
+                    b(f"    for (int {kk} = 0; {kk} < {kt}; ++{kk}) {{")
+                    b("        if (flex_is_dm_core() && px == py) {  // diagonal: load panels + broadcast")
+                    _diag_load(lx, lw, kk)
+                    b("        }")
+                    b("        grid_sync_group_barrier_xy(&grp);")
+                    b("        if (flex_is_first_core()) {")
+                    b(f"            flex_redmule_config({_T}, {_T}, {_T});")
+                    b(f"            flex_redmule_trigger({lx}, {lw}, {lz}, {fmt});")
+                    b("            flex_redmule_wait();")
+                    b("        }")
+                    b("        grid_sync_group_barrier_xy(&grp);")
+                    b("    }")
+                else:
+                    # Modulo-scheduled SUMMA: prefetch K-tile k+1's diagonal
+                    # load+broadcast while RedMule computes K-tile k. X/W double-
+                    # buffered (x0/x1, w0/w1); Z accumulator single. 5 tiles < 1MB.
+                    x0, x1, w0, w1, lz = 0, _TB, 2 * _TB, 3 * _TB, 4 * _TB
+                    b(f"    // SUMMA GEMM {m}x{n}x{k}: mesh-wide, SW-pipelined (double-buffered K)")
+                    b("    flex_global_barrier_xy();  // ensure HBM inputs are filled")
+                    b(f"    if (flex_is_dm_core()) {{ flex_dma_async_1d(local({lz}), zomem(0), {_TB}); flex_dma_async_wait_all(); }}  // zero Z acc")
+                    b("    if (flex_is_dm_core() && px == py) {  // prologue: prime buffer 0 with K-tile 0")
+                    _diag_load(x0, w0, "0")
+                    b("    }")
+                    b("    grid_sync_group_barrier_xy(&grp);")
+                    b(f"    for (int {kk} = 0; {kk} < {kt}; ++{kk}) {{")
+                    b(f"        uint32_t xcur = ({kk} & 1) ? {x1} : {x0}, wcur = ({kk} & 1) ? {w1} : {w0};")
+                    b(f"        uint32_t xnxt = ({kk} & 1) ? {x0} : {x1}, wnxt = ({kk} & 1) ? {w0} : {w1};")
+                    b(f"        if (flex_is_dm_core() && px == py && {kk} + 1 < {kt}) {{  // prefetch next K-tile (overlaps compute)")
+                    _diag_load("xnxt", "wnxt", f"{kk}+1")
+                    b("        }")
+                    b("        if (flex_is_first_core()) {")
+                    b(f"            flex_redmule_config({_T}, {_T}, {_T});")
+                    b(f"            flex_redmule_trigger(xcur, wcur, {lz}, {fmt});")
+                    b("            flex_redmule_wait();")
+                    b("        }")
+                    b("        grid_sync_group_barrier_xy(&grp);")
+                    b("    }")
                 b(f"    if (flex_is_dm_core()) {{ flex_dma_async_2d(hbm_addr({zb} + py*{czrow} + px*{_T * 2}), local({lz}), {_T * 2}, {ns * 2}, {_T * 2}, {_T}); flex_dma_async_wait_all(); }}  // store Z tile")
                 b("    grid_sync_group_barrier_xy(&grp);")
             elif not pipelined:
