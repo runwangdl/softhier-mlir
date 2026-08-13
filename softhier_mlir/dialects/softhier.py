@@ -158,6 +158,48 @@ class VExpOp(IRDLOperation):
 
 
 @irdl_op_definition
+class ReluOp(IRDLOperation):
+    """Elementwise ReLU over a TCDM tile, in place (``x = max(0, x)``)."""
+
+    name = "softhier.relu"
+    buf = operand_def(MemRefType)
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
+class L1ZeroOp(IRDLOperation):
+    """Zero a TCDM tile (RedMule accumulates into ``y``, so clear it first)."""
+
+    name = "softhier.l1_zero"
+    buf = operand_def(MemRefType)
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
+class L1FillOp(IRDLOperation):
+    """Fill a TCDM tile with a constant fp16 bit pattern (for test inputs)."""
+
+    name = "softhier.l1_fill"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
+    value_bits = prop_def(IntegerAttr)  # raw 16-bit fp16 pattern
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
+class CheckConstOp(IRDLOperation):
+    """Verify every element of a TCDM tile equals ``value_bits`` (fp16) within
+    ``tol`` ULPs; prints ``MLP_PASS`` / ``MLP_FAIL`` via the runtime log."""
+
+    name = "softhier.check_const"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
+    value_bits = prop_def(IntegerAttr)
+    tol = prop_def(IntegerAttr)
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
 class HbmBufferOp(IRDLOperation):
     """Declares an HBM buffer at a fixed byte ``offset`` from the HBM base.
 
@@ -196,6 +238,10 @@ SoftHier = Dialect(
         ClusterPosOp,
         TransposeOp,
         VExpOp,
+        ReluOp,
+        L1ZeroOp,
+        L1FillOp,
+        CheckConstOp,
     ],
     [],
 )
