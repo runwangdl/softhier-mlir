@@ -14,7 +14,11 @@ Backend reuse follows [`snax-mlir`](https://github.com/KULeuven-MICAS/snax-mlir)
 > Status: **working end-to-end.** A network's GEMMs written in standard
 > `linalg.matmul` lower to the `softhier` dialect, generate C against the SoftHier
 > `flex_` runtime, and run on GVSoC with numerically-verified results — including
-> a 2-layer MLP and multi-tile (512³) GEMMs. See [`docs/DESIGN.md`](docs/DESIGN.md).
+> a 2-layer MLP and multi-tile (512³) GEMMs.
+
+**Docs:** [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — how to generate & run, and how to
+add a new op (step by step) · [`docs/DESIGN.md`](docs/DESIGN.md) — the dialect
+abstraction and lowering pipeline.
 
 ## Working end-to-end pipeline
 
