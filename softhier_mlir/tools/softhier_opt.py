@@ -10,12 +10,17 @@ from __future__ import annotations
 from xdsl.xdsl_opt_main import xDSLOptMain
 
 from softhier_mlir.dialects.softhier import SoftHier
+from softhier_mlir.transforms.linalg_to_softhier import LinalgToSoftHier
 
 
 class SoftHierOptMain(xDSLOptMain):
     def register_all_dialects(self) -> None:
         super().register_all_dialects()
-        self.ctx.load_dialect(SoftHier)
+        self.ctx.load_dialect(SoftHier)  # linalg et al. already registered by base
+
+    def register_all_passes(self) -> None:
+        super().register_all_passes()
+        self.register_pass(LinalgToSoftHier.name, lambda: LinalgToSoftHier)
 
 
 def main() -> None:
