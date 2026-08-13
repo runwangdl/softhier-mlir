@@ -17,6 +17,7 @@ dev = ["pytest", "filecheck", "lit"]
 
 [project.scripts]
 softhier-opt = "softhier_mlir.tools.softhier_opt:main"
+softhier-translate = "softhier_mlir.tools.softhier_translate:main"
 
 [tool.setuptools.packages.find]
 include = ["softhier_mlir*"]

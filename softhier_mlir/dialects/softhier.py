@@ -157,9 +157,37 @@ class VExpOp(IRDLOperation):
     assembly_format = "$src `->` $dst attr-dict `:` type($src) `->` type($dst)"
 
 
+@irdl_op_definition
+class HbmBufferOp(IRDLOperation):
+    """Declares an HBM buffer at a fixed byte ``offset`` from the HBM base.
+
+    Codegen resolves uses of the result to ``hbm_addr(offset)``.
+    """
+
+    name = "softhier.hbm_buffer"
+    irdl_options = (ParsePropInAttrDict(),)
+    offset = prop_def(IntegerAttr)
+    result = result_def(MemRefType)
+    assembly_format = "attr-dict `:` type($result)"
+
+
+@irdl_op_definition
+class L1BufferOp(IRDLOperation):
+    """Declares a TCDM (L1) tile buffer; codegen bump-allocates its offset.
+
+    Resolves to ``local(offset)`` in the emitted C.
+    """
+
+    name = "softhier.l1_buffer"
+    result = result_def(MemRefType)
+    assembly_format = "attr-dict `:` type($result)"
+
+
 SoftHier = Dialect(
     "softhier",
     [
+        HbmBufferOp,
+        L1BufferOp,
         RedmuleOp,
         Dma2DOp,
         DmaBroadcastOp,
