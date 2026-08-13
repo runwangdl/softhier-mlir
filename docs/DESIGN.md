@@ -138,6 +138,37 @@ policy out of the mechanical rewrite.
 
 ---
 
+## 4b. Scheduling (HLS-style) — and why a cost model is needed
+
+The backend expands `softhier.gemm` into a tile loop-nest. Two scheduling
+knobs so far, plus a lesson:
+
+- **`pipeline-gemm` pass** (decide) marks gemms; the backend (apply) then
+  software-pipelines the K-loop — double-buffered, prefetch K-tile `k+1` on the
+  DM core while RedMule computes K-tile `k` on the first core. This is textbook
+  modulo scheduling: per-step wall time → `max(t_dma, t_redmule)` instead of the
+  sum. Measured: the intra-tile K-step gap dropped 4145 ns → 21 ns.
+- **DMA-zeroing**: RedMule accumulates, so each output tile's accumulator is
+  cleared first. Doing it with a scalar loop (65536 fp16 stores on one core) cost
+  ~200 µs/tile and *dominated* everything. Zeroing via one iDMA from the ZOMEM
+  region instead is ~an iDMA burst.
+
+**The lesson (this is what motivates the ILP / a cost model):** naively turning
+on `pipeline-gemm` first *regressed* the 512³ GEMM — because the real bottleneck
+was the scalar zeroing, not compute-under-DMA, and the pipeline's prologue added
+overhead. Only after fixing the dominant cost did pipelining pay off:
+
+| 512³ GEMM (GEMM-phase span) | serial, scalar-zero | serial, zomem-zero | + pipelined |
+|---|---|---|---|
+| span | 662 µs | 73 µs (**9×**) | 56.6 µs (**+22%**) |
+
+So *whether* a scheduling transform helps depends on the DMA-vs-compute-vs-fixed
+balance and K-depth — which you cannot know without measuring or modeling. That
+is exactly the job of a **static cost model** feeding the decide/apply ILP:
+estimate `t_dma`, `t_redmule`, fixed costs, TCDM budget, RedMule queue-depth-1 and
+iDMA-16-outstanding limits, and choose tiling + which loops to pipeline + buffer
+depth to minimize estimated latency.
+
 ## 5. Roadmap
 
 - [x] Repo scaffold + `softhier` dialect stub (types + core ops) — **iteration 1**

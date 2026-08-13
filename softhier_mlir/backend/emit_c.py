@@ -125,14 +125,19 @@ def emit_kernel(fn: func.FuncOp, bufs: _Buffers) -> str:
             b("    }")
             b("    flex_intra_cluster_sync();")
 
-        elif isinstance(op, (L1ZeroOp, ReluOp, L1FillOp)):
+        elif isinstance(op, L1ZeroOp):
+            off = bufs.raw_off(op.buf)
+            nbytes = _bytes(bufs.memref(op.buf))
+            b(f"    if (flex_is_dm_core()) {{ flex_dma_async_1d(local({off}), zomem(0), {nbytes});"
+              f" flex_dma_async_wait_all(); }}  // zero via zomem (fast, iDMA)")
+            b("    flex_intra_cluster_sync();")
+
+        elif isinstance(op, (ReluOp, L1FillOp)):
             off = bufs.raw_off(op.buf)
             n = _nelem(bufs.memref(op.buf))
             p, i = f"p{ew}", f"i{ew}"
             ew += 1
-            if isinstance(op, L1ZeroOp):
-                stmt, comment = f"{p}[{i}] = 0;", "zero accumulator"
-            elif isinstance(op, ReluOp):
+            if isinstance(op, ReluOp):
                 stmt = f"if ({p}[{i}] & 0x8000u) {p}[{i}] = 0;"
                 comment = "relu (fp16: clear negatives)"
             else:  # L1FillOp
@@ -169,34 +174,78 @@ def emit_kernel(fn: func.FuncOp, bufs: _Buffers) -> str:
             _k2, n = bufs.memref(op.w).get_shape()
             mt, nt, kt = m // _T, n // _T, k // _T
             fmt = _FMT.get(op.fmt.data, "REDMULE_FP_16")
+            pipelined = "pipeline" in op.attributes
             r, c, kk = f"r{ew}", f"c{ew}", f"k{ew}"
             ew += 1
-            b(f"    // GEMM {m}x{n}x{k}: {mt}x{nt} output tiles, {kt} K-steps")
-            b(f"    for (int {r} = 0; {r} < {mt}; ++{r})")
-            b(f"    for (int {c} = 0; {c} < {nt}; ++{c}) {{")
-            b(f"        if (flex_is_first_core()) {{ volatile uint16_t *zt = "
-              f"(volatile uint16_t *)local({2 * _TB}); for (int t = 0; t < {_T * _T}; ++t) zt[t] = 0; }}")
-            b("        flex_intra_cluster_sync();")
-            b(f"        for (int {kk} = 0; {kk} < {kt}; ++{kk}) {{")
-            b("            if (flex_is_dm_core()) {")
-            b(f"                flex_dma_async_1d(local(0), hbm_addr({xb} + ({r}*{kt} + {kk})*{_TB}), {_TB});")
-            b(f"                flex_dma_async_1d(local({_TB}), hbm_addr({wb} + ({kk}*{nt} + {c})*{_TB}), {_TB});")
-            b("                flex_dma_async_wait_all();")
-            b("            }")
-            b("            flex_intra_cluster_sync();")
-            b("            if (flex_is_first_core()) {")
-            b(f"                flex_redmule_config({_T}, {_T}, {_T});")
-            b(f"                flex_redmule_trigger(0, {_TB}, {2 * _TB}, {fmt});")
-            b("                flex_redmule_wait();")
-            b("            }")
-            b("            flex_intra_cluster_sync();")
-            b("        }")
-            b("        if (flex_is_dm_core()) {")
-            b(f"            flex_dma_async_1d(hbm_addr({zb} + ({r}*{nt} + {c})*{_TB}), local({2 * _TB}), {_TB});")
-            b("            flex_dma_async_wait_all();")
-            b("        }")
-            b("        flex_intra_cluster_sync();")
-            b("    }")
+            if not pipelined:
+                # Serial: load -> wait -> compute -> wait, per K-tile.
+                # Scratch: X@0, W@TB, YZ@2*TB.
+                b(f"    // GEMM {m}x{n}x{k}: {mt}x{nt} output tiles, {kt} K-steps (serial)")
+                b(f"    for (int {r} = 0; {r} < {mt}; ++{r})")
+                b(f"    for (int {c} = 0; {c} < {nt}; ++{c}) {{")
+                b(f"        if (flex_is_dm_core()) {{ flex_dma_async_1d(local({2 * _TB}), zomem(0), {_TB});"
+                  f" flex_dma_async_wait_all(); }}  // zero YZ via zomem")
+                b("        flex_intra_cluster_sync();")
+                b(f"        for (int {kk} = 0; {kk} < {kt}; ++{kk}) {{")
+                b("            if (flex_is_dm_core()) {")
+                b(f"                flex_dma_async_1d(local(0), hbm_addr({xb} + ({r}*{kt} + {kk})*{_TB}), {_TB});")
+                b(f"                flex_dma_async_1d(local({_TB}), hbm_addr({wb} + ({kk}*{nt} + {c})*{_TB}), {_TB});")
+                b("                flex_dma_async_wait_all();")
+                b("            }")
+                b("            flex_intra_cluster_sync();")
+                b("            if (flex_is_first_core()) {")
+                b(f"                flex_redmule_config({_T}, {_T}, {_T});")
+                b(f"                flex_redmule_trigger(0, {_TB}, {2 * _TB}, {fmt});")
+                b("                flex_redmule_wait();")
+                b("            }")
+                b("            flex_intra_cluster_sync();")
+                b("        }")
+                b("        if (flex_is_dm_core()) {")
+                b(f"            flex_dma_async_1d(hbm_addr({zb} + ({r}*{nt} + {c})*{_TB}), local({2 * _TB}), {_TB});")
+                b("            flex_dma_async_wait_all();")
+                b("        }")
+                b("        flex_intra_cluster_sync();")
+                b("    }")
+            else:
+                # Software-pipelined K-loop: prefetch K-tile k+1 (DM core) while
+                # RedMule computes K-tile k (first core), so per-step wall time is
+                # max(t_dma, t_redmule) instead of the sum. Double-buffered X/W.
+                # Scratch: X0@0 X1@TB W0@2TB W1@3TB YZ@4TB (5 tiles, 640KB < 1MB TCDM).
+                x0, x1, w0, w1, yz = 0, _TB, 2 * _TB, 3 * _TB, 4 * _TB
+                b(f"    // GEMM {m}x{n}x{k}: {mt}x{nt} output tiles, {kt} K-steps (SW-pipelined, double-buffered)")
+                b(f"    for (int {r} = 0; {r} < {mt}; ++{r})")
+                b(f"    for (int {c} = 0; {c} < {nt}; ++{c}) {{")
+                b(f"        if (flex_is_dm_core()) {{ flex_dma_async_1d(local({yz}), zomem(0), {_TB});"
+                  f" flex_dma_async_wait_all(); }}  // zero YZ via zomem")
+                b("        flex_intra_cluster_sync();")
+                b("        // prologue: prime buffer 0 with K-tile 0")
+                b("        if (flex_is_dm_core()) {")
+                b(f"            flex_dma_async_1d(local({x0}), hbm_addr({xb} + ({r}*{kt} + 0)*{_TB}), {_TB});")
+                b(f"            flex_dma_async_1d(local({w0}), hbm_addr({wb} + (0*{nt} + {c})*{_TB}), {_TB});")
+                b("            flex_dma_async_wait_all();")
+                b("        }")
+                b("        flex_intra_cluster_sync();")
+                b(f"        for (int {kk} = 0; {kk} < {kt}; ++{kk}) {{")
+                b(f"            uint32_t xcur = ({kk} & 1) ? {x1} : {x0}, wcur = ({kk} & 1) ? {w1} : {w0};")
+                b(f"            uint32_t xnxt = ({kk} & 1) ? {x0} : {x1}, wnxt = ({kk} & 1) ? {w0} : {w1};")
+                b(f"            if (flex_is_dm_core() && {kk} + 1 < {kt}) {{  // issue next load, no wait (overlaps compute)")
+                b(f"                flex_dma_async_1d(local(xnxt), hbm_addr({xb} + ({r}*{kt} + {kk}+1)*{_TB}), {_TB});")
+                b(f"                flex_dma_async_1d(local(wnxt), hbm_addr({wb} + (({kk}+1)*{nt} + {c})*{_TB}), {_TB});")
+                b("            }")
+                b("            if (flex_is_first_core()) {  // compute current tile — runs while next tile DMAs")
+                b(f"                flex_redmule_config({_T}, {_T}, {_T});")
+                b(f"                flex_redmule_trigger(xcur, wcur, {yz}, {fmt});")
+                b("                flex_redmule_wait();")
+                b("            }")
+                b(f"            if (flex_is_dm_core() && {kk} + 1 < {kt}) flex_dma_async_wait_all();")
+                b("            flex_intra_cluster_sync();")
+                b("        }")
+                b("        if (flex_is_dm_core()) {")
+                b(f"            flex_dma_async_1d(hbm_addr({zb} + ({r}*{nt} + {c})*{_TB}), local({yz}), {_TB});")
+                b("            flex_dma_async_wait_all();")
+                b("        }")
+                b("        flex_intra_cluster_sync();")
+                b("    }")
 
         elif isinstance(op, HbmFillOp):
             hb = bufs.raw_off(op.buf)

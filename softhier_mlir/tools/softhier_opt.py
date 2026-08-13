@@ -11,6 +11,7 @@ from xdsl.xdsl_opt_main import xDSLOptMain
 
 from softhier_mlir.dialects.softhier import SoftHier
 from softhier_mlir.transforms.linalg_to_softhier import LinalgToSoftHier
+from softhier_mlir.transforms.pipeline_gemm import PipelineGemm
 
 
 class SoftHierOptMain(xDSLOptMain):
@@ -21,6 +22,7 @@ class SoftHierOptMain(xDSLOptMain):
     def register_all_passes(self) -> None:
         super().register_all_passes()
         self.register_pass(LinalgToSoftHier.name, lambda: LinalgToSoftHier)
+        self.register_pass(PipelineGemm.name, lambda: PipelineGemm)
 
 
 def main() -> None:
