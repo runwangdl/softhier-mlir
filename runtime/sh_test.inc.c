@@ -33,3 +33,67 @@ uint32_t sh_test_check_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint
     sh_printf("%s samples=%u bad=%u maxdiff=%f %s\n", tag, nsamples, bad, maxdiff, bad ? "FAIL" : "PASS");
     return bad;
 }
+
+/* ---- constant fills / checks used by the MLIR examples (cluster 0 does the work) ----------- */
+#define SH_SCRATCH_BYTES 0x10000u   /* top 64 KB of TCDM, used only by the test helpers */
+static inline uint32_t sh_scratch_off(void) { return ARCH_CLUSTER_TCDM_SIZE - SH_SCRATCH_BYTES; }
+
+/* HBM rows x cols (ld elements) = bits; even/odd column variant when odd_bits != 0xFFFFFFFF. */
+static void sh_fill_rows(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t even, uint32_t odd) {
+    if (flex_get_cluster_id() == 0) {
+        const uint32_t rowb = cols * 2, scr = sh_scratch_off();
+        if (flex_is_first_core()) {
+            volatile uint16_t *p = (volatile uint16_t *)local(scr);
+            for (uint32_t i = 0; i < cols; ++i) p[i] = (uint16_t)((odd != 0xFFFFFFFFu && (i & 1)) ? odd : even);
+        }
+        flex_intra_cluster_sync();
+        if (flex_is_dm_core()) {
+            for (uint32_t r = 0; r < rows; ++r) bare_dma_start_1d(a + (uint64_t)r * ld * 2, local(scr), rowb);
+            bare_dma_wait_all();
+        }
+        flex_intra_cluster_sync();
+    }
+    flex_global_barrier_xy();
+}
+void sh_test_fill_const_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t bits) {
+    sh_fill_rows(a, rows, cols, ld, bits, 0xFFFFFFFFu);
+}
+void sh_test_fill_colparity_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t even, uint32_t odd) {
+    sh_fill_rows(a, rows, cols, ld, even, odd);
+}
+/* Count HBM elements within tol (in fp16 ulps of the raw code) of bits; prints <tag>_CHECK / _PASS|_FAIL. */
+uint32_t sh_test_check_const_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t bits, uint32_t tol, const char *tag) {
+    uint32_t ok = 0;
+    flex_global_barrier_xy();   /* producer may be another cluster */
+    if (flex_get_cluster_id() == 0) {
+        const uint32_t rowb = cols * 2, scr = sh_scratch_off();
+        const uint32_t rows_per = SH_SCRATCH_BYTES / rowb ? SH_SCRATCH_BYTES / rowb : 1;
+        for (uint32_t r0 = 0; r0 < rows; r0 += rows_per) {
+            const uint32_t nr = (rows - r0) < rows_per ? (rows - r0) : rows_per;
+            if (flex_is_dm_core()) {
+                bare_dma_start_2d(local(scr), a + (uint64_t)r0 * ld * 2, rowb, rowb, ld * 2, nr);
+                bare_dma_wait_all();
+            }
+            flex_intra_cluster_sync();
+            if (flex_is_first_core()) {
+                volatile uint16_t *p = (volatile uint16_t *)local(scr);
+                for (uint32_t i = 0; i < nr * cols; ++i) { int d = (int)p[i] - (int)bits; if (d < 0) d = -d; if ((uint32_t)d <= tol) ok++; }
+            }
+            flex_intra_cluster_sync();
+        }
+        if (flex_is_first_core())
+            sh_printf("%s_CHECK ok=%u/%u %s_%s\n", tag, ok, rows * cols, tag, ok == rows * cols ? "PASS" : "FAIL");
+    }
+    flex_global_barrier_xy();
+    return ok;
+}
+uint32_t sh_test_check_const_l1_fp16(uint32_t off, uint32_t n, uint32_t bits, uint32_t tol, const char *tag) {
+    uint32_t ok = 0;
+    if (flex_get_cluster_id() == 0 && flex_is_first_core()) {
+        volatile uint16_t *p = (volatile uint16_t *)local(off);
+        for (uint32_t i = 0; i < n; ++i) { int d = (int)p[i] - (int)bits; if (d < 0) d = -d; if ((uint32_t)d <= tol) ok++; }
+        sh_printf("%s_CHECK ok=%u/%u %s_%s\n", tag, ok, n, tag, ok == n ? "PASS" : "FAIL");
+    }
+    flex_intra_cluster_sync();
+    return ok;
+}

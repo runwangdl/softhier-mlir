@@ -112,3 +112,74 @@ int sh_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t
     }
     return 0;
 }
+
+/* ---- mesh-wide output-stationary SUMMA ---------------------------------------------------------
+ * Cluster (px,py) owns output tile Z[py*T .. , px*T ..] (T = tm = tn). Diagonal clusters load the
+ * X row-panel / W column-panel K-tile from HBM and broadcast along their mesh row / column
+ * (in-network multicast, line rate, independent of the number of receivers); every cluster
+ * accumulates its tile on RedMulE over K. Requires a square mesh P x P, M = N = P*T, K % tk == 0.
+ * pipeline=1 double-buffers X/W and prefetches K-tile k+1 under RedMulE.
+ * TCDM: X0 [X1] W0 [W1] Y.  Must be called by all cores of all clusters. */
+int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
+                 uint32_t ldx, uint32_t ldw, uint32_t ldz, const sh_gemm_cfg *cfg) {
+    sh_gemm_cfg c; sh_cfg_fill(&c, cfg);
+    const uint32_t P = ARCH_NUM_CLUSTER_X;
+    const int first = flex_is_first_core(), dm = flex_is_dm_core();
+    const uint32_t cid = flex_get_cluster_id(), px = cid % P, py = cid / P;
+    const uint32_t T = c.tm;
+    if (ARCH_NUM_CLUSTER_Y != P || c.tn != T || M != P * T || N != P * T || K % c.tk) {
+        if (cid == 0 && first) sh_printf("[sh_gemm_mesh] need square mesh, tm==tn, M==N==P*tm, K%%tk==0 (got %ux%ux%u tile %ux%ux%u mesh %ux%u)\n",
+                                         M, N, K, c.tm, c.tn, c.tk, (uint32_t)ARCH_NUM_CLUSTER_X, (uint32_t)ARCH_NUM_CLUSTER_Y);
+        return -1;
+    }
+    if (sh_gemm_l1_bytes(M, N, K, &c) > ARCH_CLUSTER_TCDM_SIZE) {
+        if (cid == 0 && first) sh_printf("[sh_gemm_mesh] L1 budget exceeded\n");
+        return -2;
+    }
+    const uint32_t xb = T * c.tk * 2, wb = c.tk * T * 2, yb = T * T * 2;
+    const uint32_t x0 = c.l1_base, x1 = c.pipeline ? x0 + xb : x0;
+    const uint32_t w0 = x1 + xb,  w1 = c.pipeline ? w0 + wb : w0;
+    const uint32_t y  = w1 + wb;
+    const uint32_t KT = K / c.tk;
+    const redmule_compute_format_t fmt = sh_redmule_fmt[c.fmt & 3];
+    GridSyncGroupInfo grp = grid_sync_group_init(P, P);
+    /* collective masks are AND-masks on the cluster coordinates: ~(dim-1) = wildcard, dim-1 = exact */
+    const uint16_t row_wild = (uint16_t)grp.wakeup_row_mask, col_wild = (uint16_t)grp.wakeup_col_mask;
+    const uint16_t row_exact = (uint16_t)(ARCH_NUM_CLUSTER_X - 1), col_exact = (uint16_t)(ARCH_NUM_CLUSTER_Y - 1);
+    const uint64_t zt = z + ((uint64_t)py * T * ldz + px * T) * 2;
+
+    /* diagonal cluster: load K-tile kk of its X row-panel + W column-panel, multicast row / column */
+    #define SH_DIAG_LOAD(xdst, wdst, kk) do { \
+        sh_load_block_async(xdst, x + ((uint64_t)py * T * ldx + (kk) * c.tk) * 2, T, c.tk, ldx); \
+        sh_load_block_async(wdst, w + ((uint64_t)(kk) * c.tk * ldw + px * T) * 2, c.tk, T, ldw); \
+        bare_dma_wait_all(); \
+        /* one collective in flight at a time: two outstanding broadcasts from one DM core crash the \
+           gvsoc NoC model (segfault, checked 2026-10-08) */ \
+        flex_dma_async_broadcast(local(xdst), local(xdst), xb, row_wild, col_exact);  /* along my row    */ \
+        flex_dma_async_wait_all(); \
+        flex_dma_async_broadcast(local(wdst), local(wdst), wb, row_exact, col_wild);  /* along my column */ \
+        flex_dma_async_wait_all(); } while (0)
+
+    flex_global_barrier_xy();
+    if (first) flex_redmule_config(T, c.tk, T);
+    if (dm) { if (c.accumulate) { sh_load_block_async(y, zt, T, T, ldz); bare_dma_wait_all(); } else sh_l1_zero_dm(y, yb); }
+    if (dm && px == py) SH_DIAG_LOAD(x0, w0, 0);
+    grid_sync_group_barrier_xy(&grp);
+    for (uint32_t kk = 0; kk < KT; ++kk) {
+        const uint32_t xcur = (kk & 1) ? x1 : x0, wcur = (kk & 1) ? w1 : w0;
+        const uint32_t xnxt = (kk & 1) ? x0 : x1, wnxt = (kk & 1) ? w0 : w1;
+        if (c.pipeline) {
+            if (dm && px == py && kk + 1 < KT) SH_DIAG_LOAD(xnxt, wnxt, kk + 1);
+            if (first) { flex_redmule_trigger(xcur, wcur, y, fmt); flex_redmule_wait(); }
+        } else {
+            if (first) { flex_redmule_trigger(x0, w0, y, fmt); flex_redmule_wait(); }
+            grid_sync_group_barrier_xy(&grp);
+            if (dm && px == py && kk + 1 < KT) SH_DIAG_LOAD(x0, w0, kk + 1);
+        }
+        grid_sync_group_barrier_xy(&grp);
+    }
+    #undef SH_DIAG_LOAD
+    if (dm) sh_store_block_sync(zt, y, T, T, ldz);
+    flex_global_barrier_xy();
+    return 0;
+}

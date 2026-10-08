@@ -12,6 +12,6 @@ builtin.module {
     func.return
   }
 }
-// CHECK: ({{i[0-9]+}} % 2 == 0) ? 15360u : 14336u
-// CHECK: GEMM 512x512x512
-// CHECK: GEMM_PASS
+// CHECK: sh_test_fill_colparity_fp16(hb1, 512, 512, 512, 15360u, 14336u)
+// CHECK: sh_gemm(hb1, hb2, hb3, 512, 512, 512, 512, 512, 512, &cfg, 0)
+// CHECK: sh_test_check_const_fp16(hb3, 512, 512, 512, 14848u

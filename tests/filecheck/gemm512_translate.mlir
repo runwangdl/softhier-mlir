@@ -12,8 +12,7 @@ builtin.module {
     func.return
   }
 }
-// CHECK: GEMM 512x512x512: 2x2 output tiles, 2 K-steps
-// CHECK: for (int r{{[0-9]+}} = 0; r{{[0-9]+}} < 2
-// CHECK: for (int k{{[0-9]+}} = 0; k{{[0-9]+}} < 2
-// CHECK: flex_redmule_trigger(0, 131072, 262144, REDMULE_FP_16)
-// CHECK: GEMM_PASS
+// CHECK: sh_test_fill_const_fp16(hb1, 512, 512, 512, 15360u)
+// CHECK: sh_gemm_cfg cfg = { .tm = 0, .tn = 0, .tk = 0, .pipeline = 0, .accumulate = 0, .fmt = SH_FP16, .l1_base = 0 }
+// CHECK: sh_gemm(hb1, hb2, hb3, 512, 512, 512, 512, 512, 512, &cfg, 0)
+// CHECK: sh_test_check_const_fp16(hb3, 512, 512, 512, 15360u, 16, "GEMM512")

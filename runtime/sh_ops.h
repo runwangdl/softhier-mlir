@@ -50,8 +50,23 @@ typedef struct {
 int sh_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
             uint32_t ldx, uint32_t ldw, uint32_t ldz, const sh_gemm_cfg *cfg, uint32_t cluster);
 
+/* Mesh-wide SUMMA GEMM over all P x P clusters: cluster (px,py) owns Z tile [py,px]; diagonal
+ * clusters stream the X/W panels from HBM and multicast them along their row/column. Requires a
+ * square mesh, tm == tn, M == N == P*tm, K % tk == 0. Call from all cores of all clusters. */
+int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
+                 uint32_t ldx, uint32_t ldw, uint32_t ldz, const sh_gemm_cfg *cfg);
+
 /* Bytes of TCDM the given cfg needs (so a compiler can check the budget without running). */
 uint32_t sh_gemm_l1_bytes(uint32_t M, uint32_t N, uint32_t K, const sh_gemm_cfg *cfg);
+
+/* ---- TCDM-resident ops (calling cluster only; intra-cluster sync inside) ------------------ */
+uint32_t sh_l1_addr(uint32_t off);                                   /* TCDM byte offset -> address */
+void     sh_l1_zero(uint32_t off, uint32_t bytes);                   /* via ZOMEM iDMA */
+void     sh_l1_fill_fp16(uint32_t off, uint32_t n, uint16_t bits);
+void     sh_l1_relu_fp16(uint32_t off, uint32_t n);
+void     sh_l1_add_fp16(uint32_t dst, uint32_t src, uint32_t n);     /* dst += src */
+void     sh_redmule(uint32_t x, uint32_t w, uint32_t y, uint32_t m, uint32_t n, uint32_t k, uint32_t fmt); /* y[m,n] += x[m,k].w[k,n] */
+void     sh_dma_copy(uint64_t dst, uint64_t src, uint32_t bytes);    /* 1-D, DM core, sync */
 
 /* ---- test helpers (on-device data generation + self-check, no host round trip) --------- */
 /* Fill rows x cols fp16 matrix (ld elements) with integers in [lo, hi] from an LCG(seed). First core. */
@@ -61,6 +76,11 @@ void sh_test_fill_int_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld
 uint32_t sh_test_check_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
                             uint32_t ldx, uint32_t ldw, uint32_t ldz, uint32_t nsamples, float tol,
                             float z0, const char *tag);
+/* Constant fills / checks (cluster 0 does the work; global barrier inside, so call from all clusters). */
+void     sh_test_fill_const_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t bits);
+void     sh_test_fill_colparity_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t even, uint32_t odd);
+uint32_t sh_test_check_const_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t bits, uint32_t tol, const char *tag);
+uint32_t sh_test_check_const_l1_fp16(uint32_t off, uint32_t n, uint32_t bits, uint32_t tol, const char *tag);
 /* fp16 <-> fp32 on the host-side convention (IEEE binary16). */
 float    sh_fp16_to_f32(uint16_t h);
 uint16_t sh_f32_to_fp16(float f);

@@ -11,6 +11,5 @@ builtin.module {
     func.return
   }
 }
-// CHECK: volatile _Float16 *a{{[0-9]+}} = (volatile _Float16 *)local(0);
-// CHECK: d{{[0-9]+}}[i{{[0-9]+}}] += a{{[0-9]+}}[i{{[0-9]+}}];
-// CHECK: MLP_PASS
+// CHECK: sh_l1_add_fp16(l1b2, l1b1, 65536)
+// CHECK: sh_test_check_const_l1_fp16(l1b2, 65536, 15872u, 4, "ADD_TEST")

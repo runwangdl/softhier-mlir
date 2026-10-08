@@ -1,8 +1,10 @@
+*.egg-info/
+*.pyc
+.pipinstall.log
+.pytest_cache/
 .venv/
 __pycache__/
-*.pyc
-*.egg-info/
 build/
 dist/
-.pytest_cache/
-.pipinstall.log
+tests/gvsoc/gemm/shape.h
+tests/gvsoc/mlir_app/main.c

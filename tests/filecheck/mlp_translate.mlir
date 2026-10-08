@@ -22,7 +22,7 @@ builtin.module {
     func.return
   }
 }
-// CHECK: flex_redmule_trigger(0, 131072, 393216, REDMULE_FP_16)
-// CHECK: if ({{.*}} & 0x8000u)
-// CHECK: flex_redmule_trigger(393216, 262144, 524288, REDMULE_FP_16)
-// CHECK: MLP_PASS
+// CHECK: sh_redmule(l1b2, l1b3, l1b5, 256, 256, 256, SH_FP16)
+// CHECK: sh_l1_relu_fp16(l1b5, 65536)
+// CHECK: sh_redmule(l1b5, l1b4, l1b6, 256, 256, 256, SH_FP16)
+// CHECK: sh_test_check_const_l1_fp16(l1b6, 65536, 15360u, 8, "MLP")

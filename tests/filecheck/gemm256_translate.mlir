@@ -16,9 +16,7 @@ builtin.module {
     func.return
   }
 }
-// CHECK: flex_dma_async_1d(local(0), hbm_addr(0), 131072)
-// CHECK: flex_dma_async_1d(local(131072), hbm_addr(131072), 131072)
-// CHECK: flex_redmule_config(256, 256, 256)
-// CHECK: flex_redmule_trigger(0, 131072, 262144, REDMULE_FP_16)
-// CHECK: flex_redmule_wait()
-// CHECK: flex_dma_async_1d(hbm_addr(262144), local(262144), 131072)
+// CHECK: sh_dma_copy((uint64_t)sh_l1_addr(0), hb1, 131072)
+// CHECK: sh_dma_copy((uint64_t)sh_l1_addr(131072), hb2, 131072)
+// CHECK: sh_redmule(l1b4, l1b5, l1b6, 256, 256, 256, SH_FP16)
+// CHECK: sh_dma_copy(hb3, (uint64_t)sh_l1_addr(262144), 131072)
