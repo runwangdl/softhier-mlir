@@ -738,9 +738,9 @@ if __name__ == "__main__":
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--d", type=int, default=768)
     ap.add_argument("--ff", type=int, default=3072)
-    ap.add_argument("--heads", type=int, default=12)
+    ap.add_argument("--heads", type=int, default=None, help="attention heads (default 12; llmops 15)")
     ap.add_argument("--rows", type=int, default=256)
-    ap.add_argument("--cols", type=int, default=768)
+    ap.add_argument("--cols", type=int, default=None)
     ap.add_argument("--cluster", default=None, help="executing cluster: 0 or all (default 0; smolvla: all)")
     ap.add_argument("--app-dir", help="smolvla: app/build dir (default tests/gvsoc/smolvla_app)")
     ap.add_argument("--no-wait", action="store_true", help="preload: skip softhier.preload_wait (demonstrates the race)")
@@ -764,24 +764,24 @@ if __name__ == "__main__":
     elif a.test == "gemm-seq":
         ok = run_gemm_seq()
     elif a.test == "rowops":
-        ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
+        ok = run_rowops(a.rows, (a.cols or 768), "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
     elif a.test == "fp16cvt":
         ok = run_fp16cvt()
     elif a.test == "llmops":
-        ok = run_llmops(a.rows, a.cols, a.heads, a.kv_heads, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
+        ok = run_llmops(a.rows, a.cols or 960, a.heads or 15, a.kv_heads, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
     elif a.test == "smolvla-vlm":
         ok = run_smolvla_vlm(a.npz, None if a.all_layers else a.layers, a.attn, -1 if a.cluster == "all" else int(a.cluster),
                              a.nsamples, a.dumps, Path(a.log) if a.log else None, app_dir=a.app_dir,
                              from_log=Path(a.from_log) if a.from_log else None, layer0=a.layer0)
     elif a.test == "mesh":
-        ok = run_mesh(a.modes, a.heads)
+        ok = run_mesh(a.modes, (a.heads or 12))
     elif a.test == "siglip":
-        ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0",
+        ok = run_siglip(a.seq, a.d, a.ff, (a.heads or 12), "SH_ALL" if a.cluster == "all" else "0",
                         extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "attention":
-        ok = run_attention(a.seq, a.d, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples)
+        ok = run_attention(a.seq, a.d, (a.heads or 12), "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples)
     elif a.test == "siglip-mlir":
-        ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused)
+        ok = run_siglip_mlir(a.seq, a.d, a.ff, (a.heads or 12), "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused)
     elif a.test == "preload":
         ok = run_preload(wait=not a.no_wait)
     elif a.test == "smolvla":
