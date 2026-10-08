@@ -110,28 +110,39 @@ axpy 0.0008, ...).
 | step-0 attention output of layer l | 0.003-0.011 (max 0.9-2.7) | same | |
 
 The device sits on the fp16 floor of its own program (the device-vs-twin and twin-vs-lerobot distances are the same order
-as device-vs-lerobot); fp16 operands, RedMulE fp16 accumulation and the fp16 `x_t` Euler state are the floor. 470 s wall.
+as device-vs-lerobot); fp16 operands, RedMulE fp16 accumulation and the fp16 `x_t` Euler state are the floor. The same
+numbers were obtained with the expert's own row kernels and with the shared sh_llm ones, with the host-side KV buffers
+and with the VLM prefix program's KV layout (`kv_base + L * kv_stride`, token-class mask).
 
-### Step 3: timing (`--profile`, default tiles)
-25.37 ms per flow step, **253.7 ms per chunk** (+ 0.35 ms KV projection once per chunk, + 3.2 ms preload of the 194 MiB
-image). Per-op breakdown (160 layer instances per op, 10 steps):
+### Step 3: timing (`--profile`, default tiles, shared sh_llm row kernels)
+**9.96 ms per flow step, 99.6 ms per chunk** of 50 actions (+ 0.30 ms KV projection once per chunk, + 3.2 ms preload of
+the 194 MiB image), 10 steps x 16 layers on 16 clusters; 522 s wall. Per-op breakdown (160 layer instances per op):
 
 | op (mark segment) | total | share | per call |
 |---|---|---|---|
-| rmsnorm + q/qkv GEMM (`[50,720] x [720,1600]` self, `x [720,960]` cross; tn 64, tk 720) | 153.7 ms | 60.6 % | 961 us |
-| attention (15 heads on 15 clusters, 50 x 291 / 50 x 241 keys) | 38.4 ms | 15.1 % | 240 us |
-| rmsnorm + gate/up GEMM (`x [720,4096]`, tn 256, tk 240) | 16.9 ms | 6.7 % | 106 us |
-| silu * up (`[50, 2048]`) | 12.5 ms | 4.9 % | 78 us |
-| down GEMM (`[50,2048] x [2048,720]`, tn 48, tk 512) + residual | 10.8 ms | 4.3 % | 68 us |
-| step tail (final rmsnorm, `x [720,32]`, bias, axpy, mark) | 9.7 ms | 3.8 % | 968 us / step |
-| o_proj GEMM (`[50,960] x [960,720]`, tn 48, tk 960) + residual | 6.6 ms | 2.6 % | 42 us |
-| rope | 3.5 ms | 1.4 % | 22 us |
-| suffix embedding (3 small GEMMs, biases, SiLU) | 1.4 ms | 0.6 % | 143 us / step |
+| attention (15 heads on 15 clusters, 50 x 291 / 50 x 241 keys, GQA) | 38.7 ms | 38.9 % | 242 us |
+| rmsnorm + gate/up GEMM (`[50,720] x [720,4096]`, tn 256, tk 240; 147 MMAC, 5.9 MB) | 15.4 ms | 15.5 % | 96 us |
+| silu * up (`[50, 2048]`, in place) | 12.6 ms | 12.6 % | 78 us |
+| down GEMM (`[50,2048] x [2048,720]`, tn 48, tk 512; 74 MMAC, 2.9 MB) + residual | 10.6 ms | 10.6 % | 66 us |
+| rmsnorm + q / qkv GEMM (`x [720,1600]` self: 58 MMAC, 2.3 MB; `x [720,960]` cross; tn 64, tk 720) | 10.3 ms | 10.3 % | 64 us |
+| o_proj GEMM (`[50,960] x [960,720]`, tn 48, tk 960; 35 MMAC, 1.4 MB) + residual | 6.6 ms | 6.6 % | 41 us |
+| rope (q, and own k on self layers) | 3.6 ms | 3.6 % | 22 us |
+| suffix embedding (3 small GEMMs, biases, SiLU) | 1.4 ms | 1.4 % | 143 us / step |
+| step tail (final rmsnorm, `x [720,32]`, bias, axpy) | 0.4 ms | 0.4 % | 42 us / step |
 
-The q/qkv GEMM dominates and is anomalously slow for its size (57.6 MMAC, 2.3 MB of weights, 25 output tiles of 64 columns
-over 16 clusters) next to the gate/up GEMM (147 MMAC, 5.9 MB, 106 us): a tile-shape effect (720-row W tiles of 128 B rows,
-two rounds of tiles), measured in the next section. The attention cost is the Snitch-core softmax (fetch-bound SIMD, ~15 k
-elements per head), not RedMulE.
+What dominates: not the weight GEMMs (41 % together: the four of them stream 12.5 MB of fp16 weights per layer in ~270 us,
+~46 B/ns aggregate, i.e. HBM/NoC bound as R2 predicts; per-call RedMulE work is 2-5 us) but the Snitch-core work:
+the attention softmax (39 %: 15 heads x 50 x 320 scores, fetch-bound fp16 SIMD on 3 cores, ~16 cycles per score element,
+plus q/K/V staging and the K transpose by DMA) and the SwiGLU product (13 %: 50 x 2048 elements through the row driver).
+The whole chunk is 5.2 GMAC of RedMulE work = 80 us at the 16-cluster peak, so the expert runs at ~1 % of peak: it is a
+latency/row-op problem at M = 50, as the research notes' R2/R3 expected (26 MAC/B). Levers in order: fuse the softmax
+into fewer, longer fp16-SIMD passes or move it to RedMulE-friendly form; run the gate | up product inside the down GEMM's
+X staging; fuse rope into the q GEMM's epilogue; tile shapes matter little (`qkv=50,320,240` saves 3.5 us per layer).
+
+A first profile with the expert's own `sh_x_rmsnorm` (before sharing the sh_llm kernel) read 25.4 ms per step with the
+q/qkv segment at 961 us: that kernel's fp16 sum-of-squares fell back to its scalar fp32 recount on real activations.
+Deleted; the shared `sh_rmsnorm` costs ~10 us. The micro-benchmarks of the GEMM shapes alone (`run.py gemm ... all`):
+50x1600x720 54 us (tn 64, tk 720) / 32 us (tn 320, tk 240), 50x960x720 35 us / 22 us (tn 192, tk 240).
 
 ### Per-step RedMulE format (R4 hook)
 `expert.py flow --fmt fp8,fp16,int8,...` (one entry per step) sets `fmt_steps` on every weight GEMM inside the step loop; the

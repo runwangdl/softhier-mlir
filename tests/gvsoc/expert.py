@@ -184,12 +184,12 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
         good, err = compare(tag, got[tag], want, atol=0.05, rtol=0.02, floor=floor_xt[s + 1])
         ok &= good
     if "A" in got:
-        want = data["ref_actions"] if layers == 16 else floor_xt[steps]
+        want = ref_xt[steps] if layers == 16 else floor_xt[steps]      # x_t after `steps` steps (== the actions at 10)
         vals = np.zeros((50, 32), np.float32)
         for r_, c, v in got["A"]:
             vals[r_, c] = v
         err = np.abs(vals - want)
-        print(f"     actions (50 x 32, all elements) vs lerobot fp32: max abs {err.max():.4f} mean {err.mean():.4f} "
+        print(f"     x_{steps} (50 x 32, all elements){' = actions' if steps == 10 else ''} vs lerobot fp32: max abs {err.max():.4f} mean {err.mean():.4f} "
               f"(|actions| max {np.abs(want).max():.3f}); vs fp16 floor: max abs {np.abs(vals - floor_xt[steps]).max():.4f}; "
               f"floor vs lerobot: {np.abs(floor_xt[steps] - want).max():.4f}")
         ok &= err.max() < 0.1
