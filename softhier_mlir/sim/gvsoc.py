@@ -21,11 +21,23 @@ import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-SH = Path(os.environ.get("SOFTHIER_HOME", "/app/install/softhier"))
+SHARED_HOME = Path("/app/install/softhier")   # the machine-wide install every other simulation reads
+SH = Path(os.environ.get("SOFTHIER_HOME", str(SHARED_HOME)))
 CHROOT = os.environ.get("SOFTHIER_CHROOT", "/opt/x86-ort/run")
 SRC_GEN = SH / "soft_hier" / "flex_cluster"
 PULP_GEN = SH / "pulp" / "pulp" / "chips" / "flex_cluster"
 INST_GEN = SH / "install" / "generators" / "pulp" / "chips" / "flex_cluster"
+
+
+def set_home(path: str | Path) -> Path:
+    """Switch the SoftHier checkout used by build_sw/run_sim/apply_arch (same as SOFTHIER_HOME,
+    but at run time). Architecture sweeps must point this at a private copy of the install."""
+    global SH, SRC_GEN, PULP_GEN, INST_GEN
+    SH = Path(path).resolve()
+    SRC_GEN = SH / "soft_hier" / "flex_cluster"
+    PULP_GEN = SH / "pulp" / "pulp" / "chips" / "flex_cluster"
+    INST_GEN = SH / "install" / "generators" / "pulp" / "chips" / "flex_cluster"
+    return SH
 
 PERF_RE = re.compile(r"\[Performance Counter\]: Execution period is (\d+) ns")
 
@@ -94,7 +106,13 @@ class Arch:
 
 def apply_arch(arch: Arch, verbose: bool = False) -> None:
     """Write the arch into the three generator copies + regenerate the C header.
-    GVSoC imports install/generators/..., the SDK includes the generated header."""
+    GVSoC imports install/generators/..., the SDK includes the generated header.
+
+    Refuses to touch the shared install (every simulation on the machine reads it at launch)
+    unless SOFTHIER_ALLOW_SHARED_APPLY=1: use set_home() / SOFTHIER_HOME on a private copy."""
+    if SH.resolve() == SHARED_HOME.resolve() and os.environ.get("SOFTHIER_ALLOW_SHARED_APPLY") != "1":
+        raise RuntimeError(f"apply_arch on the shared install {SH} would change the architecture under every "
+                           "running simulation; point SOFTHIER_HOME / set_home() at a private copy")
     (SRC_GEN / "flex_cluster_arch.py").write_text(arch.to_py())
     for dst in (PULP_GEN, INST_GEN):
         dst.mkdir(parents=True, exist_ok=True)
@@ -161,7 +179,7 @@ def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
           [f"--model-dir={d}" for d in model_dirs] + ["--target=pulp.chips.flex_cluster.flex_cluster",
            f"--binary={elf}", f"--work-dir={work}", "run"] + [f"--trace={t}" for t in traces]
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=SH, env=env, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(cmd, cwd=Path(elf).parent, env=env, capture_output=True, text=True, timeout=timeout)
     out = r.stdout + r.stderr
     m = PERF_RE.search(out)
     return {"ok": r.returncode == 0 and m is not None, "returncode": r.returncode,

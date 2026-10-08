@@ -23,3 +23,48 @@ Other facts the library relies on:
   for the whole library (`.text` ~20 KB).
 - Every core executes `main()`: never keep mutable program state in `.bss` (it is shared
   L3 memory); allocate HBM offsets on the stack or with constants.
+
+## Host speed of the RedMulE functional model (patch `gvsoc_redmule_neon.patch`, 2026-10-08)
+
+`light_redmule.cpp` computes every 128 x 2048 x 128 tile (33.5 MMAC per `process_compute`)
+with a scalar per-MAC `fp16 -> float -> fp16` round trip through hand-written bit converters:
+~14-25 ns per MAC on the aarch64 host, i.e. 0.5-0.8 s per tile and ~60 s of pure arithmetic for a
+1024x3072x768 GEMM. The patch replaces only the arithmetic helpers (address generation, DMA and
+timing code are untouched, so every ROI stays bit-identical):
+
+- `matmul_fp16`: AArch64 NEON `vfmaq_f16` (8 output columns per vector, 4x32 register block,
+  accumulator kept in fp16 lanes, zero-padded lanes for a column tail). The host needs
+  `fphp asimdhp` (checked at run time through `HWCAP`; the old scalar loop stays as fallback,
+  `REDMULE_NO_NEON=1` forces it for A/B runs). No CMake change: the functions carry
+  `__attribute__((target("arch=armv8.2-a+fp16")))`. The kernel saves FPCR, forces round-to-nearest
+  with FZ/FZ16 clear and restores it: the Snitch ISS emulates RISC-V rounding modes with
+  `fesetround()` and leaves the engine thread in RTZ/RDN/RUP, which the hand-written scalar
+  converter ignored but hardware fp16 FMAs honour (first NEON build: `siglip` P.V came out ~4 % low
+  and H/G/OUT failed).
+- `matmul_{u,}int{8,16}`: accumulate 64 columns in a local `uint32_t` block so GCC vectorises;
+  bit-identical (per-step wrap-around == one wrap at the end).
+- `fp8e4m3_fma`: 256-entry table instead of `powf` per operand.
+
+Numerics (fp16): the per-MAC rounding of the accumulator to fp16 is kept, but the FMA is now
+*fused* (one RNE rounding of the exact `a*b+c`, as in FPnew) instead of double-rounded through
+fp32. Checked against an exact long-double FMA with a single RNE rounding: the NEON result matched
+it in 100 % of ~30k outputs; the old path differed in 0.01 % (`gemm --real` data) to 0.13 % (random
+normal fp16 bits). On the integer-valued data of `run.py gemm` both are bit-identical. Subnormal,
+inf and NaN now follow IEEE (`FZ16 = 0`); the old converter read a subnormal *accumulator* back as
+~0 and inf/NaN as the finite `2^16 * 1.m`, so results differ only for data that leaves the fp16
+normal range (|x| < 6.1e-5 or overflow).
+
+| run (`tests/gvsoc/run.py`) | ROI (ns) scalar / NEON | wall scalar | wall NEON |
+|---|---|---|---|
+| kernel alone, 128x2048x128 tile, host | - | 14.35 ns/MAC (0.48 s) | 0.076 ns/MAC (2.6 ms), ~190x |
+| `gemm 1024x3072x768:256,256,256,1,0,all` | 509224 / 509224 | 71.6 s | 36.9-40.7 s |
+| `gemm 512x768x768:256,256,256` | 146466 / 146466 | 13.2-14.6 s | 10.0-10.4 s |
+| `gemm` default set (7 shapes) + `--real` | all identical | - | all PASS |
+| `siglip --seq 256 --cluster 0` (13 tensors) | 700522026 / 700514592 | 242 s | 228 s |
+
+The GEMM ROIs are identical because the RedMulE timing code is untouched; the siglip ROI moves by
+1e-5 because the software softmax/LN/GELU on the Snitch cores have data-dependent timing and now
+see slightly different fp16 GEMM outputs (siglip accuracy: OUT maxerr 0.0283 -> 0.0205).
+Host load from other jobs was 7-9 (10 cores) during all measurements. The remaining wall time is
+the rest of the platform (Snitch ISS, iDMA/NoC/TCDM models), not RedMulE arithmetic: with
+`REDMULE_NO_NEON=1` the 512x768x768 run takes 13.2 s, with NEON 10.4 s.
