@@ -15,6 +15,28 @@ removed from `gvsoc-pulp` in 2026-01 and the public SDK (2026-06) only ships the
 | 4 | gvsoc segfaults (no output) with two outstanding collective broadcasts from one DM core | NoC collective model | `sh_gemm_mesh` waits after every broadcast |
 | 5 | gvsoc segfaults at elaboration | DRAMSys ships as an x86-64 `.so` on an aarch64 host | `SOFTHIER_IDEAL_HBM=1` swaps HBM for gvsoc's ideal memory (HBM-bound numbers are optimistic) |
 
+## HBM preload (real weights without a host round trip)
+
+`gvsoc ... run --preload <elf>` feeds an ELF to the chip's `hbm_preloader`
+(`utils.loader.loader.ElfLoader`, wired in `flex_cluster.py`). At reset it walks the ELF's
+`PT_LOAD` program headers (sections are ignored) and writes each segment to its `p_paddr` through
+the data NoC at cluster (0,0), 64 KB per request, then raises `hbm_preload_done` in
+`ctrl_registers`; `has_preload_binary=1` makes the control registers hold back every global
+barrier until that flag is set, so the first barrier of `sh_init` is where the program waits for
+the data. Verified on the ideal-HBM model (`tests/gvsoc/run.py preload`): fp16 matrices placed at
+4 KB, 70 MB and 200 MB (three different HBM nodes) read back bit-exact; a 165 MiB image
+(the SmolVLA vision tower) loads in a few simulated ms.
+
+`softhier_mlir/sim/preload.py` writes that ELF32 directly from `{hbm_offset: ndarray}`
+(no toolchain; the SDK's `flex_cluster_utilities/preload.py` spells arrays out as C initialisers,
+which does not scale past a few MB). Constraints: offsets >= 4 KB (the SDK's `flex_alloc_init`
+keeps the HBM allocator state at `0xC0000000` and the first block header at `+0x400`), 64 B
+aligned, non-overlapping. `run_sim(preload=path)` passes the flag.
+
+Timing probe: `softhier.mark {tag}` prints `[mark] tag <mcycle>` from cluster 0 (clock 1 GHz,
+so cycle deltas are ns; the counter is 32-bit and wraps every 4.29 s, `tests/gvsoc/run.py`
+unwraps it). The ROI timer (`[Performance Counter]`) starts after `sh_init`, i.e. after the preload.
+
 Other facts the library relies on:
 - RedMulE convention: `flex_redmule_config(m, n, k)` computes `Y[m,k] += X[m,n] . W[n,k]`
   (the contraction is `n`). `sh_gemm` therefore calls `config(tm, tk, tn)`.

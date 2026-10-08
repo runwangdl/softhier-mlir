@@ -68,7 +68,24 @@ for f in tests/filecheck/*.mlir; do echo "$f"; done   # see each file's RUN line
 ```
 
 To run generated C on GVSoC, drop it into `soft_hier_sdk/generated/<name>/`
-(with a one-line CMakeLists) and `make sh-old-hs app=... && make sh-old-run`.
+(with a one-line CMakeLists) and `make sh-old-hs app=... && make sh-old-run`, or use
+`tests/gvsoc/run.py` (private build dir, ideal HBM, host-side comparison).
+
+### Real weights: SmolVLA's SigLIP vision tower
+
+Parameters go into HBM through the simulator's preload path (`softhier_mlir/sim/preload.py`,
+see `docs/SIMULATOR_NOTES.md`), so a network with real weights needs no on-device data generation:
+
+```bash
+# checkpoint -> weights in library layout + im2col'd test image + fp32 HF reference (torch/transformers)
+python3 -m softhier_mlir.frontend.smolvla prepare --ckpt /app/models/smolvla_base/model.safetensors \
+        --seq 256 --out /app/models/smolvla_base/vision_s256.npz
+# npz -> MLIR (+ preload image) -> C -> gvsoc; compares sampled EMB / L<n> / OUT against the reference
+.venv/bin/python tests/gvsoc/run.py smolvla --npz /app/models/smolvla_base/vision_s256.npz --layers 1
+```
+
+`--seq 256` keeps the top-left 16x16 patches with their own position embeddings (exactly the full
+model restricted to those tokens); `--seq 1024 --all-layers` is the full 512x512 encoder.
 
 ## Layout
 

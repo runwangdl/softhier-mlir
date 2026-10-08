@@ -186,6 +186,76 @@ def run_preload(offsets=(0x1000, 70 << 20, 200 << 20), rows: int = 64, cols: int
     return ok
 
 
+def parse_marks(stdout: str) -> dict[str, int]:
+    """[mark] tag cycles -> {tag: ns since the first mark}, unwrapping the 32-bit mcycle (1 GHz)."""
+    out, prev, acc = {}, None, 0
+    for ln in stdout.splitlines():
+        if ln.startswith("[mark] "):
+            _, tag, c = ln.split()
+            c = int(c)
+            if prev is not None:
+                acc += (c - prev) % (1 << 32)
+            prev = c
+            out[tag] = acc
+    return out
+
+
+def run_smolvla(npz: str, layers: int | None, attn: int, cluster: int, nsamples: int = 64, dumps=None,
+                log: Path | None = None, timeout: int = 48 * 3600, app_dir: Path | None = None) -> bool:
+    """SmolVLA vision tower (real weights via HBM preload) -> compare sampled device tensors against
+    the fp32 HF reference and the fp16-program floor stored in the npz by `smolvla.py prepare`."""
+    from softhier_mlir.frontend import smolvla
+    from softhier_mlir.sim.preload import make_preload_elf
+    from softhier_mlir.testing import lcg
+    app = Path(app_dir) if app_dir else HERE / "smolvla_app"     # own dir so runs can go concurrently
+    app.mkdir(parents=True, exist_ok=True)
+    rt = (HERE / "../../runtime").resolve()
+    (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c PARENT_SCOPE)\n"
+                                        f"set(INCLUDE_DIRS {rt} PARENT_SCOPE)\n")
+    data = np.load(npz)
+    layers = int(data["meta"][1]) if layers is None else layers
+    seq = int(data["xp"].shape[0])
+    dumps = tuple(dumps) if dumps else ("EMB",) + tuple(f"L{n}" for n in range(1, layers + 1)) + ("OUT",)
+    mlir, pre = smolvla.emit(data, layers, attn, cluster, dumps=dumps, nsamples=nsamples)
+    (app / "smolvla.mlir").write_text(mlir)
+    elf = make_preload_elf(app / "smolvla_preload.elf", pre)
+    (app / "main.c").write_text(lower_and_translate(app / "smolvla.mlir", None))
+    build_sw(app)
+    print(f"[smolvla] seq={seq} layers={layers} attn={attn} cluster={cluster} preload {elf.stat().st_size / 2 ** 20:.1f} MiB; simulating...", flush=True)
+    r = run_sim(preload=elf, timeout=timeout, log=log)
+    (app / "last_run.log").write_text(r["stdout"])
+    got = lcg.parse_samples(r["stdout"])
+    marks = parse_marks(r["stdout"])
+    ok = r["ok"]
+    print(f"{'PASS' if ok else 'FAIL'} smolvla seq={seq} layers={layers} attn={attn} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[sh_"):
+            print("     " + ln)
+    prev_t, prev_tag = None, None
+    for tag, t in marks.items():
+        if prev_t is not None:
+            print(f"     time {prev_tag:>8} -> {tag:<8} {(t - prev_t) / 1e6:9.3f} ms")
+        prev_t, prev_tag = t, tag
+    for tag in dumps:
+        if tag not in got:
+            print(f"     {tag:<4} MISSING"); ok = False; continue
+        floor = data[f"np_{tag}"].astype(np.float32)
+        has_hf = f"ref_{tag}" in data
+        ref = data[f"ref_{tag}"].astype(np.float32) if has_hf else floor   # HF fp32 when it exists, else the fp16 floor
+        vals = np.array([v for _, _, v in got[tag]]); want = np.array([ref[r_, c] for r_, c, _ in got[tag]])
+        err = np.abs(vals - want)
+        rel = err.max() / (np.abs(ref).max() + 1e-12)
+        bad_hf, _ = lcg.compare_samples(got[tag], ref, atol=0.05, rtol=0.05, show=2)
+        bad_fl, maxerr_fl = lcg.compare_samples(got[tag], floor, atol=0.02, rtol=0.02)
+        print(f"     {tag:<4} samples={len(got[tag])} vs {'HF fp32' if has_hf else 'fp16 floor'}: max abs {err.max():.4f} "
+              f"(|ref| max {np.abs(ref).max():.2f}, rel-to-max {rel:.2e}) bad={bad_hf}; vs fp16 floor: max abs {maxerr_fl:.4f} bad={bad_fl} "
+              f"{'PASS' if bad_hf == 0 else 'FAIL'}")
+        ok &= bad_hf == 0
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
+
+
 # passes each example needs (none = already in the softhier dialect)
 EXAMPLE_PASSES = {
     "gemm512_linalg.mlir": "linalg-to-softhier",
@@ -231,21 +301,29 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip", "siglip-mlir", "preload"])
+    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip", "siglip-mlir", "preload", "smolvla"])
     ap.add_argument("--layers", type=int, default=1)
+    ap.add_argument("--npz", default="/app/models/smolvla_base/vision_s256.npz", help="smolvla: output of `smolvla.py prepare`")
+    ap.add_argument("--attn", type=int, default=-1, help="smolvla: cluster of the per-head attention ops (-1 = SH_ALL per op)")
+    ap.add_argument("--dumps", nargs="*", help="smolvla: tensors to compare (default EMB, L1..Ln, OUT)")
+    ap.add_argument("--log", help="smolvla: stream the simulator output to this file")
+    ap.add_argument("--all-layers", action="store_true", help="smolvla: run every layer in the npz (overrides --layers)")
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--d", type=int, default=768)
     ap.add_argument("--ff", type=int, default=3072)
     ap.add_argument("--heads", type=int, default=12)
     ap.add_argument("--rows", type=int, default=256)
     ap.add_argument("--cols", type=int, default=768)
-    ap.add_argument("--cluster", default="0", help="rowops: 0 or all")
+    ap.add_argument("--cluster", default=None, help="executing cluster: 0 or all (default 0; smolvla: all)")
+    ap.add_argument("--app-dir", help="smolvla: app/build dir (default tests/gvsoc/smolvla_app)")
     ap.add_argument("files", nargs="*", help="mlir: input .mlir files")
     ap.add_argument("-p", "--passes", help="mlir: pass pipeline for softhier-opt (default: per-example table)")
     ap.add_argument("--shapes", nargs="*")
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
     a = ap.parse_args()
+    if a.cluster is None:
+        a.cluster = "all" if a.test == "smolvla" else "0"
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
     elif a.test == "rowops":
@@ -256,6 +334,9 @@ if __name__ == "__main__":
         ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers)
     elif a.test == "preload":
         ok = run_preload()
+    elif a.test == "smolvla":
+        ok = run_smolvla(a.npz, None if a.all_layers else a.layers, a.attn, -1 if a.cluster == "all" else int(a.cluster),
+                         a.nsamples, a.dumps, Path(a.log) if a.log else None, app_dir=a.app_dir)
     else:
         ok = run_mlir(a.files, a.passes)
     sys.exit(0 if ok else 1)
