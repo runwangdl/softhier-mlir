@@ -229,3 +229,134 @@ Model accuracy:
   is contended; the model has no instruction-fetch term. (4) SUMMA is +11 % (section 4).
   (5) The HBM-sharing curve was measured for clusters 0..n-1 of a 4x4 mesh and is scaled
   linearly with the link width; other meshes and placements are extrapolations.
+
+## 8. Attention and tiling (2026-10-08, branch `agent/attn-simd-tiling`)
+
+Same setup as above (shared install, ideal HBM, 1 GHz). Layer times are the `softhier.mark`
+segments the frontend now emits (`run.py siglip-mlir` prints them); the `[Performance Counter]`
+ROI of that test also contains the sample dumps (printf), so it reads ~2 ms higher at S=256 and is
+not a layer time. The timeline PNGs come from `run.py siglip-mlir --trace <log>` +
+`python -m softhier_mlir.sim.trace <log> --png`.
+
+### 8.1 Fused attention with the fp16 SIMD softmax (`runtime/sh_attention.inc.c`)
+
+The fused kernel already kept the S x S scores in L1; its softmax was scalar fp32 (2.0 M cycles of a
+2.23 M-cycle head at S=256, dh=64, ~30 cycles/element) and the o normalisation scalar too (0.2 M).
+Both now use the Xfvec row kernel of `sh_rowops.inc.c` (`sh_v4_exp2x4`: 4 lanes per instruction,
+2^k assembled on the integer side, FP/int fences of `SIMULATOR_NOTES.md` #6-#8). The compiled exp
+loop is 120 instructions per 16 elements plus the max pass and the row-sum folds, ~9 instructions
+per element, and the cluster executes ~1 instruction/cycle in total (#7), which is what the
+measured 9.5-9.7 cycles/element are. `run.py attention` (numpy comparison, maxerr <= 1e-3):
+
+| S=256, dh=64, one head on cluster 0 | before | after |
+|---|---|---|
+| stage q/k/v + k^T (iDMA) | 18.3 k | 18.4 k |
+| scores GEMM (RedMulE) | 2.0 k | 2.0 k |
+| softmax | 2006 k | 636 k |
+| P.V GEMM | 2.6 k | 2.6 k |
+| normalise + store | 205 k | 19 k |
+| **head** | **2235 k cycles** | **678 k cycles** (3.3x) |
+
+k^T: the element-granular 2-D iDMA transpose costs ~14 k of the 18.4 k staging cycles; the in-core
+loop (`SH_ATTN_KT_DMA=0`) makes the staging phase 30.9 k, so the DMA stays (the cores are
+fetch-bound, #7). The remaining ~92 % is the softmax; cutting it further needs fewer instructions
+per element, and the one candidate (per-lane `vfcvt.x.h` to build 2^k without the integer round
+trip) is not usable: the gvsoc handler converts two lanes into an *integer* register.
+
+**Work items instead of heads.** The kernel now processes (head, q block of `sq` rows) items with
+the head's K / K^T / V resident; items are dealt in contiguous chunks over the clusters, so a
+cluster re-stages K/V for at most two heads. This removes the S <= 256 limit (S=1024 fits with
+sq=256: 961 KB) and balances 12 heads over 16 clusters. Rule (`sh_attention_q_block`, mirrored in
+`softhier_mlir.dse.tiling.attention_q_block`, emitted as the op's `q_block` attribute): the largest
+sq in {S, 256, 128, 64} that fits L1 and minimises the rows per cluster `ceil(H*S/sq / P) * sq`.
+
+| `run.py attention --cluster all`, 12 heads, 16 clusters | items | rows / cluster | time |
+|---|---|---|---|
+| S=256, sq=256 (whole heads, 4 clusters idle) | 12 | 256 | 0.691 ms |
+| S=256, sq=128 | 24 | 256 | 0.714 ms |
+| S=256, **sq=64 (rule)** | 48 | 192 | **0.556 ms** |
+| S=256, composed path (transpose + per-head gemm / SIMD softmax / gemm via HBM, heads on clusters h % 16) | - | - | 0.835 ms |
+| S=1024, **sq=256 (rule)** | 48 | 768 | **7.77 ms** |
+| S=1024, sq=128 | 96 | 768 | 7.76 ms |
+| S=1024, composed path | - | - | 11.78 ms |
+
+Per 256 x 1024 item at S=1024 the softmax is 2.48 M cycles (9.5 cycles/element); the whole
+attention is 92 % softmax at both sizes, so the fused path's advantage over the composed one
+(1.5x at both S) is the balance (192 instead of 256 rows per cluster at S=256; 12 heads on 16
+clusters either way at S=1024) plus the HBM round trips and the K transpose it does not do.
+
+### 8.2 GEMM tiling: the GEMMs are HBM-bound, so more tiles are slower
+
+Hypothesis tested: at S=256 the projections (256x768x768, 3 output tiles of 256x256) keep 3 of 16
+clusters busy; smaller tiles would spread them. `run.py gemm --shapes MxNxK:tm,tn,tk,1,0,all`
+(operands in HBM node 0, as the frontend places them), cycles:
+
+| shape | 256^3 (today) | 128x256x256 | 128x128x256 | 256x64x256 | 256x256x128 | 256x384x256 | 256x384x128 | 256x512x256 | 256x512x128 | 512x256x256 | 512x256x128 | 512x512x128 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 256x768x768 (proj, S=256) | 35.3 k (3 tiles) | 35.0 k (6) | 55.8 k (12) | 70.2 k (12) | 33.3 k (3) | 31.8 k (2) | **31.3 k** (2) | - | - | - | - | - |
+| 256x3072x768 (fc1, S=256) | 120.4 k (12) | 166.9 k (24) | 241.8 k (48) | - | - | 81.9 k (8) | 78.6 k (8) | 78.2 k (6) | **73.9 k** (6) | - | - | - |
+| 256x768x3072 (fc2, S=256) | 109.0 k (3) | 117.6 k (6) | 203.2 k (12) | - | 107.0 k (3) | **92.7 k** (2) | 98.7 k (2) | - | - | - | - | - |
+| 1024x768x768 (proj, S=1024) | 119.9 k (12) | 166.8 k (24) | 242.0 k (48) | - | - | 82.2 k (8) | 78.7 k (8) | - | - | 78.3 k (6) | **74.2 k** (6) | - |
+| 1024x3072x768 (fc1, S=1024) | 520.5 k (48) | - | 961.2 k (192) | - | - | - | 444.9 k (32) | 369.0 k (24) | - | 375.4 k (24) | - | **271.2 k** (12) |
+| 1024x768x3072 (fc2, S=1024) | 414.8 k (12) | 609.3 k (24) | 905.6 k (48) | - | - | 265.1 k (8) | 261.3 k (8) | - | - | 243.5 k (6) | **239.4 k** (6) | - |
+
+Every split into more tiles is slower, by up to 2x; every merge into larger tiles is faster, as long
+as the per-cluster compute (RedMulE at 86-93 % for 256-512 tiles) stays under the per-cluster stream
+time. The reason is the one section 7 already gave: the aggregate HBM -> TCDM rate out of one HBM
+node is 85-125 B/cycle whatever the number of streaming clusters, so the time is the total traffic
+`2 M N K (1/tm + 1/tn)` bytes over that rate, and 12 tiles of 128x128 move 2x the bytes of 3 tiles
+of 256x256. The "3 busy clusters" of the timeline are an HBM symptom, not a parallelism gap; the
+rule "MT*NT >= P" would have cost 1.6-2x. The analytic model (`gemm_est`) ranks these cases in the
+measured order (absolute error within +-10 %, including the single-cluster link cap that makes
+one tile of 256x768x128 slow: 55.4 k), so the policy is the model:
+`softhier_mlir.dse.tiling.gemm_tiles(M, N, K)` returns the cheapest candidate `(tm, tn, tk)`
+(tm in {64..512}, tn in {64..1024}, tk in {128, 256, 512}) that fits TCDM, and `frontend/siglip.py`
+(and `smolvla.py`) emit it (`--tiles model`, the default; `--tiles tm,tn,tk` fixes one). Picks and
+how far they are from the best measured tile: proj S=256 256x384x128 (best), fc1 S=256 256x384x128
+(+6 %), fc2 S=256 256x384x256 (best), proj S=1024 256x384x128 (+6 %), fc1 S=1024 512x512x128
+(best, 1.9x over 256^3), fc2 S=1024 256x384x128 (+9 %). The model's residual is the HBM-sharing
+table (it prefers 8 streaming clusters to 6); a tk = 128 tile is picked because the per-K-step
+load gets smaller than the compute at no RedMulE cost.
+
+**HBM placement.** Every HBM node (64 MB of address space) has its own NoC edge port. The same
+test with W in HBM node 1 and Z in node 2 (`--offsets 0,0x04000000,0x08000000`): 1024x768x768
+119.9 k -> 74.9 k, 1024x3072x768 520.5 k -> 324.9 k, 256x768x768 with 128x128 tiles 55.8 k -> 36.2 k.
+With only the parameters moved (X and Z stay in node 0, which is what a frontend can do without
+copying activations; `--offsets 0,0x04000000,0x02000000`):
+
+| shape, tile | node 0 only | W in node 1 |
+|---|---|---|
+| 256x768x768, 256^3 / 256x384x128 | 35.3 k / 31.3 k | 37.5 k / 34.9 k |
+| 256x3072x768, 256^3 / 256x384x128 | 120.4 k / 78.6 k | 76.1 k / 62.1 k |
+| 256x768x3072, 256^3 / 256x384x256 | 109.0 k / 92.7 k | 117.4 k / 111.4 k |
+| 1024x768x768, 256^3 / 256x384x128 | 119.9 k / 78.7 k | 74.9 k / 61.6 k |
+| 1024x3072x768, 256^3 / 512x512x128 | 520.5 k / 271.2 k | 376.1 k / 170.0 k |
+| 1024x768x3072, 256^3 / 256x384x128 | 414.8 k / 261.3 k | 244.3 k / 204.0 k |
+
+At S=1024 the split is worth another 1.2-1.6x on every GEMM; at S=256 only fc1 gains, and the
+K=3072 fc2 loses 20 % (not understood; the 2-3 streaming clusters sit in mesh row 0 and node 1's
+port is on row 1). `siglip.emit(hbm_split=True)` / `run.py siglip-mlir --hbm-split` allocates the
+parameters from offset 64 MB; the tile policy does not model the placement yet (`CostParams.hbm_channels`
+is the knob to fit next).
+
+### 8.3 Layer time before / after (SigLIP layer, 16 clusters, from the marks)
+
+| S | configuration | qkv proj | attention | rest (o-proj, LN2, FFN) | layer |
+|---|---|---|---|---|---|
+| 256 | per-head attention, 256^3 tiles (before) | BEFORE256 |
+| 256 | fused attention, scalar softmax, 256^3 tiles (before, `--fused`) | trace window 3.635 ms |
+| 256 | per-head attention, cost-model tiles | 0.324 | 0.831 | 1.040 | 2.148 (trace window) |
+| 256 | fused SIMD attention, 256^3 tiles | 0.336 | 0.556 | 1.106 | 1.998 |
+| 256 | **fused SIMD attention, cost-model tiles** | 0.325 | 0.551 | 1.044 | **1.920** |
+| 256 | fused SIMD attention, cost-model tiles, HBM split | SPLIT256 |
+| 1024 | per-head attention, 256^3 tiles (before) | BEFORE1024 |
+| 1024 | per-head attention, cost-model tiles | PH1024 |
+| 1024 | **fused SIMD attention, cost-model tiles** | FUSED1024 |
+| 1024 | fused SIMD attention, cost-model tiles, HBM split | SPLIT1024 |
+
+RedMulE busy (mean over the 16 clusters of the trace window, `softhier_mlir.sim.trace`): before
+(fused, scalar softmax) 1.0 %, per-head with the new tiles 1.6 %, fused SIMD + new tiles 2.0 %.
+The layer is still a row-op problem: LayerNorm (2 x ~0.15 ms), GELU on 256x3072 (~0.4 ms) and the
+bias adds are the long RedMulE-free stretches of the timeline, and the GEMMs that remain are
+HBM-bound (section 7). The PNGs: `docs/dse/timeline_s256_before.png` (per-head, 256^3 tiles),
+`docs/dse/timeline_s256_after.png` (fused SIMD attention, cost-model tiles).
