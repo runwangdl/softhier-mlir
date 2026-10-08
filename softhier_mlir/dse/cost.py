@@ -233,15 +233,21 @@ def rowop_est(arch: Arch, prm: CostParams, kind: str, rows: int, cols: int, all_
     rpb = max(1, min(0x40000 // (rowb * (nin + 1)), rows))
     if all_clusters:
         rpb = min(rpb, max(1, math.ceil(rows / P)))
-    nblk = math.ceil(rows / rpb)
+    sizes = [rpb] * (rows // rpb) + ([rows % rpb] if rows % rpb else [])   # the last block is partial
+    nblk = len(sizes)
     n_active = min(P, nblk) if all_clusters else n_lanes
-    my = math.ceil(nblk / P)
-    load = dma_load(arch, prm, rpb, cols, n_active) + (dma_load(arch, prm, rpb if kind == "add" else 1, cols, n_active) if kind in ("add", "add_bias") else 0)
-    store = dma_store(arch, prm, rpb, cols, n_active)
-    comp = rpb * cols * ce
-    per = load + comp + store + prm.rowop_fixed
-    total = my * per + (prm.barrier if all_clusters else 0)
-    return Est(total, my * comp, my * (load + store), "scalar" if comp >= load + store else "dma", f"{my} blocks x {rpb} rows/cluster")
+    # blocks are dealt round-robin: the critical cluster is the one with the most rows
+    lanes = [sizes[c::P] for c in range(min(P, nblk))]
+    mine = max(lanes, key=sum)
+
+    def block(nr: int) -> tuple[float, float]:
+        load = dma_load(arch, prm, nr, cols, n_active) + (dma_load(arch, prm, nr if kind == "add" else 1, cols, n_active) if kind in ("add", "add_bias") else 0)
+        return nr * cols * ce, load + dma_store(arch, prm, nr, cols, n_active) + prm.rowop_fixed
+
+    comp = sum(block(nr)[0] for nr in mine)
+    dma = sum(block(nr)[1] for nr in mine)
+    total = comp + dma + (prm.barrier if all_clusters else 0)
+    return Est(total, comp, dma, "scalar" if comp >= dma else "dma", f"{len(mine)} blocks, {sum(mine)} rows on the critical cluster (block {rpb} rows)")
 
 
 def op_est(arch: Arch, prm: CostParams, op: OpRec, n_lanes: int = 1) -> Est:
