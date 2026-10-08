@@ -28,9 +28,6 @@ from softhier_mlir.dialects.softhier import (
     AxpyOp,
     CrossAttentionOp,
     DumpAllOp,
-    RmsNormOp,
-    RopeOp,
-    SiluMulOp,
     AddBiasOp,
     AddOp,
     CheckConstOp,
@@ -349,8 +346,13 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
               f"{op.head_dim.value.data}, {_cluster(op)});")
 
         elif isinstance(op, SiluMulOp):
-            rows, cols, ld, _ = bufs.geom(op.a)
-            b(f"{ind}sh_silu_mul({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {ld}, {_cluster(op)});")
+            rows, cols, lda, _ = bufs.geom(op.a)
+            ldy = bufs.geom(op.y)[2]
+            if op.b is not None and ldy == lda == bufs.geom(op.b)[2]:      # sh_llm kernel: one leading dimension
+                b(f"{ind}sh_silu_mul({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {lda}, {_cluster(op)});")
+            else:                                                            # strided views / plain SiLU: the expert's kernel
+                bb, ldb = (bufs.haddr(op.b), bufs.geom(op.b)[2]) if op.b is not None else ("0", 0)
+                b(f"{ind}sh_x_silu_mul({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bb}, {rows}, {cols}, {ldy}, {lda}, {ldb}, {_cluster(op)});")
 
         elif isinstance(op, ScaleOp):
             rows, cols, ld, _ = bufs.geom(op.x)
@@ -388,26 +390,10 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
                 b(f"{ind}sh_attention({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
                   f"{S}, {D}, {H}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
 
-        elif isinstance(op, RmsNormOp):
-            rows, cols, ldx, _ = bufs.geom(op.x)
-            ldy = bufs.geom(op.y)[2]
-            b(f"{ind}sh_x_rmsnorm({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.gamma)}, {rows}, {cols}, {ldy}, {ldx}, {_f(op.eps)}, {_cluster(op)});")
-
-        elif isinstance(op, SiluMulOp):
-            rows, cols, lda, _ = bufs.geom(op.a)
-            ldy = bufs.geom(op.y)[2]
-            bb, ldb = (bufs.haddr(op.b), bufs.geom(op.b)[2]) if op.b is not None else ("0", 0)
-            b(f"{ind}sh_x_silu_mul({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bb}, {rows}, {cols}, {ldy}, {lda}, {ldb}, {_cluster(op)});")
-
         elif isinstance(op, AxpyOp):
             rows, cols, lda, _ = bufs.geom(op.a)
             ldy, ldb = bufs.geom(op.y)[2], bufs.geom(op.b)[2]
             b(f"{ind}sh_x_axpy({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {ldy}, {lda}, {ldb}, {_f(op.alpha)}, {_cluster(op)});")
-
-        elif isinstance(op, RopeOp):
-            rows, cols, ldx, _ = bufs.geom(op.x)
-            ldy, ldt = bufs.geom(op.y)[2], bufs.geom(op.cos_sin)[2]
-            b(f"{ind}sh_x_rope({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.cos_sin)}, {rows}, {cols}, {ldy}, {ldx}, {ldt}, {op.head_dim.value.data}, {_cluster(op)});")
 
         elif isinstance(op, CrossAttentionOp):
             Sq, _, ldq, _ = bufs.geom(op.q)
@@ -422,8 +408,8 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
                 own = f"{bufs.haddr(op.ko)}, {bufs.haddr(op.vo)}"
             else:
                 So, ldko, ldvo, own = 0, 0, 0, "0, 0"
-            valid = bufs.haddr(op.valid) if op.valid is not None else "0"
-            b(f"{ind}sh_x_attention({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {valid}, {bufs.haddr(op.o)}, "
+            tok = bufs.haddr(op.mask) if op.mask is not None else "0"
+            b(f"{ind}sh_x_attention({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
               f"{Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
 
         elif isinstance(op, DumpAllOp):

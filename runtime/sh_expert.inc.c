@@ -1,7 +1,7 @@
-/* SmolVLA action-expert ops (prefix sh_x_): RMSNorm, RoPE, SiLU-gated MLP activation, the flow-matching
- * Euler update and a GQA cross/self attention over a stationary prefix KV. Written for the expert's own
- * use (agent/action-expert); the VLM-prefix branch adds the same primitives under their own names in
- * sh_llm.inc.c and the two sets are to be unified at merge time (see docs/SMOLVLA_EXPERT.md).
+/* SmolVLA action-expert ops (prefix sh_x_): the SiLU-gated activation with per-operand leading dimensions (and
+ * plain SiLU), the flow-matching Euler update (axpy) and a GQA cross/self attention over a stationary prefix KV
+ * with a token-class mask. RMSNorm / RoPE / the equal-ld silu_mul come from sh_llm.inc.c (agent/vlm-prefix);
+ * see docs/SMOLVLA_EXPERT.md.
  *
  * The row ops reuse the double-buffered sh_rowop driver of sh_rowops.inc.c (block of rows staged by
  * the DM core, split over the three cores, fp16 SIMD, cols % 4 == 0; scalar fp32 fallback otherwise).
@@ -9,9 +9,11 @@
  * sh_x_attention: for query head h (dh columns of q) with kv head h / (H / Hkv):
  *     keys   = [ kp (Lp prefix rows, stationary in HBM, dealt to the cluster by head) ; ko (So own rows) ]
  *     values = [ vp ; vo ]
- *     o_h = softmax(scale * q_h K^T + mask) V,  mask: prefix key j invalid when valid[j] == 0 (fp16 row of
- *           1.0 / 0.0, 0 pointer = all valid), own key j attended by query i only when j <= i (causal; this
- *           is lerobot's make_att_2d_masks with att_mask = 1 on every action token)
+ *     o_h = softmax(scale * q_h K^T + mask) V,  mask: prefix key j is padding when tok[j] == SH_LLM_PAD (the VLM
+ *           prefix's uint16 token-class array, sh_llm.inc.c convention: 0 image/language, 1 state, 0xFFFF padding;
+ *           the expert's queries are class 2, so "tok[j] <= tok[i]" reduces to "not padding"; tok == 0: all valid),
+ *           own key j attended by query i only when j <= i (causal; lerobot's make_att_2d_masks with att_mask = 1
+ *           on every action token)
  * entirely inside one cluster's TCDM: K rows staged and transposed by element-granular 2-D DMA into
  * kT[dh, Lpad] (Lpad = L rounded up to 32, padding columns zero), RedMulE E = q kT, a masked fp16 SIMD row
  * softmax on the cores (validity rows per core: a 1/0 multiplier and a 0/-65504 additive bias, so masked
@@ -21,35 +23,6 @@
 #define SH_X_NPROF 8u
 
 static inline uint32_t sh_x_up64(uint32_t b) { return (b + 63u) & ~63u; }
-
-/* ---- rmsnorm: y = x * rsqrt(mean(x^2) + eps) * g ------------------------------------------------ */
-static void sh_xk_rmsnorm_s(const sh_blk *k) {
-    const float eps = *(const float *)k->arg; const float *g = k->p0; const uint32_t cols = k->cols;
-    uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
-    for (uint32_t r = lo; r < hi; ++r) {
-        const uint16_t *xr = k->x + r * cols; uint16_t *yr = k->y + r * cols;
-        const float rs = sh_rsqrtf(sh_row_sqdev(xr, cols, 0.f) / (float)cols + eps);
-        for (uint32_t i = 0; i < cols; ++i) yr[i] = (uint16_t)sh_f2h(sh_h2f(xr[i]) * rs * g[i]);
-    }
-}
-static void sh_xk_rmsnorm(const sh_blk *k) {
-    if (k->cols & 3) { sh_xk_rmsnorm_s(k); return; }
-    const float eps = *(const float *)k->arg; const uint32_t cols = k->cols, cv = cols >> 2, j0 = sh_core_rot(cv);
-    const sh_v4h *g = SH_V4CP(k->ph0), q4 = sh_v4_splat(0.0625f), z4 = sh_v4_splat_h(0);
-    uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
-    for (uint32_t r = lo; r < hi; ++r) {
-        const uint16_t *xr = k->x + r * cols; const sh_v4h *x = SH_V4CP(xr); sh_v4h *y = SH_V4P(k->y + r * cols);
-        /* sum of (x/16)^2: fp16 partial sums of 4 vectors, folded into fp32 (|x| up to ~2047 safe) */
-        float ms = sh_v4_row_sqdev(x, cv, z4, z4, q4) * (256.f / (float)cols);
-        if (ms < 1e-3f) ms = sh_row_sqdev(xr, cols, 0.f) / (float)cols;
-        const sh_v4h rs4 = sh_v4_splat(sh_rsqrtf(ms + eps));
-        for (uint32_t j = j0; j < cv; ++j) y[j] = sh_v4_mul(sh_v4_mul_r(x[j], rs4), g[j]);
-        for (uint32_t j = 0; j < j0; ++j) y[j] = sh_v4_mul(sh_v4_mul_r(x[j], rs4), g[j]);
-    }
-}
-void sh_x_rmsnorm(uint64_t y, uint64_t x, uint64_t gamma, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t ldx, float eps, uint32_t cluster) {
-    sh_rowop(y, x, 0, gamma, 0, rows, cols, ldy, ldx, 0, sh_xk_rmsnorm, &eps, cluster);
-}
 
 /* ---- silu_mul: y = silu(a) * b = a b / (1 + 2^(-a log2 e)); b == 0 -> y = silu(a) ------------------ */
 static inline float sh_x_silu1(float a) { return a / (1.f + sh_exp2_clamped(sh_fminf(sh_fmaxf(-a * SH_LOG2E, -126.f), 126.f))); }
@@ -96,42 +69,6 @@ static void sh_xk_axpy(const sh_blk *k) {
 }
 void sh_x_axpy(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, float alpha, uint32_t cluster) {
     sh_rowop(y, a, b, 0, 0, rows, cols, ldy, lda, ldb, sh_xk_axpy, &alpha, cluster);
-}
-
-/* ---- rope: half-split rotation per head (lerobot apply_rope == HF rotate-half) with a per-row table ----
- * tab row r = [cos(r, 0..dh/2) | sin(r, 0..dh/2)] (dh entries, host-built for the row's position; leading dim
- * ldtab >= dh), the same for every head of the row:  y[i] = x1 cos - x2 sin,  y[i + dh/2] = x2 cos + x1 sin.
- * The row driver stages cols elements per table row, so the staged row starts with the dh table entries and the
- * rest is don't-care (an over-read of the table in HBM). dh % 8 == 0 for the SIMD path. */
-static void sh_xk_rope_s(const sh_blk *k) {
-    const uint32_t dh = *(const uint32_t *)k->arg, hh = dh >> 1, cols = k->cols;
-    uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
-    for (uint32_t r = lo; r < hi; ++r) {
-        const uint16_t *xr = k->x + r * cols, *tr = k->b + r * cols; uint16_t *yr = k->y + r * cols;
-        for (uint32_t h0 = 0; h0 < cols; h0 += dh)
-            for (uint32_t i = 0; i < hh; ++i) {
-                const float c = sh_h2f(tr[i]), s = sh_h2f(tr[hh + i]), x1 = sh_h2f(xr[h0 + i]), x2 = sh_h2f(xr[h0 + hh + i]);
-                yr[h0 + i] = (uint16_t)sh_f2h(x1 * c - x2 * s); yr[h0 + hh + i] = (uint16_t)sh_f2h(x2 * c + x1 * s);
-            }
-    }
-}
-static void sh_xk_rope(const sh_blk *k) {
-    const uint32_t dh = *(const uint32_t *)k->arg, cols = k->cols;
-    if ((cols & 3) || (dh & 7) || cols % dh) { sh_xk_rope_s(k); return; }
-    const uint32_t cv = cols >> 2, dv = dh >> 2, hv = dh >> 3;
-    uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
-    for (uint32_t r = lo; r < hi; ++r) {
-        const sh_v4h *x = SH_V4CP(k->x + r * cols), *t = SH_V4CP(k->b + r * cols); sh_v4h *y = SH_V4P(k->y + r * cols);
-        for (uint32_t h0 = 0; h0 < cv; h0 += dv)
-            for (uint32_t i = 0; i < hv; ++i) {
-                const sh_v4h c = t[i], s = t[hv + i], x1 = x[h0 + i], x2 = x[h0 + hv + i];
-                y[h0 + i] = sh_v4_sub(sh_v4_mul(x1, c), sh_v4_mul(x2, s));
-                y[h0 + hv + i] = sh_v4_mac(sh_v4_mul(x2, c), x1, s);
-            }
-    }
-}
-void sh_x_rope(uint64_t y, uint64_t x, uint64_t tab, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t ldx, uint32_t ldtab, uint32_t dh, uint32_t cluster) {
-    sh_rowop(y, x, tab, 0, 0, rows, cols, ldy, ldx, ldtab, sh_xk_rope, &dh, cluster);
 }
 
 /* ---- GQA cross / self attention over a stationary prefix KV ---------------------------------------- */
@@ -184,7 +121,7 @@ static inline float sh_x_softmax_row(sh_v4h *x, const sh_v4h *vld, const sh_v4h 
     return sum + sh_v4_hsum(acc);
 }
 
-int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t valid, uint64_t o,
+int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
                         uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
                         uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster) {
     if (cluster != SH_ALL && flex_get_cluster_id() != cluster) return 0;
@@ -204,7 +141,7 @@ int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint6
         sh_load_block_async(l.k, kp, Lp, dh, ldkp);
         sh_load_block_async(l.v, vp, Lp, dh, ldvp);
         if (So) { sh_load_block_async(l.k + Lp * dh * 2, ko, So, dh, ldko); sh_load_block_async(l.v + Lp * dh * 2, vo, So, dh, ldvo); }
-        if (valid) bare_dma_start_1d(local(l.vrow), valid, Lp * 2);
+        if (tok) bare_dma_start_1d(local(l.vrow), tok, Lp * 2);
         sh_l1_zero_dm(l.kt, dh * Lpad * 2);               /* waits for everything issued so far */
         sh_l1_zero_dm(l.s, Sq * Lpad * 2);
         sh_l1_zero_dm(l.o, Sq * dh * 2);
@@ -214,14 +151,15 @@ int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint6
         bare_dma_wait_all();
     }
     flex_intra_cluster_sync();
-    /* 2. per-core validity rows: prefix from `valid` (or all 1), own columns [0, lo] of this core's first row, pad 0 */
+    /* 2. per-core validity rows: prefix from `tok` (padding class 0xFFFF -> 0, else 1; all 1 without tok), own columns
+     *    [0, lo] of this core's first row, padding columns 0 */
     uint32_t lo, hi; sh_share(Sq, 1, &lo, &hi);
     volatile uint16_t *vld = (volatile uint16_t *)local(l.vld + core * 2 * vb), *nb = vld + (vb >> 1);
     {
         const volatile uint16_t *vr = (const volatile uint16_t *)local(l.vrow);
         for (uint32_t j = 0; j < Lpad; ++j) {
             uint32_t v;
-            if (j < Lp) v = valid ? (vr[j] != 0) : 1u;
+            if (j < Lp) v = tok ? (vr[j] != SH_LLM_PAD) : 1u;
             else if (j < L) v = (j - Lp) <= lo;
             else v = 0;
             vld[j] = v ? 0x3C00u : 0u; nb[j] = v ? 0u : 0xFBFFu;
@@ -268,7 +206,7 @@ int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint6
     return 0;
 }
 
-int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t valid, uint64_t o,
+int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
                    uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
                    uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo,
                    float scale, uint32_t cluster) {
@@ -282,7 +220,7 @@ int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t v
     for (uint32_t h = 0; h < H; ++h) {
         const uint32_t cl = (cluster == SH_ALL) ? h % P : cluster, kvh = h / grp;
         const uint64_t qo = (uint64_t)h * dh * 2, ko_ = (uint64_t)kvh * dh * 2;
-        int r = sh_x_attention_head(q + qo, kp + ko_, vp + ko_, ko ? ko + ko_ : 0, vo ? vo + ko_ : 0, valid, o + qo,
+        int r = sh_x_attention_head(q + qo, kp + ko_, vp + ko_, ko ? ko + ko_ : 0, vo ? vo + ko_ : 0, tok, o + qo,
                                     Sq, Lp, So, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, scale, cl);
         if (r) rc = r;
     }

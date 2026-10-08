@@ -434,12 +434,13 @@ class RopeOp(IRDLOperation):
 
 @irdl_op_definition
 class SiluMulOp(IRDLOperation):
-    """``y = silu(a) * b`` elementwise (the SiLU-gated MLP activation)."""
+    """``y = silu(a) * b`` elementwise (the SiLU-gated MLP activation; ``b`` may be omitted: ``y = silu(a)``, the expert's time MLP)."""
     name = "softhier.silu_mul"
+    irdl_options = (ParsePropInAttrDict(),)
     a = operand_def(MemRefType)
-    b = operand_def(MemRefType)
+    b = opt_operand_def(MemRefType)
     y = operand_def(MemRefType)
-    assembly_format = "$a `,` $b `->` $y attr-dict `:` type($a) `,` type($b) `->` type($y)"
+    assembly_format = "$a (`,` $b^)? `->` $y attr-dict `:` type($a) (`,` type($b)^)? `->` type($y)"
 
 
 @irdl_op_definition
@@ -467,29 +468,6 @@ class PixelShuffleOp(IRDLOperation):
 
 
 @irdl_op_definition
-class RmsNormOp(IRDLOperation):
-    """``y = x * rsqrt(mean(x^2) + eps) * gamma`` over the last dim (gamma is 1 x cols; Llama/SmolLM RMSNorm)."""
-    name = "softhier.rmsnorm"
-    irdl_options = (ParsePropInAttrDict(),)
-    x = operand_def(MemRefType)
-    gamma = operand_def(MemRefType)
-    y = operand_def(MemRefType)
-    eps = prop_def(FloatAttr)
-    assembly_format = "$x `,` $gamma `->` $y attr-dict `:` type($x) `,` type($gamma) `->` type($y)"
-
-
-@irdl_op_definition
-class SiluMulOp(IRDLOperation):
-    """``y = silu(a) * b`` elementwise (the SwiGLU gate; ``b`` may be omitted: ``y = silu(a)``)."""
-    name = "softhier.silu_mul"
-    irdl_options = (ParsePropInAttrDict(),)
-    a = operand_def(MemRefType)
-    b = opt_operand_def(MemRefType)
-    y = operand_def(MemRefType)
-    assembly_format = "$a (`,` $b^)? `->` $y attr-dict `:` type($a) (`,` type($b)^)? `->` type($y)"
-
-
-@irdl_op_definition
 class AxpyOp(IRDLOperation):
     """``y = a + alpha * b`` elementwise (the flow-matching Euler update ``x_t + dt * v_t``)."""
     name = "softhier.axpy"
@@ -502,27 +480,13 @@ class AxpyOp(IRDLOperation):
 
 
 @irdl_op_definition
-class RopeOp(IRDLOperation):
-    """Rotary position embedding, HF Llama rotate-half convention (== lerobot's ``apply_rope``), on every head
-    of ``head_dim`` columns of each row: ``y1 = x1 cos - x2 sin, y2 = x2 cos + x1 sin`` with ``cos_sin`` a
-    ``rows x head_dim`` table (cos[head_dim/2] then sin[head_dim/2] per row, precomputed by the host for the
-    row's position id). Same op as agent/vlm-prefix (lowered to sh_x_rope here)."""
-    name = "softhier.rope"
-    irdl_options = (ParsePropInAttrDict(),)
-    x = operand_def(MemRefType)
-    cos_sin = operand_def(MemRefType)
-    y = operand_def(MemRefType)
-    head_dim = prop_def(IntegerAttr)
-    assembly_format = "$x `,` $cos_sin `->` $y attr-dict `:` type($x) `,` type($cos_sin) `->` type($y)"
-
-
-@irdl_op_definition
 class CrossAttentionOp(IRDLOperation):
     """GQA attention of ``Sq`` query tokens (``q``: Sq x heads*dh) over a stationary prefix KV (``kp`` /
     ``vp``: Lp x kv_heads*dh, e.g. the VLM prefix of SmolVLA) plus, with ``own %ko, %vo`` (Sq x kv_heads*dh),
-    the tokens' own keys/values attended causally (query i sees own key j iff j <= i). ``valid %m``: a
-    1 x Lp fp16 row of 1.0 / 0.0 masking prefix keys (padding). Query head h uses kv head h / (heads /
-    kv_heads). Each head runs inside one cluster's TCDM; ``cluster = -1`` deals head h to cluster h % P."""
+    the tokens' own keys/values attended causally (query i sees own key j iff j <= i). ``mask %tok``: the
+    prefix's 1 x Lp i16 token-class array (as for ``softhier.attention``'s mask: 0xFFFF = padding key; the
+    expert's queries attend every non-padding prefix key). Query head h uses kv head h / (heads / kv_heads).
+    Each head runs inside one cluster's TCDM; ``cluster = -1`` deals head h to cluster h % P."""
     name = "softhier.cross_attention"
     irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
     q = operand_def(MemRefType)
@@ -530,13 +494,13 @@ class CrossAttentionOp(IRDLOperation):
     vp = operand_def(MemRefType)
     ko = opt_operand_def(MemRefType)
     vo = opt_operand_def(MemRefType)
-    valid = opt_operand_def(MemRefType)
+    mask = opt_operand_def(MemRefType)
     o = operand_def(MemRefType)
     scale = prop_def(FloatAttr)
     heads = prop_def(IntegerAttr)
     kv_heads = prop_def(IntegerAttr)
-    assembly_format = ("$q `,` $kp `,` $vp (`own` $ko^ `,` $vo)? (`valid` $valid^)? `->` $o attr-dict `:` "
-                       "type($q) `,` type($kp) `,` type($vp) (`own` type($ko)^ `,` type($vo))? (`valid` type($valid)^)? `->` type($o)")
+    assembly_format = ("$q `,` $kp `,` $vp (`own` $ko^ `,` $vo)? (`mask` $mask^)? `->` $o attr-dict `:` "
+                       "type($q) `,` type($kp) `,` type($vp) (`own` type($ko)^ `,` type($vo))? (`mask` type($mask)^)? `->` type($o)")
 
 
 @irdl_op_definition
@@ -632,10 +596,7 @@ SoftHier = Dialect(
         AddOp,
         AddBiasOp,
         AttentionOp,
-        RmsNormOp,
-        SiluMulOp,
         AxpyOp,
-        RopeOp,
         CrossAttentionOp,
         DumpAllOp,
         HbmFillLcgOp,
