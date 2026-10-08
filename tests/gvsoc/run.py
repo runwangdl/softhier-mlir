@@ -75,8 +75,8 @@ def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False) -> bool
     for s in shapes:
         c = parse_shape(s)
         M, N, K, acc = c["M"], c["N"], c["K"], c["accumulate"]
-        # == the fills in gemm/main.c (X at HBM_START, W at 16 MB, Z at 32 MB; Z0 = 3.0 when accumulating)
-        off = {"x": HBM_START, "w": 0x01000000, "z": 0x02000000}
+        # == the fills in gemm/main.c (X at HBM_START, W at 16 MB, Z at 32 MB or behind a larger W; Z0 = 3.0 when accumulating)
+        off = {"x": HBM_START, "w": 0x01000000, "z": max(0x02000000, 0x01000000 + ((K * N * 2 + 0xFFFFF) & ~0xFFFFF))}
         x = lcg.fill_fp16(M, K, 1, 0, 64, 1 / 4096) if real else lcg.fill_fp16(M, K, 1, -1, 1)
         w = lcg.fill_fp16(K, N, 2, -16, 16, 0.125) if real else lcg.fill_fp16(K, N, 2, -2, 2)
         z = lcg.fill_fp16(M, N, 3, 3 if acc else 0, 3 if acc else 0)
@@ -135,6 +135,89 @@ def run_rowops(rows: int, cols: int, cluster: str, nsamples: int = 64) -> bool:
         bad, maxerr = lcg.compare_samples(got[tag], arr, atol=2e-2, rtol=2e-2)
         print(f"     {tag:<6} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
         ok &= bad == 0
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
+
+
+def llm_tokens(S: int, kind: str) -> np.ndarray:
+    """Token mask classes (uint16, 0xFFFF = padding) == tok_prefix / causal in tests/gvsoc/llmops/main.c."""
+    PAD = 0xFFFF
+    if kind == "causal":
+        return np.arange(S, dtype=np.uint32)
+    img = S - 64
+    tok = np.full(S, PAD, dtype=np.uint32)
+    tok[:img] = 0; tok[img:img + 5] = 0; tok[img + 48] = 1
+    return tok
+
+
+def masked_softmax_ref(x: np.ndarray, scale: float, tok_q: np.ndarray, tok_k: np.ndarray) -> np.ndarray:
+    """softmax(scale x) with key j allowed for query i iff tok[j] <= tok[i] (unsigned); a padding query row -> uniform
+    (torch's softmax of an all -inf row, which is what lerobot's eager attention produces for padded queries)."""
+    allowed = (tok_k[None, :] <= tok_q[:, None]) & (tok_q[:, None] != 0xFFFF)
+    z = np.where(allowed, scale * x, -np.inf)
+    m = np.where(allowed.any(1, keepdims=True), z.max(1, keepdims=True), 0.0)
+    e = np.exp(z - m); e = np.where(allowed, e, 0.0)
+    s = e.sum(1, keepdims=True)
+    out = np.where(s > 0, e / np.where(s > 0, s, 1.0), 1.0 / x.shape[1])
+    return out.astype(np.float32)
+
+
+def gqa_reference(S: int, D: int, H: int, Hkv: int, tok: np.ndarray | None, scale: float = 0.125) -> np.ndarray:
+    """numpy twin of the sh_attention_gqa call in tests/gvsoc/llmops/main.c (fp16 roundings where the device stores fp16)."""
+    from softhier_mlir.testing import lcg
+    f = lambda *a, **k: lcg.fill_fp16(*a, **k).astype(np.float32)  # noqa: E731
+    r16 = lambda a: a.astype(np.float16).astype(np.float32)  # noqa: E731
+    dh = D // H; dkv = Hkv * dh
+    q = f(S, D, 21, -8, 8, 0.125); k = f(S, dkv, 22, -8, 8, 0.125); v = f(S, dkv, 23, -16, 16, 0.125)
+    o = np.zeros((S, D), np.float32)
+    grp = H // Hkv
+    for hd in range(H):
+        sl = slice(hd * dh, (hd + 1) * dh); kv = slice((hd // grp) * dh, (hd // grp + 1) * dh)
+        s = r16(q[:, sl] @ k[:, kv].T)
+        if tok is None:
+            p = np.exp(scale * s - (scale * s).max(1, keepdims=True)); p = p / p.sum(1, keepdims=True)
+        else:
+            p = masked_softmax_ref(s, scale, tok, tok)
+        o[:, sl] = r16(r16(p) @ v[:, kv])
+    return o
+
+
+def run_llmops(rows: int, cols: int, heads: int, kv_heads: int, cluster: str, nsamples: int = 256) -> bool:
+    """RMSNorm / RoPE / SiLU-mul / masked softmax / GQA attention of runtime/sh_llm.inc.c vs numpy."""
+    from softhier_mlir.testing import lcg
+    app = HERE / "llmops"
+    S, D, dh = rows, cols, 64
+    (app / "shape.h").write_text(f"#define SEQ {S}\n#define D_MODEL {D}\n#define N_HEADS {heads}\n#define N_KV_HEADS {kv_heads}\n"
+                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n")
+    build_sw(app)
+    r = run_sim(timeout=7200)
+    f = lambda *a, **k: lcg.fill_fp16(*a, **k).astype(np.float32)  # noqa: E731
+    x = f(S, D, 11, -16, 16, 0.125); b = f(S, D, 12, -16, 16, 0.125); g = f(1, D, 13, 1, 8, 0.25)
+    tab = f(S, dh, 15, -16, 16, 0.0625); sc = f(S, S, 16, -32, 32, 0.25)
+    rms = x / np.sqrt((x * x).mean(1, keepdims=True) + 1e-5) * g
+    xh = x.reshape(S, D // dh, dh); x1, x2 = xh[..., :dh // 2], xh[..., dh // 2:]
+    c = tab[:, None, :dh // 2]; s = tab[:, None, dh // 2:]
+    rope = np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], -1).reshape(S, D)
+    silu = x / (1 + np.exp(-x)) * b
+    ta, tc = llm_tokens(S, "prefix"), llm_tokens(S, "causal")
+    ref = {"RMS": rms, "ROPE": rope, "SILU": silu, "SMA": masked_softmax_ref(sc, 0.5, ta, ta), "SMC": masked_softmax_ref(sc, 0.5, tc, tc),
+           "O": gqa_reference(S, D, heads, kv_heads, ta), "OU": gqa_reference(S, D, heads, kv_heads, None)}
+    got = lcg.parse_samples(r["stdout"])
+    ok = r["ok"] and "LLMOPS_DONE" in r["stdout"] and "LLMOPS_FAIL" not in r["stdout"]
+    per_op = dict(zip(list(ref), r["rois"]))
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[llmops]") or ln.startswith("[sh_"):
+            print("     " + ln)
+    print(f"{'PASS' if ok else 'FAIL'} llmops S={S} D={D} H={heads} Hkv={kv_heads} cluster={cluster} roi={sum(r['rois'])} ns wall={r['wall_s']}s")
+    print("     per-op ns: " + "  ".join(f"{k}={v}" for k, v in per_op.items()))
+    for tag, arr in ref.items():
+        if tag not in got:
+            print(f"     {tag:<5} MISSING"); ok = False; continue
+        bad, maxerr = lcg.compare_samples(got[tag], arr, atol=2e-2, rtol=2e-2, show=3)
+        print(f"     {tag:<5} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
+        ok &= bad == 0
+    (app / "last_run.log").write_text(r["stdout"])
     if not r["ok"]:
         print(r["stdout"][-1500:])
     return ok
@@ -388,13 +471,64 @@ def run_smolvla(npz: str, layers: int | None, attn: int, cluster: int, nsamples:
     return ok
 
 
-def report_smolvla(data: dict, stdout: str, layers: int, dumps: tuple, ok: bool) -> bool:
+def run_smolvla_vlm(npz: str, layers: int | None, attn: int, cluster: int, nsamples: int = 64, dumps=None,
+                    log: Path | None = None, timeout: int = 48 * 3600, app_dir: Path | None = None, from_log: Path | None = None,
+                    layer0: int = 0) -> bool:
+    """SmolVLA VLM text prefix (connector + 16 Llama layers, real weights via HBM preload) -> sampled device tensors
+    (EMB, L<n>, K<n>, V<n>, OUT over the valid tokens) against the fp32 lerobot-semantics reference and the fp16 floor
+    stored by `smolvla.py prepare-vlm`."""
+    from softhier_mlir.frontend import smolvla
+    from softhier_mlir.sim.preload import make_preload_elf
+    data = dict(np.load(npz))
+    npz_layers = int(data["meta"][1])
+    layers = (npz_layers - layer0) if layers is None else layers
+    last = layer0 + layers
+    n = int(data["meta"][0])
+    if not dumps:
+        dumps = (("EMB",) if layer0 == 0 else ()) + tuple(f"{t}{i}" for i in range(layer0 + 1, last + 1) for t in ("L", "K", "V")) \
+            + (("OUT",) if last == npz_layers else ())
+    dumps = tuple(dumps)
+    # padded language rows are computed by both sides but never read (masked as keys everywhere); lerobot gives such a
+    # query uniform attention over its 241 keys, the device over S_pad = 256 (15 zero rows), so they are not compared
+    valid = smolvla.prefix_layout(int(data["meta"][2]), data["lang_mask"])["pad"]
+    if from_log is not None:
+        stdout = Path(from_log).read_text()
+        rois = [int(v) for v in PERF_RE.findall(stdout)]
+        print(f"[smolvla-vlm] re-evaluating {from_log}: tokens={n} layers {layer0 + 1}..{last} roi={rois[0] if rois else None} ns")
+        return report_smolvla(data, stdout, layers, dumps, bool(rois), valid)
+    app = Path(app_dir) if app_dir else HERE / "smolvla_vlm_app"
+    app.mkdir(parents=True, exist_ok=True)
+    rt = (HERE / "../../runtime").resolve()
+    (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c PARENT_SCOPE)\n"
+                                        f"set(INCLUDE_DIRS {rt} PARENT_SCOPE)\n")
+    mlir, pre = smolvla.emit_vlm(data, layers, cluster, attn, dumps=dumps, nsamples=nsamples, layer0=layer0)
+    info = smolvla.emit_vlm.last_info
+    (app / "smolvla_vlm.mlir").write_text(mlir)
+    elf = make_preload_elf(app / "smolvla_vlm_preload.elf", pre)
+    (app / "main.c").write_text(lower_and_translate(app / "smolvla_vlm.mlir", None))
+    build_sw(app)
+    text = sum(sz for _, sz in _elf_load_segments(build_sw.last_elf) if sz)
+    print(f"[smolvla-vlm] tokens={n} S_pad={info['S_pad']} layers {layer0 + 1}..{last} attn={attn} cluster={cluster} preload {elf.stat().st_size / 2 ** 20:.1f} MiB "
+          f"({info['n_west']} layers in the west region, {layers - info['n_west']} in the south), program {text / 1024:.1f} KB; "
+          f"KV cache at 0x{info['kv_base']:x} stride 0x{info['kv_stride']:x}; simulating...", flush=True)
+    r = run_sim(preload=elf, timeout=timeout, log=log)
+    (app / "last_run.log").write_text(r["stdout"])
+    print(f"{'PASS' if r['ok'] else 'FAIL'} smolvla-vlm tokens={n} layers {layer0 + 1}..{last} attn={attn} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    ok = report_smolvla(data, r["stdout"], layers, dumps, r["ok"], valid)
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
+
+
+def report_smolvla(data: dict, stdout: str, layers: int, dumps: tuple, ok: bool, valid_rows=None) -> bool:
     """Timing (marks) + accuracy of the sampled tensors. A tensor passes when every sample is within
     atol = 3% of the tensor's max |ref| (+ 5% relative) of the HF fp32 reference: the program is fp16 end
     to end (fp16 operands and RedMulE fp16 accumulation), so ~1e-2 of the tensor scale is the floor, and
     the post layernorm amplifies the last layer's error by gamma / row-std (~6x for this checkpoint)."""
     from softhier_mlir.testing import lcg
     got = lcg.parse_samples(stdout)
+    if valid_rows is not None:      # rows nobody reads (padded language tokens): not compared
+        got = {t: [(r_, c, v) for r_, c, v in smp if valid_rows[r_]] for t, smp in got.items()}
     marks = parse_marks(stdout)
     for ln in stdout.splitlines():
         if ln.startswith("[sh_"):
@@ -589,9 +723,12 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "gemm-seq", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir", "mesh", "attention", "preload", "smolvla"])
+    ap.add_argument("test", choices=["gemm", "gemm-seq", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir", "mesh", "attention", "preload", "smolvla",
+                                     "llmops", "smolvla-vlm"])
     ap.add_argument("--data", choices=["preload", "device"], default="preload",
                     help="test inputs: generated on the host into the HBM preload image (default) or on the device")
+    ap.add_argument("--kv-heads", type=int, default=5, help="llmops: key/value heads (GQA)")
+    ap.add_argument("--layer0", type=int, default=0, help="smolvla-vlm: first layer to run (the program starts from the reference's L<layer0>)")
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--npz", default="/app/models/smolvla_base/vision_s256.npz", help="smolvla: output of `smolvla.py prepare`")
     ap.add_argument("--attn", type=int, default=-1, help="smolvla: cluster of the per-head attention ops (-1 = SH_ALL per op)")
@@ -621,7 +758,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     DATA = a.data
     if a.cluster is None:
-        a.cluster = "all" if a.test == "smolvla" else "0"
+        a.cluster = "all" if a.test in ("smolvla", "smolvla-vlm") else "0"
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
     elif a.test == "gemm-seq":
@@ -630,6 +767,12 @@ if __name__ == "__main__":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
     elif a.test == "fp16cvt":
         ok = run_fp16cvt()
+    elif a.test == "llmops":
+        ok = run_llmops(a.rows, a.cols, a.heads, a.kv_heads, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
+    elif a.test == "smolvla-vlm":
+        ok = run_smolvla_vlm(a.npz, None if a.all_layers else a.layers, a.attn, -1 if a.cluster == "all" else int(a.cluster),
+                             a.nsamples, a.dumps, Path(a.log) if a.log else None, app_dir=a.app_dir,
+                             from_log=Path(a.from_log) if a.from_log else None, layer0=a.layer0)
     elif a.test == "mesh":
         ok = run_mesh(a.modes, a.heads)
     elif a.test == "siglip":

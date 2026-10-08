@@ -22,3 +22,6 @@ tests/gvsoc/*/preload.elf
 tests/gvsoc/gemm_seq/shape.h
 tests/gvsoc/attention/shape.h
 tests/gvsoc/attention/last_run.log
+tests/gvsoc/smolvla_vlm_app/
+tests/gvsoc/llmops/last_run.log
+tests/gvsoc/llmops/shape.h

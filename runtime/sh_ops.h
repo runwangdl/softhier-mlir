@@ -198,4 +198,32 @@ static inline void sh_f2h4(uint16_t *p, float a0, float a1, float a2, float a3) 
     p[0] = (uint16_t)h0; p[1] = (uint16_t)h1; p[2] = (uint16_t)h2; p[3] = (uint16_t)h3;
 }
 
+/* ---- Llama-style decoder ops (runtime/sh_llm.inc.c; fp16 HBM tensors, fp16 SIMD, cols % 4 == 0) ----------
+ * Attention masks are a uint16 token array (`tok`, one entry per sequence position, in HBM): tok[j] = the
+ * cumulative attention-block id of token j (big_vision / lerobot make_att_2d_masks: cumsum of att_masks),
+ * SH_LLM_PAD for padding. Query i attends key j iff tok[j] <= tok[i] (unsigned, so PAD keys never); a PAD
+ * query row gets uniform probabilities. causal: tok[j] = j; bidirectional: all 0; SmolVLA prefix: 0 for
+ * image + language tokens, PAD for language padding, 1 for the state token. */
+#define SH_LLM_PAD 0xFFFFu
+void sh_rmsnorm(uint64_t y, uint64_t x, uint64_t gamma, uint32_t rows, uint32_t cols, uint32_t ld, float eps, uint32_t cluster); /* y = x rsqrt(mean x^2 + eps) gamma */
+/* RoPE, HF Llama rotate-half convention, applied to every head of `dh` columns of the row: with x1 / x2 the
+ * two halves of a head and (cos | sin) the row's table entry (dh fp16: cos[dh/2] then sin[dh/2], precomputed
+ * by the host for that row's position id, leading dim ld_table), y1 = x1 cos - x2 sin, y2 = x2 cos + x1 sin. */
+void sh_rope(uint64_t y, uint64_t x, uint64_t cos_sin, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t ld_table, uint32_t dh, uint32_t cluster);
+void sh_silu_mul(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t cluster);           /* y = silu(a) * b */
+/* softmax(scale x + mask) per row of an [rows (queries) x cols (keys)] matrix; tok_q / tok_k index the rows / columns
+ * (the same array for self-attention). scale > 0. */
+void sh_softmax_masked(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, float scale, uint64_t tok_q, uint64_t tok_k, uint32_t cluster);
+/* One head of masked attention in TCDM (sh_attention_head with the token mask and fp16-SIMD softmax; tok == 0: no mask). */
+int sh_attention_head_masked(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, uint32_t dh,
+                             uint32_t ldq, uint32_t ldk, uint32_t ldv, uint32_t ldo, float scale, uint64_t tok, uint32_t cluster);
+/* Grouped-query attention: H query heads (dh = D / H columns each of q / o), Hkv key/value heads (columns
+ * [(h / (H / Hkv)) * dh, ...) of k / v, which are S x (Hkv * dh)), optional token mask (tok == 0: none).
+ * cluster == SH_ALL deals head h to cluster h % P and ends with a global barrier. */
+int sh_attention_gqa(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, uint32_t D, uint32_t H, uint32_t Hkv,
+                     uint32_t ldq, uint32_t ldk, uint32_t ldv, uint32_t ldo, float scale, uint64_t tok, uint32_t cluster);
+/* SmolVLM connector pixel shuffle: src [grid*grid, D] raster patch tokens -> dst [(grid/s)^2, D*s*s], output
+ * token (gr, gb) = the s x s patch block (rows gr*s.., cols gb*s..) row-major. Data movement only (iDMA). */
+void sh_pixel_shuffle(uint64_t dst, uint64_t src, uint32_t grid, uint32_t D, uint32_t s, uint32_t cluster);
+
 #endif /* SH_OPS_H */
