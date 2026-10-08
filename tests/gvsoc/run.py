@@ -108,7 +108,7 @@ def run_fp16cvt() -> bool:
         if ln.startswith("[fp16cvt]") or ln.startswith("h2f") or ln.startswith("f2h"):
             print("     " + ln)
     if len(r["rois"]) >= 2:
-        print(f"     timed loop: software {r['rois'][0]} ns, hardware {r['rois'][1]} ns ({r['rois'][0] / max(r['rois'][1], 1):.1f}x)")
+        print(f"     timed loop: software {r['rois'][0]} ns, hardware {r['rois'][1]} ns ({r['rois'][0] / max(r['rois'][1], 1):.1f}x); more ROIs: {r['rois'][2:]}")
     if not r["ok"]:
         print(r["stdout"][-1500:])
     return ok

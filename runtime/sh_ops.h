@@ -106,7 +106,9 @@ uint16_t sh_f32_to_fp16(float f);
  * broken (docs/SIMULATOR_NOTES.md #2) but fcvt.s.h / fcvt.h.s between registers work: load the half
  * with an integer lhu, NaN-box it into an FP register with fmv.w.x, convert; and back with
  * fcvt.h.s (RNE) + fmv.x.w + sh. ~1 FPU op each instead of ~60 integer ops. Verified bit-exact
- * against the software pair by tests/gvsoc/fp16cvt (NaN payloads excepted). */
+ * against the software pair by tests/gvsoc/fp16cvt (NaN payloads excepted).
+ * sh_f2h returns the half in the LOW 16 bits; the high 16 bits are the NaN-box (0xFFFF), so store
+ * it through a uint16_t (one `sh`) or mask it. */
 static inline float sh_h2f(uint32_t h) {
     float f;
     __asm__ ("fmv.w.x %0, %1\n\tfcvt.s.h %0, %0" : "=f"(f) : "r"(h | 0xFFFF0000u));
@@ -115,7 +117,7 @@ static inline float sh_h2f(uint32_t h) {
 static inline uint32_t sh_f2h(float f) {
     uint32_t h; float t;
     __asm__ ("fcvt.h.s %1, %2, rne\n\tfmv.x.w %0, %1" : "=r"(h), "=&f"(t) : "f"(f));
-    return h & 0xFFFFu;
+    return h;
 }
 
 #endif /* SH_OPS_H */

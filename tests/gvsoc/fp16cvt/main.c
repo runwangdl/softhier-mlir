@@ -27,7 +27,7 @@ int main(void) {
             if (n & 1) a.u = (a.u & 0x807fffffu) | (((lcg(&s) % 40) + 100) << 23);   /* exponents around the fp16 range */
             if ((n & 7) == 2) a.u &= ~0x0fffu;                                        /* exact / tie patterns */
             if ((n & 7) == 3) a.u = (a.u & ~0x1fffu) | 0x1000u;                       /* exact tie at bit 12 */
-            uint32_t hw = sh_f2h(a.f), sw = sh_f32_to_fp16(a.f);
+            uint32_t hw = sh_f2h(a.f) & 0xFFFFu, sw = sh_f32_to_fp16(a.f);
             if (is_nan32(a.u)) { if (!is_nan16(hw)) bad_f2h++; }
             else if (hw != sw) { if (bad_f2h < 8) sh_printf("f2h f=%08x hw=%04x sw=%04x\n", a.u, hw, sw); bad_f2h++; }
         }
@@ -44,6 +44,24 @@ int main(void) {
         uint32_t bad = 0;
         for (uint32_t i = 0; i < N_ELEMS; ++i) if (y[i] != sh_f32_to_fp16(sh_fp16_to_f32(x[i]) * 1.5f + 0.25f)) bad++;
         sh_printf("[fp16cvt] timed loop N=%u bad=%u\n", (uint32_t)N_ELEMS, bad);
+        /* 4. ILP probes: 4-way unrolled elementwise (ROI #3); sum with 1 accumulator (ROI #4) vs 4 (ROI #5) */
+        sh_timer_start();
+        for (uint32_t i = 0; i < N_ELEMS; i += 4) {
+            float a0 = sh_h2f(x[i]), a1 = sh_h2f(x[i + 1]), a2 = sh_h2f(x[i + 2]), a3 = sh_h2f(x[i + 3]);
+            a0 = a0 * 1.5f + 0.25f; a1 = a1 * 1.5f + 0.25f; a2 = a2 * 1.5f + 0.25f; a3 = a3 * 1.5f + 0.25f;
+            y[i] = (uint16_t)sh_f2h(a0); y[i + 1] = (uint16_t)sh_f2h(a1); y[i + 2] = (uint16_t)sh_f2h(a2); y[i + 3] = (uint16_t)sh_f2h(a3);
+        }
+        sh_timer_end();
+        float s1 = 0.f;
+        sh_timer_start();
+        for (uint32_t i = 0; i < N_ELEMS; ++i) s1 += sh_h2f(x[i]);
+        sh_timer_end();
+        float q0 = 0.f, q1 = 0.f, q2 = 0.f, q3 = 0.f;
+        sh_timer_start();
+        for (uint32_t i = 0; i < N_ELEMS; i += 4) { q0 += sh_h2f(x[i]); q1 += sh_h2f(x[i + 1]); q2 += sh_h2f(x[i + 2]); q3 += sh_h2f(x[i + 3]); }
+        sh_timer_end();
+        for (uint32_t i = 0; i < N_ELEMS; ++i) if (y[i] != sh_f32_to_fp16(sh_fp16_to_f32(x[i]) * 1.5f + 0.25f)) bad++;
+        sh_printf("[fp16cvt] ilp probes: sum1=%d sum4=%d (x1000) bad=%u\n", (int)(s1 * 1000.f), (int)((q0 + q1 + q2 + q3) * 1000.f), bad);
         sh_printf("FP16CVT_%s\n", (bad_h2f | bad_f2h | bad) ? "FAIL" : "PASS");
     }
     sh_barrier_global();
