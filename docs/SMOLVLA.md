@@ -105,7 +105,89 @@ ulp 2).
 
 ### 113 tokens (1 camera: 64 image + 48 language + 1 state), 16 layers, 16 clusters
 
-RESULTS_C1
+Run as two 8-layer programs (`--layers 8` and `--layer0 8 --layers 8`; host memory, see above), 128 samples per
+tensor, 16 clusters, gvsoc at 1 GHz, ideal HBM. The second program starts from the fp32 reference's L8 rounded to
+fp16, so its errors are those of layers 9-16 alone (the connector's error, below, does not carry over).
+Preload image 174 MiB (8 layers + connector + inputs) / 150 MiB; program 49 KB; wall 117 s + 118 s.
+
+Simulated time: preload wait 2.8 ms (not timed), connector + embedding scaling 0.344 ms, then
+
+| layer | attention (ms) | proj + MLP (ms) | total (ms) | | layer | attention | proj + MLP | total |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0.400 | 0.568 | 0.968 | | 9 | 0.357 | 0.569 | 0.926 |
+| 2 | 0.356 | 0.570 | 0.926 | | 10 | 0.357 | 0.508 | 0.865 |
+| 3 | 0.357 | 0.508 | 0.865 | | 11 | 0.357 | 0.508 | 0.865 |
+| 4 | 0.357 | 0.508 | 0.865 | | 12 | 0.357 | 0.507 | 0.865 |
+| 5 | 0.357 | 0.507 | 0.865 | | 13 | 0.357 | 0.565 | 0.923 |
+| 6 | 0.357 | 0.565 | 0.923 | | 14 | 0.362 | 0.569 | 0.931 |
+| 7 | 0.362 | 0.569 | 0.931 | | 15 | 0.362 | 0.569 | 0.931 |
+| 8 | 0.362 | 0.569 | 0.931 | | 16 | 0.362 | 0.569 | 0.931 |
+
+**0.909 ms per layer** (mean, 16 layers), **14.9 ms for the 16-layer prefix + 0.34 ms connector** at 113 tokens.
+Attention = 15 heads on 15 clusters, each ~360 k cycles of which ~300 k are the fetch-bound softmax; proj + MLP =
+7 GEMMs (M = 128) + 2 rmsnorm + silu_mul + 2 adds.
+
+Accuracy (rows that are read: 64 image + 5 language + state; padded language rows excluded, see run.py):
+
+| tensor | samples | max abs vs fp32 ref | median | max \|ref\| | max / max\|ref\| | vs fp16 floor max abs | |
+|---|---|---|---|---|---|---|---|
+| EMB | 79 | 6.5388 | 0.6482 | 2212.90 | 2.95e-03 | 6.7500 | PASS |
+| L1 | 79 | 6.8927 | 0.6208 | 2255.60 | 3.06e-03 | 7.0000 | PASS |
+| K1 | 82 | 0.0627 | 0.0055 | 11.57 | 5.42e-03 | 0.0615 | PASS |
+| V1 | 84 | 0.0023 | 0.0002 | 0.66 | 3.46e-03 | 0.0023 | PASS |
+| L2 | 79 | 6.9321 | 0.5769 | 2325.65 | 2.98e-03 | 7.1250 | PASS |
+| K2 | 82 | 0.0553 | 0.0095 | 18.20 | 3.04e-03 | 0.0547 | PASS |
+| V2 | 84 | 0.0142 | 0.0040 | 1.74 | 8.17e-03 | 0.0144 | PASS |
+| L3 | 79 | 6.9372 | 0.5997 | 2358.33 | 2.94e-03 | 7.2500 | PASS |
+| K3 | 82 | 0.0365 | 0.0105 | 17.11 | 2.13e-03 | 0.0371 | PASS |
+| V3 | 84 | 0.0207 | 0.0045 | 2.50 | 8.26e-03 | 0.0210 | PASS |
+| L4 | 79 | 6.9009 | 0.6004 | 2364.65 | 2.92e-03 | 7.2500 | PASS |
+| K4 | 82 | 0.0682 | 0.0093 | 12.64 | 5.39e-03 | 0.0684 | PASS |
+| V4 | 84 | 0.0191 | 0.0057 | 2.58 | 7.38e-03 | 0.0192 | PASS |
+| L5 | 79 | 6.9612 | 0.6040 | 2374.72 | 2.93e-03 | 7.2500 | PASS |
+| K5 | 82 | 0.0700 | 0.0120 | 11.97 | 5.85e-03 | 0.0693 | PASS |
+| V5 | 84 | 0.0339 | 0.0058 | 2.70 | 1.26e-02 | 0.0334 | PASS |
+| L6 | 79 | 6.9665 | 0.6108 | 2358.66 | 2.95e-03 | 7.2500 | PASS |
+| K6 | 82 | 0.0525 | 0.0101 | 15.23 | 3.45e-03 | 0.0527 | PASS |
+| V6 | 84 | 0.0342 | 0.0078 | 3.19 | 1.07e-02 | 0.0342 | PASS |
+| L7 | 79 | 6.9631 | 0.6528 | 2337.71 | 2.98e-03 | 7.2500 | PASS |
+| K7 | 82 | 0.0734 | 0.0092 | 13.98 | 5.25e-03 | 0.0781 | PASS |
+| V7 | 84 | 0.0428 | 0.0073 | 2.90 | 1.48e-02 | 0.0420 | PASS |
+| L8 | 79 | 6.8209 | 0.6517 | 2319.41 | 2.94e-03 | 7.0000 | PASS |
+| K8 | 82 | 0.0768 | 0.0082 | 15.05 | 5.10e-03 | 0.0742 | PASS |
+| V8 | 84 | 0.0314 | 0.0073 | 3.10 | 1.01e-02 | 0.0322 | PASS |
+| L9 | 79 | 0.1902 | 0.0214 | 2321.03 | 8.19e-05 | 0.3750 | PASS |
+| K9 | 82 | 0.0327 | 0.0028 | 14.17 | 2.31e-03 | 0.0312 | PASS |
+| V9 | 84 | 0.0139 | 0.0018 | 3.60 | 3.86e-03 | 0.0137 | PASS |
+| L10 | 79 | 0.2180 | 0.0234 | 2367.68 | 9.21e-05 | 0.3750 | PASS |
+| K10 | 82 | 0.0367 | 0.0025 | 14.00 | 2.62e-03 | 0.0391 | PASS |
+| V10 | 84 | 0.0223 | 0.0016 | 4.11 | 5.43e-03 | 0.0215 | PASS |
+| L11 | 79 | 0.2916 | 0.0296 | 2398.00 | 1.22e-04 | 0.3750 | PASS |
+| K11 | 82 | 0.0235 | 0.0042 | 13.54 | 1.73e-03 | 0.0195 | PASS |
+| V11 | 84 | 0.0132 | 0.0019 | 3.66 | 3.60e-03 | 0.0137 | PASS |
+| L12 | 79 | 0.2640 | 0.0286 | 2397.12 | 1.10e-04 | 0.3750 | PASS |
+| K12 | 82 | 0.0554 | 0.0036 | 14.11 | 3.93e-03 | 0.0625 | PASS |
+| V12 | 84 | 0.0220 | 0.0023 | 4.11 | 5.36e-03 | 0.0234 | PASS |
+| L13 | 79 | 0.3342 | 0.0330 | 2383.96 | 1.40e-04 | 0.5000 | PASS |
+| K13 | 82 | 0.0363 | 0.0028 | 16.32 | 2.22e-03 | 0.0391 | PASS |
+| V13 | 84 | 0.0187 | 0.0020 | 3.19 | 5.85e-03 | 0.0195 | PASS |
+| L14 | 79 | 0.5952 | 0.0443 | 2471.67 | 2.41e-04 | 0.5000 | PASS |
+| K14 | 82 | 0.0342 | 0.0041 | 16.24 | 2.10e-03 | 0.0352 | PASS |
+| V14 | 84 | 0.0167 | 0.0017 | 2.92 | 5.70e-03 | 0.0161 | PASS |
+| L15 | 79 | 0.5748 | 0.0539 | 2477.17 | 2.32e-04 | 0.5000 | PASS |
+| K15 | 82 | 0.0294 | 0.0024 | 16.71 | 1.76e-03 | 0.0273 | PASS |
+| V15 | 84 | 0.0185 | 0.0019 | 4.14 | 4.46e-03 | 0.0156 | PASS |
+| L16 | 79 | 1.0029 | 0.0620 | 2488.67 | 4.03e-04 | 0.5000 | PASS |
+| K16 | 82 | 0.0239 | 0.0033 | 18.11 | 1.32e-03 | 0.0200 | PASS |
+| V16 | 84 | 0.0320 | 0.0027 | 4.29 | 7.46e-03 | 0.0312 | PASS |
+| OUT | 82 | 0.0097 | 0.0006 | 24.76 | 3.93e-04 | 0.0078 | PASS |
+
+Reading: the residual stream's max error (6.5-7.0 from EMB through L8) is the **connector GEMM** (K = 12288
+accumulated in fp16 on RedMulE; the fp16 floor twin accumulates in fp32, which is why "vs floor" is the same 7):
+it sits in the massive-activation channels (|x| ~ 2200, fp16 ulp 2, i.e. ~3 ulp) of a few image tokens and is
+carried unchanged by the residual adds; the layers themselves add 0.2-1.0 (L9-L16 restart from an exact L8).
+Everything the expert consumes is at the fp16 floor: **K within 0.08 (0.2-0.6 % of its max 12-18), V within
+0.043 (0.4-1.5 % of its max 0.7-4.3)**, the final norm within 0.01 of 24.8. Median errors are 2-10x smaller.
 
 ### 241 tokens (3 cameras), 16 layers, 16 clusters
 
