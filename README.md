@@ -70,14 +70,33 @@ for f in tests/filecheck/*.mlir; do echo "$f"; done   # see each file's RUN line
 To run generated C on GVSoC, drop it into `soft_hier_sdk/generated/<name>/`
 (with a one-line CMakeLists) and `make sh-old-hs app=... && make sh-old-run`.
 
+## Design-space exploration
+
+`softhier_mlir/dse/` turns a module into a shape-level workload (`workload.py`), estimates it
+analytically for any `Arch` (`cost.py`: RedMulE FSM, DMA/HBM rates, double-buffered tiles,
+SUMMA collectives, scalar row ops), calibrates the constants on micro-benchmarks
+(`calibrate.py` + `tests/gvsoc/ubench`) and sweeps knob grids, simulating the top-K points per
+unique kernel shape on a **private** SoftHier copy (`sweep.py`). Results, the fitted
+constants and the model-vs-simulation errors are in [`docs/DSE.md`](docs/DSE.md).
+
+```bash
+python -m softhier_mlir.frontend.siglip --layers 12 --no-test | python -m softhier_mlir.dse.workload -
+python -m softhier_mlir.dse.calibrate --home /app/softhier_dse --fit docs/dse/params.json
+python -m softhier_mlir.dse.sweep --home /app/softhier_dse --params docs/dse/params.json \
+    --arch noc_link_width=256,512,1024 --arch redmule_ce=64x64,128x32 --arch mesh=1x1,4x4 --top 12
+```
+
 ## Layout
 
 ```
 docs/DESIGN.md                     the dialect abstraction + lowering pipeline
+docs/DSE.md                        cost model calibration + sweep results
 softhier_mlir/dialects/softhier.py the dialect (types + ops)
 softhier_mlir/transforms/          lowering passes (WIP)
+softhier_mlir/dse/                 workload IR, analytic cost model, calibration, sweep driver
 softhier_mlir/tools/softhier_opt.py the opt driver
 tests/filecheck/                   FileCheck tests
+tests/gvsoc/                       on-simulator tests (run.py) + ubench (cost-model micro-benchmarks)
 ```
 
 ## Why this can work

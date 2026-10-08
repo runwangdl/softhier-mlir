@@ -153,6 +153,11 @@ class Workload:
                 ops.append(o)
         return Workload(ops, self.name)
 
+    def remap_clusters(self, n_clusters: int) -> "Workload":
+        """Fold explicit cluster ids onto a mesh of n_clusters (the frontend pins attention heads
+        to ``hd % 16``; on a smaller mesh those ops would otherwise never run)."""
+        return Workload([replace(o, cluster=o.cluster % n_clusters) if o.cluster >= 0 else o for o in self.ops], self.name)
+
     def table(self) -> str:
         lines = [f"{'count':>5}  {'kind':<9} {'shape':<16} {'tile':<12} {'cl':<4} {'MMAC':>9} {'MB moved':>9}"]
         for rec, n in self.unique().values():
