@@ -515,11 +515,14 @@ def vision_outputs(ckpt: str | Path, seeds: list[int]) -> np.ndarray:
     import gc
     outs, todo = {}, []
     cache = Path("/app/models/smolvla_base/vision_s1024.npz")
+    per_seed = lambda s: Path(f"/app/models/smolvla_base/vision_out_seed{s}.npz")  # noqa: E731
     for s in seeds:
         if s == 0 and cache.exists():
             d = np.load(cache)
             if int(d["meta"][2]) == 0 and int(d["meta"][1]) == LAYERS:
                 outs[s] = d["ref_OUT"].astype(np.float32); continue
+        if per_seed(s).exists():
+            outs[s] = np.load(per_seed(s))["out"].astype(np.float32); continue
         todo.append(s)
     if todo:
         import torch
@@ -529,14 +532,20 @@ def vision_outputs(ckpt: str | Path, seeds: list[int]) -> np.ndarray:
                                  image_size=IMG, patch_size=PATCH, num_channels=3, hidden_act="gelu_pytorch_tanh",
                                  vision_use_head=False, attn_implementation="eager", layer_norm_eps=LN_EPS)
         model = SiglipVisionModel(cfg).eval()
-        f = safe_open(str(ckpt), "pt")          # tensor by tensor: no fp32 copy of the whole tower on the side
-        sd = {k[len(PREFIX):]: f.get_tensor(k).to(torch.float32) for k in f.keys() if k.startswith(PREFIX)}
-        missing, unexpected = model.load_state_dict(sd, strict=False)
-        assert not [m for m in missing if "head" not in m] and not unexpected, (missing, unexpected)
-        del sd
+        f = safe_open(str(ckpt), "pt")          # parameter by parameter (the host has ~1 GB free): no second fp32 copy
+        params = dict(model.named_parameters())
+        params.update(dict(model.named_buffers()))
+        loaded = 0
         with torch.no_grad():
+            for k in f.keys():
+                if k.startswith(PREFIX):
+                    nm = k[len(PREFIX):]
+                    nm = nm if nm in params else "vision_model." + nm
+                    params[nm].copy_(f.get_tensor(k).to(torch.float32)); loaded += 1
+            assert loaded == 197, loaded
             for s in todo:
                 outs[s] = model(pixel_values=torch.from_numpy(test_image(s))[None]).last_hidden_state[0].numpy()
+                np.savez(per_seed(s), out=outs[s].astype(np.float32))   # cached: a later run (or a crash) does not redo it
         del model; gc.collect()
     return np.stack([outs[s] for s in seeds])
 
@@ -749,7 +758,7 @@ VLM_TILES = {"wc": (64, 320, 256), "wq": (128, 192, 320), "wk": (128, 320, 320),
 
 
 def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -1, attn: int = -1,
-             dumps: tuple[str, ...] = ("EMB", "L1", "OUT"), nsamples: int = 64, marks: bool = True) -> tuple[str, dict[int, np.ndarray]]:
+             dumps: tuple[str, ...] = ("EMB", "L1", "OUT"), nsamples: int = 64, marks: bool = True, layer0: int = 0) -> tuple[str, dict[int, np.ndarray]]:
     """-> (mlir, {hbm_offset: array to preload}) of the VLM prefix program: pixel shuffle + connector GEMM per camera,
     sqrt(960) scaling, then one scf.for over the decoder layers (RMSNorm, q/k/v GEMMs with k/v written straight
     into the per-layer KV cache, RoPE on q and k, masked GQA attention, o-proj + residual, RMSNorm, gate/up GEMMs,
@@ -757,11 +766,16 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     rows carry TOK_PAD and are never attended). Weights live in two HBM regions (west, then south for the layers
     that do not fit in the first 256 MiB): the layer index selects the region through arith.divui.
     KV cache layout (what the action expert reads): layer L's keys at kv_base + L * kv_stride as [S_pad, 320]
-    fp16 row-major (head h = columns [64h, 64h+64), RoPE applied), its values right after at + S_pad*320*2."""
+    fp16 row-major (head h = columns [64h, 64h+64), RoPE applied), its values right after at + S_pad*320*2.
+    layer0 > 0: the program runs layers [layer0, layer0 + layers) only, starting from the reference's L<layer0>
+    rounded to fp16 (no connector / embedding stage): the simulator's host memory is ~400 MB + 2x the preload image,
+    which the shared 7.8 GB host cannot always spare for all 16 layers (324 MiB) at once."""
     data = np.load(npz) if isinstance(npz, (str, Path)) else npz
     P = {k[2:]: data[k] for k in data if k.startswith("p_")}
     n, npz_layers, n_cams = int(data["meta"][0]), int(data["meta"][1]), int(data["meta"][2])
-    layers = npz_layers if layers is None else layers
+    layers = (npz_layers - layer0) if layers is None else layers
+    assert layer0 + layers <= npz_layers, (layer0, layers, npz_layers)
+    last = layer0 + layers == npz_layers
     n_img = n_cams * IMG_TOKENS
     S = ((n + 127) // 128) * 128
     e = _Emitter()
@@ -806,12 +820,15 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
 
     # ---- inputs: vision outputs per camera, the residual stream with the language / state rows, mask + RoPE table
     x0 = np.zeros((S, TD), np.float16)
-    x0[n_img:n_img + LANG_LEN] = P["lang"]
-    x0[n_img + LANG_LEN] = P["state_emb"][0]
+    if layer0 == 0:
+        x0[n_img:n_img + LANG_LEN] = P["lang"]
+        x0[n_img + LANG_LEN] = P["state_emb"][0]
+    else:
+        x0[:n] = data[f"ref_L{layer0}"].astype(np.float16)
     tok = np.full(S, TOK_PAD, np.uint16); tok[:n] = data["tok"]
     rope = np.zeros((S, TDH), np.float16); rope[:n] = P["rope"]
     for c in range(n_cams):
-        B(f"vis{c}", GRID * GRID, D, data["vis_out"][c])
+        B(f"vis{c}", GRID * GRID, D, data["vis_out"][c] if layer0 == 0 else None)
     B("ps", n_img, D * PIX_SCALE * PIX_SCALE)
     B("x", S, TD, x0)
     pre[e.next_off] = tok; T["tok"] = f'memref<{S}xi16, "{e.space}">'
@@ -826,7 +843,7 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     e.next_off += layers * kv_stride
     T["kc"] = T["vc"] = f'memref<{S}x{TKVD}xf16, "{e.space}">'
     # ---- parameters: connector + final norm in the west region, the per-layer family split over west / south
-    B("wc", D * PIX_SCALE * PIX_SCALE, TD, P["wc"]); B("gfin", 1, TD, P["gfin"])
+    B("wc", D * PIX_SCALE * PIX_SCALE, TD, P["wc"] if layer0 == 0 else None); B("gfin", 1, TD, P["gfin"])
     fam_base = e.next_off
     layer0_off, stride = {}, 0
     probe = fam_base
@@ -839,7 +856,7 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     for L in range(layers):
         base = fam_base + L * stride + (gap if L >= n_west else 0)
         for nm, r, c in VLM_PARAMS:
-            arr = P[f"{nm}{L}"]
+            arr = P[f"{nm}{L + layer0}"]
             assert arr.shape == (r, c), (nm, L, arr.shape)
             pre[base + layer0_off[nm]] = arr
         if L == 0:
@@ -855,20 +872,22 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
 
     # ---- connector: pixel shuffle + projection per camera, then the sqrt(960) scaling of image + language rows
     mark("start")
-    for c in range(n_cams):
-        psv = hv(IMG_TOKENS, D * PIX_SCALE * PIX_SCALE, D * PIX_SCALE * PIX_SCALE, c * IMG_TOKENS * D * PIX_SCALE * PIX_SCALE)
-        e.op(f"%ps{c} = softhier.view %ps : {T['ps']} -> {psv}")
-        e.op(f"softhier.pixel_shuffle %vis{c} -> %ps{c} {{scale = {PIX_SCALE} : i32, {cl}}} : {T[f'vis{c}']} -> {psv}")
-    xi = hv(n_img, TD, TD, 0)
-    e.op(f"%ximg = softhier.view %x : {T['x']} -> {xi}")
-    e.op(f"softhier.gemm %ps, %wc into %ximg {{fmt = \"fp16\", {gem('wc', n_img)}, {cl}}} : {T['ps']}, {T['wc']}, {xi}")
-    xs = hv(n_img + LANG_LEN, TD, TD, 0)
-    e.op(f"%xsc = softhier.view %x : {T['x']} -> {xs}")
-    e.op(f"softhier.scale %xsc -> %xsc {{scale = {math.sqrt(TD)!r} : f32, {cl}}} : {xs} -> {xs}")
+    if layer0 == 0:
+        for c in range(n_cams):
+            psv = hv(IMG_TOKENS, D * PIX_SCALE * PIX_SCALE, D * PIX_SCALE * PIX_SCALE, c * IMG_TOKENS * D * PIX_SCALE * PIX_SCALE)
+            e.op(f"%ps{c} = softhier.view %ps : {T['ps']} -> {psv}")
+            e.op(f"softhier.pixel_shuffle %vis{c} -> %ps{c} {{scale = {PIX_SCALE} : i32, {cl}}} : {T[f'vis{c}']} -> {psv}")
+        xi = hv(n_img, TD, TD, 0)
+        e.op(f"%ximg = softhier.view %x : {T['x']} -> {xi}")
+        e.op(f"softhier.gemm %ps, %wc into %ximg {{fmt = \"fp16\", {gem('wc', n_img)}, {cl}}} : {T['ps']}, {T['wc']}, {xi}")
+        xs = hv(n_img + LANG_LEN, TD, TD, 0)
+        e.op(f"%xsc = softhier.view %x : {T['x']} -> {xs}")
+        e.op(f"softhier.scale %xsc -> %xsc {{scale = {math.sqrt(TD)!r} : f32, {cl}}} : {xs} -> {xs}")
     xv = hv(n, TD, TD, 0)
     e.op(f"%xval = softhier.view %x : {T['x']} -> {xv}")
     mark("emb")
-    dump_mark("embdump", dump("EMB", "xval", 200, xv))
+    if layer0 == 0:
+        dump_mark("embdump", dump("EMB", "xval", 200, xv))
 
     # ---- the decoder layers
     e.op("%c0 = arith.constant 0 : index")
@@ -877,8 +896,9 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     e.op(f"%cW = arith.constant {max(n_west, 1)} : index")
     e.op(f"%cS = arith.constant {stride} : index")
     e.op(f"%cG = arith.constant {gap} : index")
+    e.op(f"%cL0 = arith.constant {layer0 + 1} : index")
     e.op("scf.for %L = %c0 to %cL step %c1 {")
-    e.op("%L1 = arith.addi %L, %c1 : index")
+    e.op("%L1 = arith.addi %L, %cL0 : index")
     e.op("%Lr = arith.divui %L, %cW : index")
     e.op("%Lo = arith.muli %L, %cS : index")
     e.op("%Lg = arith.muli %Lr, %cG : index")
@@ -916,14 +936,16 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
         e.op(f'softhier.dump_samples %vcv, %L1 {{seed = 240 : i32, n = {nsamples} : i32, tag = "V"}} : {kvv}'); d = True
     dump_mark("ldump", d, "%L1")
     e.op("}")
-    e.op(f"softhier.rmsnorm %x, %gfin -> %fin {{eps = {RMS_EPS:.1e} : f32, {cl}}} : {T['x']}, {T['gfin']} -> {T['fin']}")
+    if last:
+        e.op(f"softhier.rmsnorm %x, %gfin -> %fin {{eps = {RMS_EPS:.1e} : f32, {cl}}} : {T['x']}, {T['gfin']} -> {T['fin']}")
     mark("end")
-    fv = hv(n, TD, TD, 0)
-    e.op(f"%finv = softhier.view %fin : {T['fin']} -> {fv}")
-    dump("OUT", "finv", 205, fv)
+    if last:
+        fv = hv(n, TD, TD, 0)
+        e.op(f"%finv = softhier.view %fin : {T['fin']} -> {fv}")
+        dump("OUT", "finv", 205, fv)
     body = "\n".join(e.lines)
     mlir = f"builtin.module {{\n  func.func @smolvla_vlm_prefix() {{\n{body}\n    func.return\n  }}\n}}\n"
-    info = {"S_pad": S, "n": n, "n_img": n_img, "kv_base": kv_base, "kv_stride": kv_stride, "fam_base": fam_base, "stride": stride,
+    info = {"S_pad": S, "n": n, "n_img": n_img, "layer0": layer0, "kv_base": kv_base, "kv_stride": kv_stride, "fam_base": fam_base, "stride": stride,
             "n_west": n_west, "gap": gap, "image_bytes": sum(a.nbytes for a in pre.values())}
     emit_vlm.last_info = info
     return mlir, pre

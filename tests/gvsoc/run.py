@@ -412,7 +412,8 @@ def run_smolvla(npz: str, layers: int | None, attn: int, cluster: int, nsamples:
 
 
 def run_smolvla_vlm(npz: str, layers: int | None, attn: int, cluster: int, nsamples: int = 64, dumps=None,
-                    log: Path | None = None, timeout: int = 48 * 3600, app_dir: Path | None = None, from_log: Path | None = None) -> bool:
+                    log: Path | None = None, timeout: int = 48 * 3600, app_dir: Path | None = None, from_log: Path | None = None,
+                    layer0: int = 0) -> bool:
     """SmolVLA VLM text prefix (connector + 16 Llama layers, real weights via HBM preload) -> sampled device tensors
     (EMB, L<n>, K<n>, V<n>, OUT over the valid tokens) against the fp32 lerobot-semantics reference and the fp16 floor
     stored by `smolvla.py prepare-vlm`."""
@@ -420,14 +421,13 @@ def run_smolvla_vlm(npz: str, layers: int | None, attn: int, cluster: int, nsamp
     from softhier_mlir.sim.preload import make_preload_elf
     data = dict(np.load(npz))
     npz_layers = int(data["meta"][1])
-    layers = npz_layers if layers is None else layers
+    layers = (npz_layers - layer0) if layers is None else layers
+    last = layer0 + layers
     n = int(data["meta"][0])
-    dumps = tuple(dumps) if dumps else ("EMB",) + tuple(f"{t}{i}" for i in range(1, layers + 1) for t in ("L", "K", "V")) + ("OUT",)
-    if layers != npz_layers:      # OUT = final norm after layer `layers`
-        def rms(a, g):
-            a = a.astype(np.float32); return a / np.sqrt((a * a).mean(1, keepdims=True) + smolvla.RMS_EPS) * g.astype(np.float32)
-        data["ref_OUT"] = rms(data[f"ref_L{layers}"], data["p_gfin"])
-        data["np_OUT"] = rms(data[f"np_L{layers}"], data["p_gfin"]).astype(np.float16).astype(np.float32)
+    if not dumps:
+        dumps = (("EMB",) if layer0 == 0 else ()) + tuple(f"{t}{i}" for i in range(layer0 + 1, last + 1) for t in ("L", "K", "V")) \
+            + (("OUT",) if last == npz_layers else ())
+    dumps = tuple(dumps)
     if from_log is not None:
         stdout = Path(from_log).read_text()
         rois = [int(v) for v in PERF_RE.findall(stdout)]
@@ -438,19 +438,19 @@ def run_smolvla_vlm(npz: str, layers: int | None, attn: int, cluster: int, nsamp
     rt = (HERE / "../../runtime").resolve()
     (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c PARENT_SCOPE)\n"
                                         f"set(INCLUDE_DIRS {rt} PARENT_SCOPE)\n")
-    mlir, pre = smolvla.emit_vlm(data, layers, cluster, attn, dumps=dumps, nsamples=nsamples)
+    mlir, pre = smolvla.emit_vlm(data, layers, cluster, attn, dumps=dumps, nsamples=nsamples, layer0=layer0)
     info = smolvla.emit_vlm.last_info
     (app / "smolvla_vlm.mlir").write_text(mlir)
     elf = make_preload_elf(app / "smolvla_vlm_preload.elf", pre)
     (app / "main.c").write_text(lower_and_translate(app / "smolvla_vlm.mlir", None))
     build_sw(app)
     text = sum(sz for _, sz in _elf_load_segments(build_sw.last_elf) if sz)
-    print(f"[smolvla-vlm] tokens={n} S_pad={info['S_pad']} layers={layers} attn={attn} cluster={cluster} preload {elf.stat().st_size / 2 ** 20:.1f} MiB "
+    print(f"[smolvla-vlm] tokens={n} S_pad={info['S_pad']} layers {layer0 + 1}..{last} attn={attn} cluster={cluster} preload {elf.stat().st_size / 2 ** 20:.1f} MiB "
           f"({info['n_west']} layers in the west region, {layers - info['n_west']} in the south), program {text / 1024:.1f} KB; "
           f"KV cache at 0x{info['kv_base']:x} stride 0x{info['kv_stride']:x}; simulating...", flush=True)
     r = run_sim(preload=elf, timeout=timeout, log=log)
     (app / "last_run.log").write_text(r["stdout"])
-    print(f"{'PASS' if r['ok'] else 'FAIL'} smolvla-vlm tokens={n} layers={layers} attn={attn} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    print(f"{'PASS' if r['ok'] else 'FAIL'} smolvla-vlm tokens={n} layers {layer0 + 1}..{last} attn={attn} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
     ok = report_smolvla(data, r["stdout"], layers, dumps, r["ok"])
     if not r["ok"]:
         print(r["stdout"][-1500:])
@@ -592,6 +592,7 @@ if __name__ == "__main__":
     ap.add_argument("test", choices=["gemm", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir", "mesh", "attention", "preload", "smolvla",
                                      "llmops", "smolvla-vlm"])
     ap.add_argument("--kv-heads", type=int, default=5, help="llmops: key/value heads (GQA)")
+    ap.add_argument("--layer0", type=int, default=0, help="smolvla-vlm: first layer to run (the program starts from the reference's L<layer0>)")
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--npz", default="/app/models/smolvla_base/vision_s256.npz", help="smolvla: output of `smolvla.py prepare`")
     ap.add_argument("--attn", type=int, default=-1, help="smolvla: cluster of the per-head attention ops (-1 = SH_ALL per op)")
@@ -632,7 +633,7 @@ if __name__ == "__main__":
     elif a.test == "smolvla-vlm":
         ok = run_smolvla_vlm(a.npz, None if a.all_layers else a.layers, a.attn, -1 if a.cluster == "all" else int(a.cluster),
                              a.nsamples, a.dumps, Path(a.log) if a.log else None, app_dir=a.app_dir,
-                             from_log=Path(a.from_log) if a.from_log else None)
+                             from_log=Path(a.from_log) if a.from_log else None, layer0=a.layer0)
     elif a.test == "mesh":
         ok = run_mesh(a.modes, a.heads)
     elif a.test == "siglip":

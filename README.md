@@ -178,3 +178,16 @@ the staged lowering pipeline are in [`docs/DESIGN.md`](docs/DESIGN.md).
 ## License
 
 Apache-2.0.
+
+### SmolVLA's VLM text prefix (16 Llama layers, GQA, RoPE, token-class attention mask)
+
+The prefix the action expert cross-attends to (connector + 16-layer SmolVLM2 text tower over image, language and
+state tokens) runs through `softhier.rmsnorm / rope / silu_mul / pixel_shuffle` and the masked grouped-query
+`softhier.attention` (`runtime/sh_llm.inc.c`); references, tolerances, the attention mask, the KV-cache layout
+and the simulated times are in [`docs/SMOLVLA.md`](docs/SMOLVLA.md).
+
+```bash
+python3 -m softhier_mlir.frontend.smolvla prepare-vlm --cams 3 --out /app/models/smolvla_base/vlm_c3.npz   # 241 tokens
+.venv/bin/python tests/gvsoc/run.py smolvla-vlm --npz /app/models/smolvla_base/vlm_c3.npz --all-layers
+.venv/bin/python tests/gvsoc/run.py llmops --cluster all                                                     # the ops alone
+```
