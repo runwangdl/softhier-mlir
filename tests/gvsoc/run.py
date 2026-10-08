@@ -46,16 +46,20 @@ def parse_shape(s: str) -> dict:
     return dict(M=m, N=n, K=k, tm=tm, tn=tn, tk=tk, pipeline=pipe, accumulate=acc, cluster=cluster)
 
 
-def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False) -> bool:
+def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False, offsets: tuple | None = None) -> bool:
+    """offsets: HBM byte offsets of X, W, Z (default all in HBM node 0; a node is 64 MB)."""
     app = HERE / "gemm"
     all_ok = True
     for s in shapes:
         c = parse_shape(s)
+        extra = ("#define REAL_DATA 1\n" if real else "")
+        if offsets:
+            extra += f"#define X_OFF 0x{offsets[0]:x}\n#define W_OFF 0x{offsets[1]:x}\n#define Z_OFF 0x{offsets[2]:x}\n"
         (app / "shape.h").write_text(
             f"#define GEMM_M {c['M']}\n#define GEMM_N {c['N']}\n#define GEMM_K {c['K']}\n"
             f"#define TILE_M {c['tm']}\n#define TILE_N {c['tn']}\n#define TILE_K {c['tk']}\n"
             f"#define PIPELINE {c['pipeline']}\n#define ACCUMULATE {c['accumulate']}\n"
-            f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n" + ("#define REAL_DATA 1\n" if real else ""))
+            f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n" + extra)
         build_sw(app)
         r = run_sim()
         lines = [ln for ln in r["stdout"].splitlines() if ln.startswith("[gemm]") or "mismatch" in ln]
@@ -484,6 +488,7 @@ if __name__ == "__main__":
     ap.add_argument("--modes", nargs="*", default=["0", "1", "2", "5", "6"], help="mesh: MODE[:DEF,...]")
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
+    ap.add_argument("--offsets", help="gemm: HBM byte offsets X,W,Z (hex ok; 64 MB per HBM node), default all in node 0")
     ap.add_argument("--define", nargs="*", default=[], help="siglip: extra NAME[=VALUE] macros for shape.h")
     ap.add_argument("--composed", action="store_true", help="attention: the per-head library-call path instead of the fused kernel")
     ap.add_argument("--fused", action="store_true", help="siglip-mlir: use the fused softhier.attention op")
@@ -491,7 +496,8 @@ if __name__ == "__main__":
     if a.cluster is None:
         a.cluster = "all" if a.test == "smolvla" else "0"
     if a.test == "gemm":
-        ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
+        ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real,
+                      tuple(int(v, 0) for v in a.offsets.split(",")) if a.offsets else None)
     elif a.test == "rowops":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
     elif a.test == "fp16cvt":

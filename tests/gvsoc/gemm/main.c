@@ -6,7 +6,12 @@
 int main(void) {
     sh_init();
     const uint32_t M = GEMM_M, N = GEMM_N, K = GEMM_K;
-    const uint64_t x = sh_hbm_addr(0x00000000), w = sh_hbm_addr(0x01000000), z = sh_hbm_addr(0x02000000);
+#ifndef X_OFF   /* HBM byte offsets (node = offset / 64 MB; run.py gemm --offsets places X/W/Z in different nodes) */
+#define X_OFF 0x00000000
+#define W_OFF 0x01000000
+#define Z_OFF 0x02000000
+#endif
+    const uint64_t x = sh_hbm_addr(X_OFF), w = sh_hbm_addr(W_OFF), z = sh_hbm_addr(Z_OFF);
     uint32_t bad = 0;
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
 #ifdef REAL_DATA   /* probabilities-like X, small real W: exercises fp16 rounding paths */
