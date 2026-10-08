@@ -233,10 +233,12 @@ Model accuracy:
 ## 8. Attention and tiling (2026-10-08, branch `agent/attn-simd-tiling`)
 
 Same setup as above (shared install, ideal HBM, 1 GHz). Layer times are the `softhier.mark`
-segments the frontend now emits (`run.py siglip-mlir` prints them); the `[Performance Counter]`
-ROI of that test also contains the sample dumps (printf), so it reads ~2 ms higher at S=256 and is
-not a layer time. The timeline PNGs come from `run.py siglip-mlir --trace <log>` +
-`python -m softhier_mlir.sim.trace <log> --png`.
+segments the frontend now emits (`run.py siglip-mlir` prints them: start -> qkv<L> -> attn<L> ->
+layer<L>); the `[Performance Counter]` ROI of that test contained the sample dumps (printf, ~2 ms
+at S=256) until `origin/main` moved them to an untimed epilogue, so the ROIs of the older runs are
+not layer times. The timeline PNGs come from `run.py siglip-mlir --trace <log>` +
+`python -m softhier_mlir.sim.trace <log> --png` (with `--trace` the mark lines can be glued to trace
+lines; the trace window is first to last RedMulE/iDMA event and misses the first ~50 us of LayerNorm).
 
 ### 8.1 Fused attention with the fp16 SIMD softmax (`runtime/sh_attention.inc.c`)
 
@@ -343,20 +345,34 @@ is the knob to fit next).
 
 | S | configuration | qkv proj | attention | rest (o-proj, LN2, FFN) | layer |
 |---|---|---|---|---|---|
-| 256 | per-head attention, 256^3 tiles (before) | BEFORE256 |
-| 256 | fused attention, scalar softmax, 256^3 tiles (before, `--fused`) | trace window 3.635 ms |
-| 256 | per-head attention, cost-model tiles | 0.324 | 0.831 | 1.040 | 2.148 (trace window) |
+| 256 | per-head attention, 256^3 tiles (before) | 0.336 | 0.831 | 1.106 | 2.273 (trace window 2.222) |
+| 256 | fused attention, scalar softmax, 256^3 tiles (before, `--fused`) | - | 2.25 (attention test) | - | trace window 3.635 |
+| 256 | per-head attention, cost-model tiles | 0.324 | 0.831 | 1.040 | 2.195 (trace window 2.148) |
 | 256 | fused SIMD attention, 256^3 tiles | 0.336 | 0.556 | 1.106 | 1.998 |
 | 256 | **fused SIMD attention, cost-model tiles** | 0.325 | 0.551 | 1.044 | **1.920** |
-| 256 | fused SIMD attention, cost-model tiles, HBM split | SPLIT256 |
-| 1024 | per-head attention, 256^3 tiles (before) | BEFORE1024 |
+| 256 | fused SIMD attention, cost-model tiles, HBM split | 0.332 | 0.556 | 1.044 | 1.932 |
+| 256 | per-head attention, cost-model tiles, HBM split | 0.332 | 0.835 | 1.044 | 2.211 |
+| 1024 | per-head attention, 256^3 tiles (before) | 1.144 | 11.774 | 4.235 | 17.15 |
+| 1024 | fused SIMD attention, 256^3 tiles | 1.148 | 7.770 | 4.376 | 13.29 |
 | 1024 | per-head attention, cost-model tiles | 1.020 | 11.775 | 3.876 | 16.67 |
 | 1024 | **fused SIMD attention, cost-model tiles** | 1.024 | 7.770 | 3.932 | **12.73** |
-| 1024 | fused SIMD attention, cost-model tiles, HBM split | SPLIT1024 |
+| 1024 | fused SIMD attention, cost-model tiles, HBM split | 0.969 | 7.770 | 3.750 | 12.49 |
+| 1024 | per-head attention, cost-model tiles, HBM split | 0.969 | 11.775 | 3.750 | 16.49 |
 
-RedMulE busy (mean over the 16 clusters of the trace window, `softhier_mlir.sim.trace`): before
-(fused, scalar softmax) 1.0 %, per-head with the new tiles 1.6 %, fused SIMD + new tiles 2.0 %.
-The layer is still a row-op problem: LayerNorm (2 x ~0.15 ms), GELU on 256x3072 (~0.4 ms) and the
-bias adds are the long RedMulE-free stretches of the timeline, and the GEMMs that remain are
-HBM-bound (section 7). The PNGs: `docs/dse/timeline_s256_before.png` (per-head, 256^3 tiles),
-`docs/dse/timeline_s256_after.png` (fused SIMD attention, cost-model tiles).
+So: fused vs per-head 1.92 vs 2.27 ms at S=256 (1.18x; the attention itself 0.55 vs 0.83 ms,
+1.5x) and 12.73 vs 17.15 ms at S=1024 (1.35x; attention 7.77 vs 11.77 ms); the fused path with the
+old scalar softmax was 3.64 ms at S=256. The tile policy is worth 4 % of the layer at both sizes
+(78 us at S=256, 560 us at S=1024), the HBM split another 0-2 %: the GEMMs are a small part of the
+layer once the attention is fused. RedMulE busy (mean over the 16 clusters of the trace window,
+`softhier_mlir.sim.trace`): before (per-head, 256^3 tiles) 1.6 %, before `--fused` (scalar softmax)
+1.0 %, after (fused SIMD attention, cost-model tiles) 2.0 %, with the HBM split 2.0 %. The layer is
+still a row-op problem: LayerNorm (2 x ~0.15 ms), GELU on 256x3072 (~0.4 ms) and the bias adds are
+the long RedMulE-free stretches of the timeline, the softmax is 92 % of the attention, and the GEMMs
+that remain are HBM-bound (section 7). PNGs: `docs/dse/timeline_s256_before.png` (per-head, 256^3
+tiles), `docs/dse/timeline_s256_after.png` (fused SIMD attention, cost-model tiles),
+`docs/dse/timeline_s256_fused_scalar_before.png` (the old fused kernel).
+
+Measured on the shared install before the merge of `origin/main` (stock Snitch ISS, on-device
+test data); the merged branch uses `models_fast` and the preload data path, which the coordinator
+reports as cycle-identical, and the four HBM-split rows were run after the merge (their ROI no
+longer contains the dumps and equals the mark total).

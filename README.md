@@ -84,7 +84,7 @@ Verified on GVSoC (`../softhier/gvsoc`, RedMule traces + on-device checks):
 | `softhier.check_const` / `hbm_check_const` | on-device self-verify (prints PASS/FAIL) |
 | `softhier.cluster_pos` | this cluster's (x,y) |
 | `softhier.view` / `layernorm` / `softmax` / `gelu` / `add` / `add_bias` | strided HBM views + row-wise fp16 tensor ops (`sh_*` library calls) |
-| `softhier.attention %q, %k, %v -> %o {scale, heads}` | fused multi-head attention: each head's `softmax(scale q k^T) v` inside one cluster's TCDM (`sh_attention`) |
+| `softhier.attention %q, %k, %v -> %o {scale, heads, q_block}` | fused multi-head attention: `softmax(scale q k^T) v` in work items of `q_block` query rows inside one cluster's TCDM, fp16 SIMD softmax, any S the L1 holds (`sh_attention_q`); S=256: 0.55 ms vs 0.83 ms per-head, S=1024: 7.8 vs 11.8 ms. GEMM tiles come from the cost model (`softhier_mlir.dse.tiling`, the GEMMs are HBM-bound); numbers in `docs/DSE.md` section 8 |
 
 Memref memory spaces select the physical space / HBM edge:
 `"tcdm"`, `"remote_tcdm"`, `"hbm_west" | "hbm_south" | "hbm_north" | "hbm_east"`.

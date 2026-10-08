@@ -234,7 +234,7 @@ def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers:
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"]
     print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} attention={'fused' if fused else 'per-head'} "
-          f"tiles={tiles} hbm_split={hbm_split} roi={r['roi_ns']} ns (the ROI includes the sample dumps; see the marks) wall={r['wall_s']}s")
+          f"tiles={tiles} hbm_split={hbm_split} roi={r['roi_ns']} ns wall={r['wall_s']}s (layer segments: the marks below)")
     for ln in r["stdout"].splitlines():
         if ln.startswith("[sh_") or ln.startswith("[mark]"):
             print("     " + ln)
