@@ -32,6 +32,9 @@ static inline float sh_rsqrtf(float x) { union { float f; uint32_t u; } u; u.f =
 /* Generic driver: stage `rpb` rows of x (and optionally a second input b) into L1, let the first core
  * apply `fn` on the block, write the block back to y. All in fp16 bits in L1. */
 typedef void (*sh_rowfn_t)(uint16_t *yb, const uint16_t *xb, const uint16_t *bb, uint32_t nrows, uint32_t cols, const void *arg);
+#ifdef SH_DEBUG_SOFTMAX
+static void sh_k_softmax(uint16_t *yb, const uint16_t *xb, const uint16_t *bb, uint32_t nr, uint32_t cols, const void *a);
+#endif
 
 static void sh_rowop(uint64_t y, uint64_t x, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t ldx, uint32_t ldb,
                      uint32_t b_rows, sh_rowfn_t fn, const void *arg, uint32_t cluster) {
@@ -57,6 +60,19 @@ static void sh_rowop(uint64_t y, uint64_t x, uint64_t b, uint32_t rows, uint32_t
         }
         flex_intra_cluster_sync();
         if (first) fn((uint16_t *)local(yo), (const uint16_t *)local(xo), b ? (const uint16_t *)local(bo) : 0, nr, cols, arg);
+#ifdef SH_DEBUG_SOFTMAX        /* bisect aid: verify the softmax block in L1 right after it was computed (rows sum to 1, no negatives) */
+        if (first && fn == sh_k_softmax) {
+            uint32_t nbad = 0;
+            for (uint32_t r = 0; r < nr; ++r) {
+                const uint16_t *yr = (const uint16_t *)local(yo + r * rowb);
+                float sum = 0.f; uint32_t neg = 0;
+                for (uint32_t i = 0; i < cols; ++i) { sum += sh_fp16_to_f32(yr[i]); neg += (yr[i] >> 15) & (yr[i] != 0x8000u); }
+                union { float f; uint32_t u; } su; su.f = sum;
+                if (sum < 0.9f || sum > 1.1f || neg) { if (nbad < 4) sh_printf("[sh_softmax] cl %u blk %u row %u sum %08x neg %u\n", flex_get_cluster_id(), blk, r0 + r, su.u, neg); nbad++; }
+            }
+            if (nbad) sh_printf("[sh_softmax] cl %u blk %u: %u bad rows of %u\n", flex_get_cluster_id(), blk, nbad, nr);
+        }
+#endif
         flex_intra_cluster_sync();
         if (dm) { for (uint32_t r = 0; r < nr; ++r) bare_dma_start_1d(y + (uint64_t)(r0 + r) * ldy * 2, local(yo + r * rowb), rowb); bare_dma_wait_all(); }
         flex_intra_cluster_sync();

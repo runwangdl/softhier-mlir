@@ -94,15 +94,17 @@ def run_rowops(rows: int, cols: int, cluster: str, nsamples: int = 64) -> bool:
     return ok
 
 
-def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: int = 64) -> bool:
+def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: int = 64, extra: str = "") -> bool:
     from softhier_mlir.testing import lcg, siglip_ref
     app = HERE / "siglip_layer"
     (app / "shape.h").write_text(f"#define SEQ {seq}\n#define D_MODEL {d}\n#define D_FF {ff}\n#define N_HEADS {heads}\n"
-                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n")
+                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n" + extra)
     build_sw(app)
     r = run_sim(timeout=7200)
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
+    if "O0a" in got:
+        ref = {**ref, "O0a": ref["O0"]}
     ok = r["ok"] and "SIGLIP_LAYER_DONE" in r["stdout"]
     for ln in r["stdout"].splitlines():
         if ln.startswith("[sh_") or ln.startswith("[head"):
@@ -208,13 +210,15 @@ if __name__ == "__main__":
     ap.add_argument("--shapes", nargs="*")
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
+    ap.add_argument("--define", nargs="*", default=[], help="siglip: extra NAME[=VALUE] macros for shape.h")
     a = ap.parse_args()
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
     elif a.test == "rowops":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0")
     elif a.test == "siglip":
-        ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0")
+        ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0",
+                        extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "siglip-mlir":
         ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers)
     else:
