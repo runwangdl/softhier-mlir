@@ -1,14 +1,17 @@
-/* gvsoc test: sh_gemm on one cluster, data generated on device, sampled self-check.
- * Shape/tiling come from shape.h (written by tests/gvsoc/run.py). */
+/* gvsoc test: sh_gemm on one cluster, sampled self-check. Shape/tiling/HBM offsets come from shape.h
+ * (written by tests/gvsoc/run.py). Inputs: LCG matrices, either preloaded by the host (SH_PRELOAD = the
+ * image's sentinel offset; run.py generates the same bytes) or generated here (--data device). */
 #include "sh_ops.h"
-#include "shape.h"      /* GEMM_M GEMM_N GEMM_K TILE_M TILE_N TILE_K PIPELINE ACCUMULATE CLUSTER NSAMPLES */
+#include "shape.h"      /* GEMM_M GEMM_N GEMM_K TILE_M TILE_N TILE_K PIPELINE ACCUMULATE CLUSTER NSAMPLES OFF_X OFF_W OFF_Z [SH_PRELOAD] */
 
 int main(void) {
     sh_init();
     const uint32_t M = GEMM_M, N = GEMM_N, K = GEMM_K;
-    /* z behind w (a 12288 x 960 W is 23.6 MB: a fixed z at 32 MB overlapped it, 2026-10-08) */
-    const uint64_t x = sh_hbm_addr(0x00000000), w = sh_hbm_addr(0x01000000), z = sh_hbm_addr(0x01000000 + (((uint64_t)K * N * 2 + 0xFFFFFu) & ~0xFFFFFull));
+    const uint64_t x = sh_hbm_addr(OFF_X), w = sh_hbm_addr(OFF_W), z = sh_hbm_addr(OFF_Z);
     uint32_t bad = 0;
+#ifdef SH_PRELOAD   /* inputs are in the host's preload image: wait for its last segment (global barrier inside) */
+    sh_preload_wait(sh_hbm_addr(SH_PRELOAD));
+#else
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
 #ifdef REAL_DATA   /* probabilities-like X, small real W: exercises fp16 rounding paths */
         sh_test_fill_fp16(x, M, K, K, 1, 0, 64, 1.0f / 4096);
@@ -20,6 +23,7 @@ int main(void) {
         sh_test_fill_int_fp16(z, M, N, N, 3, ACCUMULATE ? 3 : 0, ACCUMULATE ? 3 : 0);  /* Z0 = 3.0 or 0 */
     }
     sh_barrier_global();
+#endif
     sh_gemm_cfg cfg = { .tm = TILE_M, .tn = TILE_N, .tk = TILE_K, .pipeline = PIPELINE,
                         .accumulate = ACCUMULATE, .fmt = SH_FP16, .l1_base = 0 };
     if (sh_cluster_id() == 0 && sh_is_first_core()) {

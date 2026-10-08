@@ -421,12 +421,41 @@ _EPILOGUE_OPS = (HbmCheckConstOp,)   # whole-buffer checks: after the timer. Sam
 _STRUCTURAL_OPS = (HbmBufferOp, L1BufferOp, ViewOp, arith.ConstantOp, arith.AddiOp, arith.SubiOp, arith.MuliOp, func.ReturnOp)
 
 
-def _phase_of(op) -> str:
+def _phase_of(op, later_ops=()) -> str:
+    """Prologue: test fills / preload wait. Epilogue: whole-buffer checks, and sample dumps whose
+    buffer no later top-level op touches (a dump of a buffer that is reused later, e.g. the residual
+    stream across layers, has to stay in place; it then costs printing time inside the ROI)."""
     if isinstance(op, _PROLOGUE_OPS):
         return "prologue"
     if isinstance(op, _EPILOGUE_OPS):
         return "epilogue"
+    if isinstance(op, DumpSamplesOp):
+        base = _base_value(op.buf)
+        for lo in later_ops:
+            if isinstance(lo, (DumpSamplesOp, HbmCheckConstOp)):
+                continue
+            for operand in _all_operands(lo):
+                if _base_value(operand) is base:
+                    return "kernel"
+        return "epilogue"
     return "kernel"
+
+
+def _base_value(v):
+    """Follow softhier.view chains to the underlying buffer SSA value."""
+    while isinstance(v.owner, ViewOp):
+        v = v.owner.src
+    return v
+
+
+def _all_operands(op):
+    """Operands of an op, descending into nested regions (scf.for bodies)."""
+    out = list(op.operands)
+    for region in op.regions:
+        for block in region.blocks:
+            for inner in block.ops:
+                out.extend(_all_operands(inner))
+    return out
 
 
 def emit_kernel(fn: func.FuncOp, bufs: _Buffers | None = None, phase: str | None = None) -> str:
@@ -442,7 +471,9 @@ def emit_kernel(fn: func.FuncOp, bufs: _Buffers | None = None, phase: str | None
             bufs.add_l1(op)
         elif isinstance(op, HbmBufferOp) and op.index is None:
             bufs.add_hbm(op)
-    ops = [op for op in fn.body.block.ops if phase is None or isinstance(op, _STRUCTURAL_OPS) or _phase_of(op) == phase]
+    top = list(fn.body.block.ops)
+    ops = [op for i, op in enumerate(top)
+           if phase is None or isinstance(op, _STRUCTURAL_OPS) or _phase_of(op, top[i + 1:]) == phase]
     body: list[str] = []
     _emit_ops(ops, bufs, idx, body.append, fn.sym_name.data.upper(), "    ")
     return "\n".join(bufs.top_decls + body)

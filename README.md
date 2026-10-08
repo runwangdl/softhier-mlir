@@ -30,6 +30,7 @@ runtime/sh_ops.h                   the library API (SPMD: every op is called by 
 runtime/sh_gemm.inc.c              tiled GEMM (any tm/tn/tk, split-K, double-buffered, cluster=0|SH_ALL), SUMMA
 runtime/sh_rowops.inc.c            layernorm / softmax / gelu / add / bias / scale / transpose on HBM tensors
 runtime/sh_test.inc.c              on-device LCG data + sampled dumps; host twin in softhier_mlir/testing/lcg.py
+softhier_mlir/sim/testdata.py      test inputs generated on the host into the HBM preload image (softhier-translate --preload-elf)
 softhier_mlir/sim/gvsoc.py         build (x86 chroot, private build dir) + run (ideal HBM) + Arch knobs
 tests/gvsoc/run.py                 gemm | rowops | siglip | siglip-mlir | mlir <files>: build, simulate, compare
 docs/SIMULATOR_NOTES.md            the gvsoc model bugs found on the way and the conventions relied on
@@ -43,6 +44,8 @@ bash tests/run_filecheck.sh                                   # compiler tests (
 python tests/gvsoc/run.py gemm                                # library GEMM shapes on gvsoc, self-checked
 python tests/gvsoc/run.py mlir examples/*.mlir                # every example end to end
 python tests/gvsoc/run.py siglip-mlir --seq 256 --cluster 0   # one encoder layer through the compiler
+python tests/gvsoc/run.py siglip --cluster all --data device  # test inputs generated on the device instead of
+                                                              # preloaded from the host (the default; ~20x less wall time)
 python -m softhier_mlir.frontend.siglip --layers 12 --no-test # the dialect module of a 12-layer encoder
 ```
 Simulator setup (aarch64 host, x86 toolchain chroot, ideal HBM) is described in `softhier_mlir/sim/gvsoc.py`.

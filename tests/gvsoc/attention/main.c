@@ -4,7 +4,7 @@
  *   COMPOSED=1  the library-call path: sh_transpose(K) + per head sh_gemm / sh_softmax_rows / sh_gemm via HBM
  * The ROI covers only the attention (same inputs, same output buffer, same sampling). */
 #include "sh_ops.h"
-#include "shape.h"
+#include "shape.h"   /* + HBM_START [SH_PRELOAD]: inputs preloaded by the host (sentinel offset) or generated here */
 
 #define DH (D_MODEL / N_HEADS)
 
@@ -12,19 +12,26 @@ int main(void) {
     sh_init();
     const uint32_t S = SEQ, D = D_MODEL, H = N_HEADS;
     const uint32_t mb = (S * D * 2 + 4095) & ~4095u;
-    const uint64_t q = sh_hbm_addr(0), k = sh_hbm_addr(mb), v = sh_hbm_addr(2 * mb), o = sh_hbm_addr(3 * mb);
-    const uint64_t kT = sh_hbm_addr(4 * mb), sc = sh_hbm_addr(5 * mb);   /* composed path only: K^T, H score matrices */
+    const uint64_t h0 = sh_hbm_addr(HBM_START);   /* layout mirrored in run.py run_attention */
+    const uint64_t q = h0, k = h0 + mb, v = h0 + 2 * mb, o = h0 + 3 * mb;
+    const uint64_t kT = h0 + 4 * mb, sc = h0 + 5 * mb;   /* composed path only: K^T, H score matrices */
     const float scale = 1.0f / 8.0f;   /* 1/sqrt(64); run.py uses the same constant */
     const int lead = (sh_cluster_id() == 0 && sh_is_first_core());
     if (lead) {
+#ifndef SH_PRELOAD
         sh_test_fill_fp16(q, S, D, D, 21, -8, 8, 0.125f);
         sh_test_fill_fp16(k, S, D, D, 22, -8, 8, 0.125f);
         sh_test_fill_fp16(v, S, D, D, 23, -16, 16, 0.125f);
         sh_test_fill_fp16(o, S, D, D, 24, 7, 7, 1.0f);   /* poison */
+#endif
         sh_printf("[attention] S=%u D=%u H=%u dh=%u cluster=%s composed=%d l1=%u B\n", S, D, H, DH,
                   CLUSTER == SH_ALL ? "all" : "0", COMPOSED, sh_attention_l1_bytes(S, DH));
     }
+#ifdef SH_PRELOAD
+    sh_preload_wait(sh_hbm_addr(SH_PRELOAD));
+#else
     sh_barrier_global();
+#endif
     if (lead) sh_timer_start();
     int rc = 0;
 #if COMPOSED
