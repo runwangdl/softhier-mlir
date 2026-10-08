@@ -490,7 +490,9 @@ class CrossAttentionOp(IRDLOperation):
     the tokens' own keys/values attended causally (query i sees own key j iff j <= i). ``mask %tok``: the
     prefix's 1 x Lp i16 token-class array (as for ``softhier.attention``'s mask: 0xFFFF = padding key; the
     expert's queries attend every non-padding prefix key). Query head h uses kv head h / (heads / kv_heads).
-    Each head runs inside one cluster's TCDM; ``cluster = -1`` deals head h to cluster h % P."""
+    Each head runs inside one cluster's TCDM; ``cluster = -1`` deals head h to cluster h % P. With the unit attribute
+    ``train`` it lowers to ``sh_t_attention_fwd`` (same result, the backward kernel's staging code: training programs keep
+    one attention implementation in the 64 KB instruction memory)."""
     name = "softhier.cross_attention"
     irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
     q = operand_def(MemRefType)
@@ -715,6 +717,56 @@ class GradAllReduceOp(IRDLOperation):
     assembly_format = "$src `->` $dst `,` $scal attr-dict `:` type($src) `->` type($dst) `,` type($scal)"
 
 
+@irdl_op_definition
+class LoraFwdOp(IRDLOperation):
+    """LoRA branch of a linear layer, accumulated into its output: ``y += s (x A) B`` with ``t = s x A`` (M x r) kept for
+    the backward (``sh_t_lora_fwd``; ``scale`` = s, ``tile_k`` = the K tile of x A)."""
+    name = "softhier.lora_fwd"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    a = operand_def(MemRefType)
+    b = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    t = operand_def(MemRefType)
+    scale = prop_def(FloatAttr)
+    assembly_format = "$x `,` $a `,` $b `->` $y `,` $t attr-dict `:` type($x) `,` type($a) `,` type($b) `->` type($y) `,` type($t)"
+
+
+@irdl_op_definition
+class LinearBwdOp(IRDLOperation):
+    """Backward of ``y = x W`` (W: K x N, [in, out]) w.r.t. x, plus with ``lora %a, %b, %t, %x grads %da, %db`` the LoRA
+    ``y[:, :nl] += s (x A) B`` (nl = columns of B, ``t`` = the forward's s x A): ``dx = dy W^T + s (dy B^T) A^T``,
+    ``dB = t^T dy``, ``dA = s x^T (dy B^T)``. The frozen-weight product is formed transposed (``dx^T = W dy^T``) so W is
+    read in its stored layout; ``scratch`` holds the transposed activations (``sh_t_linear_bwd``). ``tile_m`` / ``tile_k``:
+    tiles of ``W dy^T`` (K and N)."""
+    name = "softhier.linear_bwd"
+    irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
+    dy = operand_def(MemRefType)
+    w = operand_def(MemRefType)
+    a = opt_operand_def(MemRefType)
+    b = opt_operand_def(MemRefType)
+    t = opt_operand_def(MemRefType)
+    x = opt_operand_def(MemRefType)
+    da = opt_operand_def(MemRefType)
+    db = opt_operand_def(MemRefType)
+    dx = operand_def(MemRefType)
+    scratch = operand_def(MemRefType)
+    assembly_format = ("$dy `,` $w (`lora` $a^ `,` $b `,` $t `,` $x `grads` $da `,` $db)? `->` $dx `scratch` $scratch attr-dict `:` "
+                       "type($dy) `,` type($w) (`lora` type($a)^ `,` type($b) `,` type($t) `,` type($x) `grads` type($da) `,` type($db))? "
+                       "`->` type($dx) `scratch` type($scratch)")
+
+
+@irdl_op_definition
+class CopyOp(IRDLOperation):
+    """``dst = src`` for HBM tensors (strided views allowed): per-row 1-D DMA on the DM cores, rows dealt over the
+    clusters (``sh_t_copy``). Training programs seed an accumulating GEMM with it (residual / bias + x W)."""
+    name = "softhier.copy"
+    irdl_options = (ParsePropInAttrDict(),)
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    assembly_format = "$src `->` $dst attr-dict `:` type($src) `->` type($dst)"
+
+
 SoftHier = Dialect(
     "softhier",
     [
@@ -765,6 +817,9 @@ SoftHier = Dialect(
         OptimStepOp,
         AttentionBwdOp,
         GradAllReduceOp,
+        LoraFwdOp,
+        LinearBwdOp,
+        CopyOp,
     ],
     [],
 )

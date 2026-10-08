@@ -21,9 +21,19 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from softhier_mlir.testing import lcg  # noqa: E402
-from tests.gvsoc.expert import _app, _build_and_run, marks_seq  # noqa: E402
+from tests.gvsoc.expert import _build_and_run, marks_seq  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+
+
+def _app(app_dir: Path) -> Path:
+    """The SDK app dir; the library is built without the mesh SUMMA (unused, 4.5 KB of the 64 KB instruction memory)."""
+    app = Path(app_dir)
+    app.mkdir(parents=True, exist_ok=True)
+    rt = (HERE / "../../runtime").resolve()
+    (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c -DSH_NO_GEMM_MESH PARENT_SCOPE)\n"
+                                        f"set(INCLUDE_DIRS {rt} PARENT_SCOPE)\n")
+    return app
 F32_RE = re.compile(r"^(\S+) (\d+) (\d+) ([0-9a-fA-F]{8})$")
 
 
@@ -38,10 +48,12 @@ def parse_all(stdout: str) -> dict:
 
 def cmp(tag: str, got: list, ref: np.ndarray, rtol: float) -> tuple[bool, float, float]:
     """max abs error of the samples and the error relative to the reference's max |value|"""
-    err = max(abs(v - float(ref[r, c])) for r, c, v in got)
+    d = np.array([v - float(ref[r, c]) for r, c, v in got]); w = np.array([float(ref[r, c]) for r, c, _ in got])
+    err = float(np.abs(d).max())
     scale = float(np.abs(ref).max()) or 1.0
+    l2 = float(np.linalg.norm(d) / (np.linalg.norm(w) or 1.0))
     ok = err <= rtol * scale
-    print(f"     {tag:<8} n={len(got):<4} max abs err {err:.3e}  |ref| max {scale:.3e}  rel {err / scale:.2e}  {'PASS' if ok else 'FAIL'}")
+    print(f"     {tag:<8} n={len(got):<4} max abs err {err:.3e}  |ref| max {scale:.3e}  rel {err / scale:.2e}  rel-L2 {l2:.2e}  {'PASS' if ok else 'FAIL'}")
     return ok, err, err / scale
 
 

@@ -67,6 +67,9 @@ from softhier_mlir.dialects.softhier import (
     OptimStepOp,
     AttentionBwdOp,
     GradAllReduceOp,
+    LoraFwdOp,
+    LinearBwdOp,
+    CopyOp,
 )
 
 _ELEM_BYTES = {"f16": 2, "bf16": 2, "f32": 4, "f64": 8, "i8": 1, "i16": 2, "i32": 4}
@@ -426,7 +429,8 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             else:
                 So, ldko, ldvo, own = 0, 0, 0, "0, 0"
             tok = bufs.haddr(op.mask) if op.mask is not None else "0"
-            b(f"{ind}sh_x_attention({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
+            fn = "sh_t_attention_fwd" if "train" in op.attributes else "sh_x_attention"
+            b(f"{ind}{fn}({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
               f"{Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
 
         elif isinstance(op, GemmTransOp):
@@ -491,6 +495,30 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             b(f"{ind}sh_t_attention_bwd({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
               f"{bufs.haddr(op.do)}, {bufs.haddr(op.dq)}, {grads}, {Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, "
               f"{ldvo}, {bufs.geom(op.o)[2]}, {bufs.geom(op.do)[2]}, {bufs.geom(op.dq)[2]}, {lddk}, {lddv}, {_f(op.scale)}, {_cluster(op)});")
+
+        elif isinstance(op, CopyOp):
+            rows, cols, lds, _ = bufs.geom(op.src)
+            b(f"{ind}sh_t_copy({bufs.haddr(op.dst)}, {bufs.haddr(op.src)}, {rows}, {cols}, {bufs.geom(op.dst)[2]}, {lds}, {_cluster(op)});")
+
+        elif isinstance(op, LoraFwdOp):
+            m, k, ldx, _ = bufs.geom(op.x)
+            _, r, _, _ = bufs.geom(op.a)
+            _, n, ldy, _ = bufs.geom(op.y)
+            b(f"{ind}sh_t_lora_fwd({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {bufs.haddr(op.t)}, "
+              f"{m}, {k}, {n}, {r}, {ldy}, {ldx}, {_f(op.scale)}, {_int_attr(op, 'tile_k', k)}, {_cluster(op)});")
+
+        elif isinstance(op, LinearBwdOp):
+            m, n, lddy, _ = bufs.geom(op.dy)
+            k, _, ldw, _ = bufs.geom(op.w)
+            lddx = bufs.geom(op.dx)[2]
+            if op.a is not None:
+                r, nl, ldx = bufs.geom(op.a)[1], bufs.geom(op.db)[1], bufs.geom(op.x)[2]
+                lora = (f"{bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {bufs.haddr(op.t)}, {bufs.haddr(op.x)}, {bufs.haddr(op.da)}, "
+                        f"{bufs.haddr(op.db)}, {r}, {nl}, {ldx}, {_float_attr(op, 'scale', 1.0)}")
+            else:
+                lora = "0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0f"
+            b(f"{ind}sh_t_linear_bwd({bufs.haddr(op.dx)}, {bufs.haddr(op.dy)}, {bufs.haddr(op.w)}, {m}, {k}, {n}, {lddx}, {lddy}, {ldw}, "
+              f"{lora}, {bufs.haddr(op.scratch)}, {_int_attr(op, 'tile_m', 0)}, {_int_attr(op, 'tile_k', 0)}, {_cluster(op)});")
 
         elif isinstance(op, GradAllReduceOp):
             n = _nelem(bufs.memref(op.src))
@@ -645,9 +673,13 @@ int main(void) {{
 
 
 def emit_c(module: ModuleOp) -> str:
-    """Emit a complete ``main.c`` from a module containing one softhier func."""
+    """Emit a complete ``main.c`` from a module containing one softhier func. A ``sh.optimize = "Os"`` attribute on the
+    func compiles the generated code (call sequences only; the library keeps its flags) for size: the 64 KB instruction
+    memory holds library + program (docs/SIMULATOR_NOTES.md, program size)."""
     fn = next(op for op in module.body.block.ops if isinstance(op, func.FuncOp))
-    return _MAIN_TEMPLATE.format(kernel_name=fn.sym_name.data,
+    optim = fn.attributes.get("sh.optimize")
+    head = f'#pragma GCC optimize ("{optim.data}")\n' if optim is not None else ""
+    return head + _MAIN_TEMPLATE.format(kernel_name=fn.sym_name.data,
                                  prologue_body=emit_kernel(fn, phase="prologue"),
                                  kernel_body=emit_kernel(fn, phase="kernel"),
                                  epilogue_body=emit_kernel(fn, phase="epilogue"))

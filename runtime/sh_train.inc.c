@@ -22,6 +22,36 @@
 #define SH_T_L1_BYTES SH_ROWOPS_L1_BYTES
 #define SH_T_NS 4u
 
+/* Control code (drivers, wrappers, the backward compositions) is compiled for size: the 64 KB instruction memory holds the
+ * whole library + program, and none of it is on a per-element path. The per-element kernels (sh_tk_*, the attention head)
+ * keep the -O3 of the build. */
+#define SH_T_COLD __attribute__((optimize("Os")))
+/* The SDK's iDMA helpers are C99 `inline` without `static`: -O3 always inlines them, -Os may call them, so the unity build
+ * provides the external definitions (C99 6.7.4: an `extern` declaration of an inline function emits one). */
+extern inline uint32_t bare_dma_start_1d(uint64_t dst, uint64_t src, size_t size);
+extern inline uint32_t bare_dma_start_2d(uint64_t dst, uint64_t src, size_t size, size_t dst_stride, size_t src_stride, size_t repeat);
+extern inline void bare_dma_wait_all();
+extern inline void bare_dma_set_mask(uint16_t row_mask, uint16_t col_mask);
+extern inline uint32_t bare_dma_start_1d_reduction(uint64_t dst, uint64_t src, size_t size, collective_compute_format_t fmt, uint16_t row_mask, uint16_t col_mask);
+/* memcpy / memset for the cores: the toolchain's newlib is built with the C extension (compressed instructions) and the
+ * Snitch cores of this model do not execute RVC ("Executing illegal instruction ... opcode 0x...433d" = c.li inside
+ * newlib's memset). GCC emits these calls for struct copies / zeroing (-Os: compound-literal configs), so the library
+ * provides plain-RV32 versions, which the linker takes before libc's. Loop-to-libcall conversion is off inside them. */
+__attribute__((optimize("no-tree-loop-distribute-patterns"))) void *memcpy(void *d, const void *s, size_t n) {
+    if ((((uintptr_t)d | (uintptr_t)s | n) & 3u) == 0) {
+        uint32_t *dw = (uint32_t *)d; const uint32_t *sw = (const uint32_t *)s;
+        for (size_t i = 0; i < n / 4; ++i) dw[i] = sw[i];
+    } else {
+        uint8_t *db = (uint8_t *)d; const uint8_t *sb = (const uint8_t *)s;
+        for (size_t i = 0; i < n; ++i) db[i] = sb[i];
+    }
+    return d;
+}
+__attribute__((optimize("no-tree-loop-distribute-patterns"))) void *memset(void *d, int c, size_t n) {
+    uint8_t *db = (uint8_t *)d;
+    for (size_t i = 0; i < n; ++i) db[i] = (uint8_t)c;
+    return d;
+}
 static inline uint32_t sh_t_up64(uint32_t b) { return (b + 63u) & ~63u; }
 static inline uint32_t sh_t_root(void) { return flex_get_cluster_id() == 0 && flex_is_first_core(); }
 
@@ -31,7 +61,7 @@ typedef struct { sh_t_str in[SH_T_NS], out[SH_T_NS]; uint64_t p0; uint32_t p0byt
 typedef struct { uint8_t *in[SH_T_NS]; uint8_t *out[SH_T_NS]; const uint8_t *p0; uint32_t nr, r0; const sh_t_args *a; const void *arg; } sh_tblk;
 typedef void (*sh_tfn_t)(const sh_tblk *k);
 
-static void sh_t_rowop(const sh_t_args *a, sh_tfn_t fn, const void *arg, uint32_t cluster) {
+SH_T_COLD static void sh_t_rowop(const sh_t_args *a, sh_tfn_t fn, const void *arg, uint32_t cluster) {
     const uint32_t rows = a->rows;
     uint32_t rin = 0, rout = 0;
     for (uint32_t s = 0; s < SH_T_NS; ++s) {
@@ -132,7 +162,7 @@ static void sh_tk_rmsnorm_bwd(const sh_tblk *k) {
         }
     }
 }
-void sh_t_rmsnorm_bwd(uint64_t dx, uint64_t x, uint64_t dy, uint64_t dres, uint64_t gamma, uint32_t rows, uint32_t cols,
+SH_T_COLD void sh_t_rmsnorm_bwd(uint64_t dx, uint64_t x, uint64_t dy, uint64_t dres, uint64_t gamma, uint32_t rows, uint32_t cols,
                       uint32_t lddx, uint32_t ldx, uint32_t lddy, uint32_t lddres, float eps, uint32_t cluster) {
     if (sh_t_bad(cols & 3, "rmsnorm_bwd: cols % 4 != 0")) return;
     sh_t_args a; sh_t_clear(&a);
@@ -168,7 +198,7 @@ static void sh_tk_silu_mul_bwd(const sh_tblk *k) {
     }
     #undef SH_T_SILU_T
 }
-void sh_t_silu_mul_bwd(uint64_t da, uint64_t db, uint64_t a, uint64_t b, uint64_t dy, uint32_t rows, uint32_t cols,
+SH_T_COLD void sh_t_silu_mul_bwd(uint64_t da, uint64_t db, uint64_t a, uint64_t b, uint64_t dy, uint32_t rows, uint32_t cols,
                        uint32_t ldda, uint32_t lddb, uint32_t lda, uint32_t ldb, uint32_t lddy, uint32_t cluster) {
     if (sh_t_bad(cols & 3, "silu_mul_bwd: cols % 4 != 0")) return;
     sh_t_args s; sh_t_clear(&s);
@@ -198,7 +228,7 @@ static void sh_tk_softmax_bwd(const sh_tblk *k) {
         }
     }
 }
-void sh_t_softmax_bwd(uint64_t dx, uint64_t y, uint64_t dy, uint32_t rows, uint32_t cols, uint32_t ld, float scale, uint32_t cluster) {
+SH_T_COLD void sh_t_softmax_bwd(uint64_t dx, uint64_t y, uint64_t dy, uint32_t rows, uint32_t cols, uint32_t ld, float scale, uint32_t cluster) {
     if (sh_t_bad(cols & 3, "softmax_bwd: cols % 4 != 0")) return;
     sh_t_args a; sh_t_clear(&a);
     a.rows = rows; a.in[0] = sh_t_s16(y, cols, ld); a.in[1] = sh_t_s16(dy, cols, ld); a.out[0] = sh_t_s16(dx, cols, ld);
@@ -224,7 +254,7 @@ static void sh_tk_mse(const sh_tblk *k) {
         if (k->out[1]) ((float *)k->out[1])[r] = (s0 + s1) + (s2 + s3);
     }
 }
-void sh_t_mse_grad(uint64_t dy, uint64_t loss_rows, uint64_t pred, uint64_t tgt, uint32_t rows, uint32_t cols, uint32_t ld,
+SH_T_COLD void sh_t_mse_grad(uint64_t dy, uint64_t loss_rows, uint64_t pred, uint64_t tgt, uint32_t rows, uint32_t cols, uint32_t ld,
                    float gscale, uint32_t cluster) {
     if (sh_t_bad(cols & 3, "mse_grad: cols % 4 != 0")) return;
     sh_t_args a; sh_t_clear(&a);
@@ -250,7 +280,7 @@ static void sh_tk_gqa_sum(const sh_tblk *k) {
             }
     }
 }
-void sh_t_gqa_sum(uint64_t y, uint64_t x, uint32_t rows, uint32_t Hkv, uint32_t grp, uint32_t dh, uint32_t ldy, uint32_t ldx, uint32_t cluster) {
+SH_T_COLD void sh_t_gqa_sum(uint64_t y, uint64_t x, uint32_t rows, uint32_t Hkv, uint32_t grp, uint32_t dh, uint32_t ldy, uint32_t ldx, uint32_t cluster) {
     if (sh_t_bad(dh & 3, "gqa_sum: dh % 4 != 0")) return;
     sh_t_gqa_arg g = { grp, dh };
     sh_t_args a; sh_t_clear(&a);
@@ -293,7 +323,7 @@ static void sh_tk_optim(const sh_tblk *k) {
         w16[i] = (uint16_t)sh_f2h(wn);
     }
 }
-void sh_t_optim(uint64_t w32, uint64_t w16, uint64_t m32, uint64_t v32, uint64_t g, uint32_t gesz, uint32_t rows, uint32_t cols,
+SH_T_COLD void sh_t_optim(uint64_t w32, uint64_t w16, uint64_t m32, uint64_t v32, uint64_t g, uint32_t gesz, uint32_t rows, uint32_t cols,
                 uint32_t adam, float lr, float inv_scale, float b1, float b2, float eps, float bc1, float bc2, uint32_t cluster) {
     if (sh_t_bad((cols & 3) || (adam && (!m32 || !v32)), "optim: cols % 4 != 0 or Adam without moments")) return;
     sh_t_opt_arg o = { adam, gesz, lr, inv_scale, b1, b2, eps, bc1, bc2 };
@@ -310,12 +340,102 @@ void sh_t_optim(uint64_t w32, uint64_t w16, uint64_t m32, uint64_t v32, uint64_t
  * RedMulE reads both operands row-major from TCDM, so each transposed operand is first copied transposed into the
  * HBM scratch (sh_transpose: X' [M, K] at scratch, W' [K, N] behind it) and the plain sh_gemm runs on the copies.
  * scratch needs (tx ? M K : 0) + (tw ? K N : 0) fp16 elements. */
-int sh_t_gemm_tr(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K, uint32_t ldx, uint32_t ldw, uint32_t ldz,
+SH_T_COLD int sh_t_gemm_tr(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K, uint32_t ldx, uint32_t ldw, uint32_t ldz,
                  uint32_t tx, uint32_t tw, uint64_t scratch, const sh_gemm_cfg *cfg, uint32_t cluster) {
     if (tx) { sh_transpose(scratch, x, K, M, ldx, K, cluster); x = scratch; ldx = K; scratch += (uint64_t)M * K * 2; }
     if (tw) { sh_transpose(scratch, w, N, K, ldw, N, cluster); w = scratch; ldw = N; }
     if (cluster != SH_ALL) flex_intra_cluster_sync();
     return sh_gemm(x, w, z, M, N, K, ldx, ldw, ldz, cfg, cluster);
+}
+
+/* ---- copy and scale (the training programs' only elementwise needs besides the backward kernels) -----------------
+ * sh_t_copy: HBM -> HBM rows by 1-D DMA on the DM cores (rows dealt over the clusters), no staging. */
+SH_T_COLD void sh_t_copy(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint32_t ldd, uint32_t lds, uint32_t cluster) {
+    const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, cid = flex_get_cluster_id();
+    if (flex_is_dm_core() && (cluster == SH_ALL || cid == cluster)) {
+        for (uint32_t r = cluster == SH_ALL ? cid : 0; r < rows; r += cluster == SH_ALL ? P : 1)
+            bare_dma_start_1d(dst + (uint64_t)r * ldd * 2, src + (uint64_t)r * lds * 2, cols * 2);
+        bare_dma_wait_all();
+    }
+    sh_end_op(cluster);
+}
+static void sh_tk_scale(const sh_tblk *k) {
+    const sh_v4h s4 = sh_v4_splat(*(const float *)k->arg);
+    uint32_t lo, hi; sh_share(k->nr * k->a->in[0].cols, 4, &lo, &hi);
+    const sh_v4h *x = SH_V4CP(k->in[0]); sh_v4h *y = SH_V4P(k->out[0]);
+    for (uint32_t i = lo >> 2; i < (hi >> 2); ++i) y[i] = sh_v4_mul_r(x[i], s4);
+    /* the block is packed, so an odd row width (e.g. 50) leaves a 1..3 element tail on the last core */
+    const uint16_t *xs = (const uint16_t *)k->in[0]; uint16_t *ys = (uint16_t *)k->out[0]; const float s = *(const float *)k->arg;
+    for (uint32_t i = (hi & ~3u) > lo ? (hi & ~3u) : lo; i < hi; ++i) ys[i] = (uint16_t)sh_f2h(sh_h2f(xs[i]) * s);
+}
+SH_T_COLD static void sh_t_scale(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, float s, uint32_t cluster) {
+    sh_t_args a; sh_t_clear(&a);
+    a.rows = rows; a.in[0] = sh_t_s16(x, cols, ld); a.out[0] = sh_t_s16(y, cols, ld);
+    sh_t_rowop(&a, sh_tk_scale, &s, cluster);
+}
+
+/* ---- LoRA forward and the backward of a (LoRA-)linear layer -------------------------------------------------------
+ * Tile helpers: the largest candidate dividing n that still gives >= 15 tiles (16 clusters), else the smallest divisor. */
+SH_T_COLD static uint32_t sh_t_tile_n(uint32_t n) {
+    static const uint32_t c[] = { 256, 128, 64, 48, 32, 16 };
+    for (uint32_t i = 0; i < 6; ++i) if (n % c[i] == 0 && n / c[i] >= 15) return c[i];
+    for (int i = 5; i >= 0; --i) if (n % c[i] == 0) return c[i];
+    return n;
+}
+SH_T_COLD static uint32_t sh_t_tile_k(uint32_t n, uint32_t cap) {   /* the largest divisor of n <= cap that is a multiple of 16 (or n) */
+    if (n <= cap) return n;
+    for (uint32_t t = cap & ~15u; t >= 16; t -= 16) if (n % t == 0) return t;
+    return n;
+}
+SH_T_COLD static int sh_t_g(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K, uint32_t ldx, uint32_t ldw, uint32_t ldz,
+                  uint32_t tm, uint32_t tn, uint32_t tk, uint32_t acc, uint32_t cluster) {
+    sh_gemm_cfg c = { tm, tn, tk, 1, acc, SH_FP16, 0 };
+    return sh_gemm(x, w, z, M, N, K, ldx, ldw, ldz, &c, cluster);
+}
+static inline void sh_t_sync(uint32_t cluster) { if (cluster != SH_ALL) flex_intra_cluster_sync(); }
+
+/* Y[M, N] += s (X[M, K] A[K, r]) B[r, N]; t = s X A [M, r] is kept for the backward. tk | K: the K tile of X A. */
+SH_T_COLD int sh_t_lora_fwd(uint64_t y, uint64_t x, uint64_t a, uint64_t b, uint64_t t, uint32_t M, uint32_t K, uint32_t N, uint32_t r,
+                  uint32_t ldy, uint32_t ldx, float s, uint32_t tk, uint32_t cluster) {
+    int rc = sh_t_g(x, a, t, M, r, K, ldx, r, r, M, r, tk, 0, cluster);
+    sh_t_sync(cluster);
+    sh_t_scale(t, t, M, r, r, s, cluster);
+    rc |= sh_t_g(t, b, y, M, N, r, r, N, ldy, M, sh_t_tile_n(N), r, 1, cluster);
+    sh_t_sync(cluster);
+    return rc;
+}
+
+/* Backward of y[M, N] = x[M, K] W[K, N] (+ s (x A) B on the first nl output columns: the LoRA) w.r.t. x and, with a LoRA,
+ * its A [K, r] / B [r, nl]. Every product with the frozen W is formed transposed so RedMulE reads W in its stored
+ * [in, out] layout and only the M-row activations are transposed (M = 50 << K, N):
+ *     dyT = dy^T                       [N, M]     (sh_transpose)
+ *     dxT = W dyT                      [K, M]     (tiles tm x M x tk)
+ *   LoRA:
+ *     dB  = t^T dy[:, :nl]             [r, nl]    (t = s x A from the forward; sh_t_gemm_tr with the transposed t)
+ *     uT  = s B dyT[:nl]               [r, M]
+ *     dA  = (uT x)^T                   [K, r]
+ *     dxT += A uT
+ *     dx  = dxT^T                      [M, K]
+ * scratch (fp16): N M + K M + r M + r K + M r elements. a == 0: no LoRA. Returns 0 or < 0 (a GEMM constraint). */
+SH_T_COLD int sh_t_linear_bwd(uint64_t dx, uint64_t dy, uint64_t w, uint32_t M, uint32_t K, uint32_t N, uint32_t lddx, uint32_t lddy, uint32_t ldw,
+                    uint64_t a, uint64_t b, uint64_t t, uint64_t x, uint64_t da, uint64_t db, uint32_t r, uint32_t nl, uint32_t ldx, float s,
+                    uint64_t scratch, uint32_t tm, uint32_t tk, uint32_t cluster) {
+    const uint64_t dyT = scratch, dxT = dyT + (uint64_t)N * M * 2, uT = dxT + (uint64_t)K * M * 2, aT = uT + (uint64_t)r * M * 2,
+                   scr = aT + (uint64_t)r * K * 2;
+    int rc = 0;
+    sh_transpose(dyT, dy, M, N, lddy, M, cluster); sh_t_sync(cluster);
+    rc |= sh_t_g(w, dyT, dxT, K, M, N, ldw, M, M, tm, M, tk, 0, cluster); sh_t_sync(cluster);
+    if (a) {
+        sh_gemm_cfg c = { r, sh_t_tile_n(nl), M, 1, 0, SH_FP16, 0 };
+        rc |= sh_t_gemm_tr(t, dy, db, r, nl, M, r, lddy, nl, 1, 0, scr, &c, cluster); sh_t_sync(cluster);
+        rc |= sh_t_g(b, dyT, uT, r, M, nl, nl, M, M, r, M, sh_t_tile_k(nl, 1024), 0, cluster); sh_t_sync(cluster);
+        sh_t_scale(uT, uT, r, M, M, s, cluster); sh_t_sync(cluster);
+        rc |= sh_t_g(uT, x, aT, r, K, M, M, ldx, K, r, sh_t_tile_n(K), M, 0, cluster); sh_t_sync(cluster);
+        sh_transpose(da, aT, r, K, K, r, cluster); sh_t_sync(cluster);
+        rc |= sh_t_g(a, uT, dxT, K, M, r, r, M, M, tm, M, r, 1, cluster); sh_t_sync(cluster);
+    }
+    sh_transpose(dx, dxT, K, M, M, lddx, cluster); sh_t_sync(cluster);
+    return rc;
 }
 
 /* ---- attention backward ------------------------------------------------------------------------------------------
@@ -327,7 +447,10 @@ int sh_t_gemm_tr(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uin
  *   4. RedMulE  dq = dS K
  *   5. own keys only (So > 0): DMA-transpose the So own columns of dS and P, RedMulE dk = dS_own^T q, dv = P_own^T dO
  * The prefix keys/values are the frozen VLM's: no gradient is formed for them. dk / dv are per QUERY head (ld of the
- * caller's per-head scratch); sh_t_attention_bwd sums them over each kv group. */
+ * caller's per-head scratch); sh_t_attention_bwd sums them over each kv group.
+ * dout == 0 is the FORWARD of the same head (training programs use it instead of sh_x_attention_head so the staging,
+ * masking and softmax code exists once in the 64 KB instruction memory): steps 1-2 without o / dO, then RedMulE
+ * o = P V and o is stored (ldo). */
 typedef struct { uint32_t q, k, kt, v, vt, s, dp, o, dout, dq, dst, pt, dk, dv, sum, vrow, vld, end, Lpad; } sh_t_attn_l1;
 static inline sh_t_attn_l1 sh_t_attn_layout(uint32_t Sq, uint32_t dh, uint32_t L, uint32_t So, uint32_t base) {
     sh_t_attn_l1 l; const uint32_t Lpad = (L + 31u) & ~31u, NC = ARCH_NUM_CORE_PER_CLUSTER, qb = sh_t_up64(Sq * dh * 2), kb = sh_t_up64(Lpad * dh * 2);
@@ -361,19 +484,20 @@ int sh_t_attention_bwd_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, u
         sh_load_block_async(l.k, kp, Lp, dh, ldkp);
         sh_load_block_async(l.v, vp, Lp, dh, ldvp);
         if (So) { sh_load_block_async(l.k + Lp * dh * 2, ko, So, dh, ldko); sh_load_block_async(l.v + Lp * dh * 2, vo, So, dh, ldvo); }
-        sh_load_block_async(l.o, o, Sq, dh, ldo);
-        sh_load_block_async(l.dout, dout, Sq, dh, lddo);
+        if (dout) { sh_load_block_async(l.o, o, Sq, dh, ldo); sh_load_block_async(l.dout, dout, Sq, dh, lddo); }
         if (tok) bare_dma_start_1d(local(l.vrow), tok, Lp * 2);
         sh_l1_zero_dm(l.kt, dh * Lpad * 2);                   /* waits for everything issued so far */
-        sh_l1_zero_dm(l.vt, dh * Lpad * 2);
         sh_l1_zero_dm(l.s, Sq * Lpad * 2);
-        sh_l1_zero_dm(l.dp, Sq * Lpad * 2);
-        sh_l1_zero_dm(l.dq, Sq * dh * 2);
-        if (So) { sh_l1_zero_dm(l.dk, So * dh * 2); sh_l1_zero_dm(l.dv, So * dh * 2); }
+        if (dout) {
+            sh_l1_zero_dm(l.vt, dh * Lpad * 2);
+            sh_l1_zero_dm(l.dp, Sq * Lpad * 2);
+            sh_l1_zero_dm(l.dq, Sq * dh * 2);
+            if (So) { sh_l1_zero_dm(l.dk, So * dh * 2); sh_l1_zero_dm(l.dv, So * dh * 2); }
+        } else sh_l1_zero_dm(l.o, Sq * dh * 2);
         if (Lpad > L) { sh_l1_zero_dm(l.k + L * dh * 2, (Lpad - L) * dh * 2); sh_l1_zero_dm(l.v + L * dh * 2, (Lpad - L) * dh * 2); }
         for (uint32_t c = 0; c < dh; ++c) {
             bare_dma_start_2d(local(l.kt + c * Lpad * 2), local(l.k + c * 2), 2, 2, dh * 2, L);
-            bare_dma_start_2d(local(l.vt + c * Lpad * 2), local(l.v + c * 2), 2, 2, dh * 2, L);
+            if (dout) bare_dma_start_2d(local(l.vt + c * Lpad * 2), local(l.v + c * 2), 2, 2, dh * 2, L);
         }
         bare_dma_wait_all();
     }
@@ -406,6 +530,7 @@ int sh_t_attention_bwd_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, u
             sh_v4h *row = SH_V4P(local(l.s + r * Lpad * 2));
             const sh_v4h inv4 = sh_v4_splat(1.f / sh_x_softmax_row(row, vv, nn, cv, s2, &ec, s24, cm14));
             for (uint32_t j = 0; j < cv; ++j) row[j] = sh_v4_mul_r(row[j], inv4);
+            if (!dout) continue;
             const uint16_t *orow = (const uint16_t *)local(l.o + r * dh * 2), *grow = (const uint16_t *)local(l.dout + r * dh * 2);
             float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
             for (uint32_t j = 0; j < dh; j += 4) {
@@ -418,6 +543,13 @@ int sh_t_attention_bwd_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, u
         sh_fp_fence();
     }
     flex_intra_cluster_sync();
+    if (!dout) {   /* forward: o = P V */
+        if (first) { flex_redmule_config(Sq, Lpad, dh); flex_redmule_trigger(l.s, l.v, l.o, REDMULE_FP_16); flex_redmule_wait(); }
+        flex_intra_cluster_sync();
+        if (dm) { for (uint32_t r = 0; r < Sq; ++r) bare_dma_start_1d(o + (uint64_t)r * ldo * 2, local(l.o + r * dh * 2), dh * 2); bare_dma_wait_all(); }
+        flex_intra_cluster_sync();
+        return 0;
+    }
     /* 3. dP = dO V^T; dS = scale P (dP - D) */
     if (first) { flex_redmule_config(Sq, dh, Lpad); flex_redmule_trigger(l.dout, l.vt, l.dp, REDMULE_FP_16); flex_redmule_wait(); }
     flex_intra_cluster_sync();
@@ -461,13 +593,13 @@ int sh_t_attention_bwd_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, u
 /* Multi-head: query head h (columns h dh of q / o / dO / dq) with kv head h / (H / Hkv). With own keys (So > 0) the
  * per-head dk / dv go to `scratch` ([So, 2 H dh]: dk heads then dv heads) and are summed over each kv group into
  * dko / dvo (So x Hkv dh). cluster == SH_ALL deals head h to cluster h % P. */
-int sh_t_attention_bwd(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o, uint64_t dout,
+SH_T_COLD int sh_t_attention_bwd(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o, uint64_t dout,
                        uint64_t dq, uint64_t dko, uint64_t dvo, uint64_t scratch,
                        uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
                        uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo, uint32_t lddo,
                        uint32_t lddq, uint32_t lddko, uint32_t lddvo, float scale, uint32_t cluster) {
     const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y;
-    if (H == 0 || Hkv == 0 || H % Hkv || (So && !scratch)) {
+    if (H == 0 || Hkv == 0 || H % Hkv || (So && dout && !scratch)) {
         if (sh_t_root()) sh_printf("[sh_t_attention_bwd] H=%u Hkv=%u So=%u scratch=%u: bad arguments\n", H, Hkv, So, (uint32_t)(scratch != 0));
         return -1;
     }
@@ -476,17 +608,23 @@ int sh_t_attention_bwd(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64
     for (uint32_t h = 0; h < H; ++h) {
         const uint32_t cl = (cluster == SH_ALL) ? h % P : cluster;
         const uint64_t qo = (uint64_t)h * dh * 2, kvo = (uint64_t)(h / grp) * dh * 2;
-        const uint64_t dkh = So ? scratch + qo : 0, dvh = So ? scratch + (uint64_t)H * dh * 2 + qo : 0;
-        int r = sh_t_attention_bwd_head(q + qo, kp + kvo, vp + kvo, So ? ko + kvo : 0, So ? vo + kvo : 0, tok, o + qo, dout + qo,
+        const uint64_t dkh = So && dout ? scratch + qo : 0, dvh = So && dout ? scratch + (uint64_t)H * dh * 2 + qo : 0;
+        int r = sh_t_attention_bwd_head(q + qo, kp + kvo, vp + kvo, So ? ko + kvo : 0, So ? vo + kvo : 0, tok, o + qo, dout ? dout + qo : 0,
                                         dq + qo, dkh, dvh, Sq, Lp, So, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, lddo, lddq, lds, lds, scale, cl);
         if (r) rc = r;
     }
     if (cluster == SH_ALL) flex_global_barrier_xy(); else flex_intra_cluster_sync();
-    if (So) {
+    if (So && dout) {
         sh_t_gqa_sum(dko, scratch, So, Hkv, grp, dh, lddko, lds, cluster);
         sh_t_gqa_sum(dvo, scratch + (uint64_t)H * dh * 2, So, Hkv, grp, dh, lddvo, lds, cluster);
     }
     return rc;
+}
+
+int sh_t_attention_fwd(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                       uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
+                       uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster) {
+    return sh_t_attention_bwd(q, kp, vp, ko, vo, tok, o, 0, 0, 0, 0, 0, Sq, Lp, So, H, Hkv, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, 0, 0, 0, 0, scale, cluster);
 }
 
 /* ---- data-parallel gradient reduction with the in-network REDADD -----------------------------------------------------
@@ -517,7 +655,7 @@ static inline void sh_t_red_stage(uint32_t slots, uint64_t mine, uint32_t rd, ui
     bare_dma_wait_all();
 }
 
-int sh_t_allreduce(uint64_t dst, uint64_t src, uint32_t src_stride, uint32_t n, uint32_t mode, uint64_t scal) {
+SH_T_COLD int sh_t_allreduce(uint64_t dst, uint64_t src, uint32_t src_stride, uint32_t n, uint32_t mode, uint64_t scal) {
     const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, cid = flex_get_cluster_id(), CH = SH_T_RED_CHUNK, ce = CH / 2;
     const int dm = flex_is_dm_core();
     const uint16_t rm = sh_t_mask_all(ARCH_NUM_CLUSTER_X), cm = sh_t_mask_all(ARCH_NUM_CLUSTER_Y);
@@ -620,7 +758,7 @@ int sh_t_allreduce(uint64_t dst, uint64_t src, uint32_t src_stride, uint32_t n, 
 }
 
 /* ---- test helper: fp32 samples ("<tag> r c XXXXXXXX", the IEEE bits), first core ------------------------------- */
-void sh_t_dump_samples_f32(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, uint32_t nsamples, const char *tag) {
+SH_T_COLD void sh_t_dump_samples_f32(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, uint32_t nsamples, const char *tag) {
     uint32_t s = seed ^ 0x9e3779b9u;
     for (uint32_t n = 0; n < nsamples; ++n) {
         uint32_t i = sh_lcg(&s) % rows, j = sh_lcg(&s) % cols;

@@ -256,6 +256,14 @@ void sh_t_optim(uint64_t w32, uint64_t w16, uint64_t m32, uint64_t v32, uint64_t
 /* Z (+)= op(X) op(W); tx: X stored [K, M], tw: W stored [N, K]; transposed copies go to the HBM scratch first */
 int sh_t_gemm_tr(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K, uint32_t ldx, uint32_t ldw, uint32_t ldz,
                  uint32_t tx, uint32_t tw, uint64_t scratch, const sh_gemm_cfg *cfg, uint32_t cluster);
+/* LoRA forward: y[M, N] += s (x A) B, t = s x A [M, r] kept (tk: K tile of x A) */
+int sh_t_lora_fwd(uint64_t y, uint64_t x, uint64_t a, uint64_t b, uint64_t t, uint32_t M, uint32_t K, uint32_t N, uint32_t r,
+                  uint32_t ldy, uint32_t ldx, float s, uint32_t tk, uint32_t cluster);
+/* Backward of y = x W (+ LoRA s (x A) B on the first nl columns): dx (formed transposed: dx^T = W dy^T + A u^T, so W is read
+ * in its stored [K, N] layout), dA, dB. a == 0: no LoRA. scratch: N M + K M + r M + r K + M r fp16 elements. */
+int sh_t_linear_bwd(uint64_t dx, uint64_t dy, uint64_t w, uint32_t M, uint32_t K, uint32_t N, uint32_t lddx, uint32_t lddy, uint32_t ldw,
+                    uint64_t a, uint64_t b, uint64_t t, uint64_t x, uint64_t da, uint64_t db, uint32_t r, uint32_t nl, uint32_t ldx, float s,
+                    uint64_t scratch, uint32_t tm, uint32_t tk, uint32_t cluster);
 /* Backward of sh_x_attention (prefix KV frozen): dq for every query head; with own keys (So > 0) dko / dvo summed over
  * each kv group (scratch: [So, 2 H dh] per-head partials). */
 int sh_t_attention_bwd(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o, uint64_t dout,
@@ -267,6 +275,12 @@ int sh_t_attention_bwd_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, u
                             uint64_t dq, uint64_t dk, uint64_t dv, uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t dh,
                             uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo, uint32_t lddo,
                             uint32_t lddq, uint32_t lddk, uint32_t lddv, float scale, uint32_t cluster);
+/* The forward of sh_x_attention on the backward's staging code (training programs: one copy of it in instruction memory) */
+int sh_t_attention_fwd(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                       uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
+                       uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster);
+/* dst = src (HBM rows, 1-D DMA on the DM cores, rows dealt over the clusters for SH_ALL) */
+void sh_t_copy(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint32_t ldd, uint32_t lds, uint32_t cluster);
 uint32_t sh_t_attention_bwd_l1_bytes(uint32_t Sq, uint32_t L, uint32_t So, uint32_t dh);
 /* Data-parallel gradient sum over all clusters with the in-network REDADD: cluster c's n fp16 gradients at
  * src + c src_stride (bytes) -> dst (mode 0: fp16 REDADD_FP_16; mode 1: exact two-limb integer REDADD, dst fp32,

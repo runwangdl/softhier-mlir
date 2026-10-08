@@ -58,7 +58,7 @@ def arena_rows(layers: int = LAYERS) -> int:
 
 
 # saved activations of one layer (a "slab", one per layer + the final residual): name, cols
-SLAB = [("hin", D), ("xn", D), ("tq", R), ("qkv", DQ + 2 * DKV), ("o", DQ), ("to", R), ("h1", D), ("gu", 2 * FF), ("m", FF), ("td", R)]
+SLAB = [("hin", D), ("xn", D), ("tq", R), ("qkv", DQ + 2 * DKV), ("o", DQ), ("to", R), ("h1", D), ("gu", 2 * FF), ("mm", 2 * FF), ("td", R)]
 # GEMM tiles (tm, tn, tk) of the training program; forward ones from smolvla_expert.TILES
 TT = {"lq": (S, R, D), "lqb": (S, 64, R), "lo": (S, R, DQ), "lob": (S, 48, R), "ld": (S, R, 512), "ldb": (S, 48, R),
       "dB720": (R, 48, S), "dB960": (R, 64, S), "uT720": (R, S, D), "uT960": (R, S, DQ),
@@ -131,6 +131,29 @@ class TProg(_Prog):
         n = n or self.nsamples
         self.op(f'softhier.dump_samples %{name} {{seed = {seed} : i32, n = {n} : i32, tag = "{tag}"}} : {self.T[name]}')
 
+    def copy(self, src, dst):
+        self.op(f"softhier.copy %{src} -> %{dst} {{{self.cl}}} : {self.T[src]} -> {self.T[dst]}")
+
+    def lora_fwd(self, x, a, b, y, t, tk):
+        T = self.T
+        self.op(f"softhier.lora_fwd %{x}, %{a}, %{b} -> %{y}, %{t} {{scale = {LS!r} : f32, tile_k = {tk} : i32, {self.cl}}} : "
+                f"{T[x]}, {T[a]}, {T[b]} -> {T[y]}, {T[t]}")
+
+    def lin_bwd(self, dy, w, dx, tm, tk, lora=None):
+        """lora = (A, B, t, x, dA, dB)"""
+        T = self.T
+        lo, lt = "", ""
+        if lora:
+            a, b, t, x, da, db = lora
+            lo = f" lora %{a}, %{b}, %{t}, %{x} grads %{da}, %{db}"
+            lt = f" lora {T[a]}, {T[b]}, {T[t]}, {T[x]} grads {T[da]}, {T[db]}"
+        self.op(f"softhier.linear_bwd %{dy}, %{w}{lo} -> %{dx} scratch %lscr {{scale = {LS!r} : f32, tile_m = {tm} : i32, tile_k = {tk} : i32, "
+                f"{self.cl}}} : {T[dy]}, {T[w]}{lt} -> {T[dx]} scratch {T['lscr']}")
+
+    def module(self, name):
+        body = "\n".join(self.e.lines)
+        return f'builtin.module {{\n  func.func @{name}() attributes {{sh.optimize = "Os"}} {{\n{body}\n    func.return\n  }}\n}}\n'
+
 
 # ----------------------------------------------------------------------------- program pieces
 def _layer_fwd(P: TProg, kind: str, sl: dict, nxt_hin: str, W: dict, Lw: dict, kv: dict):
@@ -142,59 +165,41 @@ def _layer_fwd(P: TProg, kind: str, sl: dict, nxt_hin: str, W: dict, Lw: dict, k
         P.g(sl["xn"], W["wqkv"], sl["qkv"], E.TILES["qkv"])
     else:
         P.g(sl["xn"], W["wq"], sl["q"], E.TILES["qkv"])
-    P.g(sl["xn"], Lw["aq"], sl["tq"], TT["lq"]); P.scale(sl["tq"], sl["tq"], LS)
-    P.g(sl["tq"], Lw["bq"], sl["q"], TT["lqb"], acc=True)
+    P.lora_fwd(sl["xn"], Lw["aq"], Lw["bq"], sl["q"], sl["tq"], D)
     if kind == "self":
         P.rope(sl["q"], "rq_self"); P.rope(sl["k"], "rq_self")
         op(f"softhier.cross_attention %{sl['q']}, %{kv['kp']}, %{kv['vp']} own %{sl['k']}, %{sl['v']} mask %tok -> %{sl['o']} "
-           f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T[sl['q']]}, {T[kv['kp']]}, {T[kv['vp']]} "
+           f"{{train, scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T[sl['q']]}, {T[kv['kp']]}, {T[kv['vp']]} "
            f"own {T[sl['k']]}, {T[sl['v']]} mask {T['tok']} -> {T[sl['o']]}")
     else:
         P.rope(sl["q"], "rq_cross")
         op(f"softhier.cross_attention %{sl['q']}, %{kv['kx']}, %{kv['vx']} mask %tok -> %{sl['o']} "
-           f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T[sl['q']]}, {T[kv['kx']]}, {T[kv['vx']]} "
+           f"{{train, scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T[sl['q']]}, {T[kv['kx']]}, {T[kv['vx']]} "
            f"mask {T['tok']} -> {T[sl['o']]}")
-    P.g(sl["o"], W["wo"], "ao", E.TILES["o"])
-    P.g(sl["o"], Lw["ao"], sl["to"], TT["lo"]); P.scale(sl["to"], sl["to"], LS)
-    P.g(sl["to"], Lw["bo"], "ao", TT["lob"], acc=True)
-    P.add(sl["hin"], "ao", sl["h1"])
+    P.copy(sl["hin"], sl["h1"])                                   # h1 = h + o Wo + LoRA: the residual seeds the GEMM
+    P.g(sl["o"], W["wo"], sl["h1"], E.TILES["o"], acc=True)
+    P.lora_fwd(sl["o"], Lw["ao"], Lw["bo"], sl["h1"], sl["to"], DQ)
     P.rms(sl["h1"], W["g2"], "xn2")
     P.g("xn2", W["wgu"], sl["gu"], E.TILES["gu"])
     op(f"softhier.silu_mul %{sl['ga']}, %{sl['up']} -> %{sl['m']} {{{cl}}} : {T[sl['ga']]}, {T[sl['up']]} -> {T[sl['m']]}")
-    P.g(sl["m"], W["wd"], "f2", E.TILES["d"])
-    P.g(sl["m"], Lw["ad"], sl["td"], TT["ld"]); P.scale(sl["td"], sl["td"], LS)
-    P.g(sl["td"], Lw["bd"], "f2", TT["ldb"], acc=True)
-    P.add(sl["h1"], "f2", nxt_hin)
+    P.copy(sl["h1"], nxt_hin)
+    P.g(sl["m"], W["wd"], nxt_hin, E.TILES["d"], acc=True)
+    P.lora_fwd(sl["m"], Lw["ad"], Lw["bd"], nxt_hin, sl["td"], 512)
 
 
 def _layer_bwd(P: TProg, kind: str, sl: dict, W: dict, Lw: dict, Gw: dict, kv: dict, dh_out: str, dh_in: str, marks: bool = False, pidx=None):
     """Backward of one layer: dh_out (gradient of the layer output) -> dh_in (of its input); LoRA grads into Gw."""
     op, T, cl = P.op, P.T, P.cl
     mk = (lambda t: P.mark(t, pidx)) if marks else (lambda t: None)
-    nq = DQ + 2 * DKV if kind == "self" else DQ
-    # MLP down projection (LoRA d)
-    P.tr(dh_out, "dhT")
-    P.gt(sl["td"], dh_out, Gw["bd"], "gscr", TT["dB720"], tx=True)
-    P.g(Lw["bd"], "dhT", "uT", TT["uT720"]); P.scale("uT", "uT", LS)
-    P.g("uT", sl["m"], "aT2048", TT["aT2048"]); P.tr("aT2048", Gw["ad"])
-    P.g(W["wd"], "dhT", "dmT", TT["dmT"]); P.g(Lw["ad"], "uT", "dmT", TT["dmTa"], acc=True)
-    P.tr("dmT", "dm")
+    P.lin_bwd(dh_out, W["wd"], "dm", 128, 240, (Lw["ad"], Lw["bd"], sl["td"], sl["m"], Gw["ad"], Gw["bd"]))
     mk("bdown")
     op(f"softhier.silu_mul_bwd %{sl['ga']}, %{sl['up']}, %dm -> %dga, %dup {{{cl}}} : {T[sl['ga']]}, {T[sl['up']]}, {T['dm']} -> {T['dga']}, {T['dup']}")
     mk("bsilu")
-    P.tr("dgu", "dguT")
-    P.g(W["wgu"], "dguT", "dxnT", TT["dxn2T"]); P.tr("dxnT", "dxn")
+    P.lin_bwd("dgu", W["wgu"], "dxn", 48, 512)
     P.rms_bwd(sl["h1"], W["g2"], "dxn", "dh1", res=dh_out)
     mk("bgateup")
-    # o projection (LoRA o)
-    P.tr("dh1", "dhT")
-    P.gt(sl["to"], "dh1", Gw["bo"], "gscr", TT["dB720"], tx=True)
-    P.g(Lw["bo"], "dhT", "uT", TT["uT720"]); P.scale("uT", "uT", LS)
-    P.g("uT", sl["o"], "aT960", TT["aT960"]); P.tr("aT960", Gw["ao"])
-    P.g(W["wo"], "dhT", "doT", TT["doT"]); P.g(Lw["ao"], "uT", "doT", TT["doTa"], acc=True)
-    P.tr("doT", "do")
+    P.lin_bwd("dh1", W["wo"], "do", 64, 240, (Lw["ao"], Lw["bo"], sl["to"], sl["o"], Gw["ao"], Gw["bo"]))
     mk("boproj")
-    # attention
     if kind == "self":
         op(f"softhier.attention_bwd %{sl['q']}, %{kv['kp']}, %{kv['vp']} own %{sl['k']}, %{sl['v']} mask %tok, %{sl['o']}, %do -> %dq "
            f"grads %dk, %dv scratch %ascr {{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : "
@@ -205,35 +210,22 @@ def _layer_bwd(P: TProg, kind: str, sl: dict, W: dict, Lw: dict, Gw: dict, kv: d
            f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : "
            f"{T[sl['q']]}, {T[kv['kx']]}, {T[kv['vx']]} mask {T['tok']}, {T[sl['o']]}, {T['do']} -> {T['dq']}")
     mk("battn")
-    # RoPE^T, q projection (LoRA q), input norm
     if kind == "self":
         P.rope("dq", "rb_self"); P.rope("dk", "rb_self")
-        P.tr("dqkv", "dqkvT")
+        P.lin_bwd("dqkv", W["wqkv"], "dxn", 48, 320, (Lw["aq"], Lw["bq"], sl["tq"], sl["xn"], Gw["aq"], Gw["bq"]))
     else:
         P.rope("dq", "rb_cross")
-        P.tr("dq", "dqT")
-    P.gt(sl["tq"], "dq", Gw["bq"], "gscr", TT["dB960"], tx=True)
-    P.g(Lw["bq"], "dqT", "uT", TT["uT960"]); P.scale("uT", "uT", LS)
-    P.g("uT", sl["xn"], "aT720", TT["aT720"]); P.tr("aT720", Gw["aq"])
-    if kind == "self":
-        P.g(W["wqkv"], "dqkvT", "dxnT", TT["dxnT"])
-    else:
-        P.g(W["wq"], "dqT", "dxnT", TT["dxnT"])
-    P.g(Lw["aq"], "uT", "dxnT", TT["dxnTa"], acc=True)
-    P.tr("dxnT", "dxn")
+        P.lin_bwd("dq", W["wq"], "dxn", 48, 320, (Lw["aq"], Lw["bq"], sl["tq"], sl["xn"], Gw["aq"], Gw["bq"]))
     P.rms_bwd(sl["hin"], W["g1"], "dxn", dh_in, res="dh1")
     mk("bqproj")
-    del nq
 
 
 def _bwd_buffers(P: TProg):
-    for nm, r, c in [("dhT", D, S), ("uT", R, S), ("aT2048", R, FF), ("aT960", R, DQ), ("aT720", R, D), ("dmT", FF, S), ("dm", S, FF),
-                     ("dgu", S, 2 * FF), ("dguT", 2 * FF, S), ("dxnT", D, S), ("dxn", S, D), ("dh1", S, D), ("doT", DQ, S), ("do", S, DQ),
-                     ("dqkv", S, DQ + 2 * DKV), ("dqkvT", DQ + 2 * DKV, S), ("ascr", S, 2 * H * DH), ("gscr", 2 * FF, S)]:
+    for nm, r, c in [("dm", S, FF), ("dgu", S, 2 * FF), ("dxn", S, D), ("dh1", S, D), ("do", S, DQ), ("dqkv", S, DQ + 2 * DKV),
+                     ("ascr", S, 2 * H * DH), ("lscr", 5120, S)]:
         P.B(nm, r, c)
     P.vw("dga", "dgu", S, FF, 2 * FF, 0); P.vw("dup", "dgu", S, FF, 2 * FF, FF)
     P.vw("dq", "dqkv", S, DQ, DQ + 2 * DKV, 0); P.vw("dk", "dqkv", S, DKV, DQ + 2 * DKV, DQ); P.vw("dv", "dqkv", S, DKV, DQ + 2 * DKV, DQ + DKV)
-    P.vw("dqT", "dqkvT", DQ, S, S, 0)
 
 
 def _slab_layout():
@@ -253,6 +245,7 @@ def _slab_decl(P: TProg, idx: str, sfx: str, base: int, stride: int, lay: dict) 
     sl["q"] = P.vw(f"q{sfx}", sl["qkv"], S, DQ, nq, 0); sl["k"] = P.vw(f"k{sfx}", sl["qkv"], S, DKV, nq, DQ)
     sl["v"] = P.vw(f"v{sfx}", sl["qkv"], S, DKV, nq, DQ + DKV)
     sl["ga"] = P.vw(f"ga{sfx}", sl["gu"], S, FF, 2 * FF, 0); sl["up"] = P.vw(f"up{sfx}", sl["gu"], S, FF, 2 * FF, FF)
+    sl["m"] = P.vw(f"m{sfx}", sl["mm"], S, FF, 2 * FF, 0)        # silu(g) u with the ld of g | u
     return sl
 
 
@@ -287,8 +280,9 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     N = layers * LAYER_N
     rows = N // ARENA_COLS
     # ---- buffers: activations shared between layers, backward scratch, LoRA arenas, tables, weights, slabs
-    for nm, r, c in [("ao", S, D), ("xn2", S, D), ("f2", S, D), ("dhA", S, D), ("dhB", S, D)]:
+    for nm, r, c in [("xn2", S, D), ("dhB", S, D)]:
         P.B(nm, r, c)
+    P.B("dhA", S, D, None if head else (dh_in.astype(np.float32) * loss_scale).astype(np.float16))
     _bwd_buffers(P)
     w32 = np.ascontiguousarray(lora16.astype(np.float32).reshape(rows, ARENA_COLS))
     P.B("w16", rows, ARENA_COLS, lora16.reshape(rows, ARENA_COLS))
@@ -302,8 +296,11 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     P.B("rb_self", S, DH, rb(Wt["rq_self"])); P.B("rb_cross", S, DH, rb(Wt["rq_cross"]))
     P.B("tok", 1, LP, Wt["tok"].astype(np.uint16), elem="i16")
     if head:
-        for nm in ("wa", "ba", "wti", "tb", "wto", "bto", "gf", "wout", "bout"):
+        for nm in ("wa", "wti", "wto", "gf", "wout"):
             P.B(nm, *Wt[nm].shape, Wt[nm])
+        bc = lambda row: np.ascontiguousarray(np.broadcast_to(np.asarray(row, np.float16).reshape(1, -1), (S, row.size)))  # noqa: E731
+        P.B("ba_b", S, D, bc(Wt["ba"])); P.B("tb_b", S, D, bc(Wt["tb"][step])); P.B("bto_b", S, D, bc(Wt["bto"]))
+        P.B("bout_b", S, AD, bc(Wt["bout"])); P.B("ones", S, D, np.ones((S, D), np.float16))
         P.B("x", S, AD, x_in.astype(np.float16)); P.B("tgt", S, AD, target.astype(np.float16))
         for nm, r, c in [("e", S, D), ("e1", S, D), ("fin", S, D), ("vt", S, AD), ("dvt", S, AD), ("dfin", S, D)]:
             P.B(nm, r, c)
@@ -313,7 +310,6 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     slab0 = P.e.next_off
     if not head:
         P.pre[slab0 + lay["hin"]] = h_in.astype(np.float16)
-        P.B("dh_out", S, D, dh_in.astype(np.float16))
     P.e.next_off = slab0 + (layers + 1) * sstride
     for nm, off in (("hfin", slab0 + layers * sstride + lay["hin"]), ("h0", slab0 + lay["hin"])):
         T[nm] = f'memref<{S}x{D}xf16, "{P.sp}">'
@@ -352,15 +348,11 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     op("}")
     P.mark("kvproj")
     # ---- forward
-    if head:
-        P.g("x", "wa", "e", E.TILES["a"])
-        op(f"softhier.add_bias %e, %ba -> %e {{{P.cl}}} : {T['e']}, {T['ba']} -> {T['e']}")
-        P.g("e", "wti", "e1", E.TILES["t"])
-        P.vw("tbs", "tb", 1, D, D, step * D)
-        op(f"softhier.add_bias %e1, %tbs -> %e1 {{{P.cl}}} : {T['e1']}, {T['tbs']} -> {T['e1']}")
-        op(f"softhier.silu_mul %e1 -> %e1 {{{P.cl}}} : {T['e1']} -> {T['e1']}")
-        P.g("e1", "wto", "h0", E.TILES["t"])
-        op(f"softhier.add_bias %h0, %bto -> %h0 {{{P.cl}}} : {T['h0']}, {T['bto']} -> {T['h0']}")
+    if head:   # suffix embedding; biases are host-broadcast [50, n] matrices seeding accumulating GEMMs
+        P.copy("ba_b", "e"); P.g("x", "wa", "e", E.TILES["a"], acc=True)
+        P.copy("tb_b", "e1"); P.g("e", "wti", "e1", E.TILES["t"], acc=True)
+        op(f"softhier.silu_mul %e1, %ones -> %e1 {{{P.cl}}} : {T['e1']}, {T['ones']} -> {T['e1']}")
+        P.copy("bto_b", "h0"); P.g("e1", "wto", "h0", E.TILES["t"], acc=True)
         P.mark("emb")
     op("scf.for %p = %c0 to %cP step %c1 {")
     op("%L0 = arith.muli %p, %c2 : index"); op("%L1 = arith.addi %L0, %c1 : index"); op("%L2 = arith.addi %L0, %c2 : index")
@@ -377,17 +369,14 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     op("}")
     if head:
         P.rms("hfin", "gf", "fin")
-        P.g("fin", "wout", "vt", E.TILES["out"])
-        op(f"softhier.add_bias %vt, %bout -> %vt {{{P.cl}}} : {T['vt']}, {T['bout']} -> {T['vt']}")
+        P.copy("bout_b", "vt"); P.g("fin", "wout", "vt", E.TILES["out"], acc=True)
     P.mark("fwd")
     # ---- loss and the gradient entering the last layer
     if head:
         gs = 2.0 / (S * AD) * loss_scale
         op(f"softhier.mse_grad %vt, %tgt -> %dvt loss %lrows {{gscale = {gs!r} : f32, {P.cl}}} : {T['vt']}, {T['tgt']} -> {T['dvt']} loss {T['lrows']}")
-        P.gt("dvt", "wout", "dfin", "gscr", TT["dfin"], tw=True)
+        P.lin_bwd("dvt", "wout", "dfin", 48, AD)
         P.rms_bwd("hfin", "gf", "dfin", "dhA")
-    else:
-        P.scale("dh_out", "dhA", loss_scale)
     P.mark("loss")
     # ---- backward, pairs in reverse: cross 2p+1 (dhA -> dhB), self 2p (dhB -> dhA)
     op("scf.for %pr = %c0 to %cP step %c1 {")
