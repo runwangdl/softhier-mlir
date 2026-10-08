@@ -128,9 +128,13 @@ HF `SiglipVisionModel`):
 | run | per layer (simulated) | total | wall | embeddings | layer 1 | layer 12 | post-LN |
 |---|---|---|---|---|---|---|---|
 | seq 256, 12 layers | 2.29 ms (attention 1.21, proj+MLP 1.07) | 38.8 ms compute + 2.7 ms preload | 502 s | max abs 0.0067 (max 1.23) | 0.039 (max 3.6) | 0.19 (max 359) | 0.21 (max 24.7, median 0.01) |
+| seq 1024 (full 512x512 image), 12 layers | 14.86 ms (attention 10.85, proj+MLP 3.9-4.1) | 190.4 ms compute + 2.7 ms preload | 4431 s | 0.0057 (max 12.0) | 0.035 (max 10.9) | 0.31 (max 472) | 0.35 (max 24.5, median 0.016) |
 
 Everything is at the fp16 floor (fp16 operands and RedMulE accumulation): the device agrees with
-the fp16-rounded numpy model of the same program as closely as with HF.
+the fp16-rounded numpy model of the same program as closely as with HF. At seq 1024 the per-head
+attention (12 x 3 ops on 1024x1024 scores) is 73% of the layer; the fused `softhier.attention` op is
+the next step for it. The gvsoc runs at ~24 s of wall time per simulated ms for this program; the
+host's 7 GB is shared between sessions and the full run (~1 GB RSS) gets OOM-killed when it is not.
 
 ## Design-space exploration
 
