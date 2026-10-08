@@ -522,11 +522,22 @@ def vision_outputs(ckpt: str | Path, seeds: list[int]) -> np.ndarray:
                 outs[s] = d["ref_OUT"].astype(np.float32); continue
         todo.append(s)
     if todo:
-        vis = load_vision_tower(ckpt)
-        ids_all = np.arange(GRID * GRID)
-        for s in todo:
-            outs[s] = hf_reference(vis, test_image(s), ids_all, LAYERS)["OUT"]
-        del vis; gc.collect()
+        import torch
+        from safetensors import safe_open
+        from transformers import SiglipVisionConfig, SiglipVisionModel
+        cfg = SiglipVisionConfig(hidden_size=D, intermediate_size=FF, num_hidden_layers=LAYERS, num_attention_heads=HEADS,
+                                 image_size=IMG, patch_size=PATCH, num_channels=3, hidden_act="gelu_pytorch_tanh",
+                                 vision_use_head=False, attn_implementation="eager", layer_norm_eps=LN_EPS)
+        model = SiglipVisionModel(cfg).eval()
+        f = safe_open(str(ckpt), "pt")          # tensor by tensor: no fp32 copy of the whole tower on the side
+        sd = {k[len(PREFIX):]: f.get_tensor(k).to(torch.float32) for k in f.keys() if k.startswith(PREFIX)}
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        assert not [m for m in missing if "head" not in m] and not unexpected, (missing, unexpected)
+        del sd
+        with torch.no_grad():
+            for s in todo:
+                outs[s] = model(pixel_values=torch.from_numpy(test_image(s))[None]).last_hidden_state[0].numpy()
+        del model; gc.collect()
     return np.stack([outs[s] for s in seeds])
 
 
@@ -622,10 +633,11 @@ def hf_llama_crosscheck(tw: TextTower, inp: dict, ref: dict[str, np.ndarray], la
         o = m(inputs_embeds=torch.from_numpy(ref["EMB"])[None], attention_mask=mask, position_ids=pos, output_hidden_states=True)
     valid = lay["pad"]
     worst = 0.0
-    for n in range(1, layers + 1):
+    for n in range(1, layers):          # transformers 5 records the LAST entry of hidden_states after the final norm
         worst = max(worst, float(np.abs(o.hidden_states[n][0].numpy()[valid] - ref[f"L{n}"][valid]).max()))
-    if layers == TLAYERS:
-        worst = max(worst, float(np.abs(o.last_hidden_state[0].numpy()[valid] - ref["OUT"][valid]).max()))
+    last = ref[f"L{layers}"]
+    normed = last / np.sqrt((last * last).mean(1, keepdims=True) + RMS_EPS) * tw.norm
+    worst = max(worst, float(np.abs(o.last_hidden_state[0].numpy()[valid] - normed[valid]).max()))
     return worst
 
 
