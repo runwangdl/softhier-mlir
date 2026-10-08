@@ -116,7 +116,11 @@ python3 -m softhier_mlir.frontend.smolvla prepare --ckpt /app/models/smolvla_bas
 ```
 
 `--seq 256` keeps the top-left 16x16 patches with their own position embeddings (exactly the full
-model restricted to those tokens); `--seq 1024 --all-layers` is the full 512x512 encoder.
+model restricted to those tokens); `--seq 1024 --all-layers` is the full 512x512 encoder. The
+program is one `scf.for` over the layers and one over the heads (the cluster instruction memory is
+64 KB), starts with `softhier.preload_wait` on the image's sentinel segment (the loader's done flag
+fires before the data has crossed the NoC) and prints `[mark]` stamps per layer; `--unroll` gives the
+spelled-out form with the layer-1 intermediate dumps, `--from-log` re-evaluates a finished run.
 
 ## Design-space exploration
 

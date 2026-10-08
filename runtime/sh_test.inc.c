@@ -24,6 +24,11 @@ void sh_test_dump_samples(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld,
     }
 }
 
+void sh_test_dump_samples_idx(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, uint32_t nsamples, const char *tag, uint32_t idx) {
+    char t[32]; snprintf(t, sizeof t, "%s%u", tag, idx);
+    sh_test_dump_samples(a, rows, cols, ld, seed, nsamples, t);
+}
+
 uint32_t sh_test_check_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
                             uint32_t ldx, uint32_t ldw, uint32_t ldz, uint32_t nsamples, float tol,
                             float z0, const char *tag) {

@@ -10,6 +10,7 @@ import argparse
 import sys
 
 from xdsl.context import Context
+from xdsl.dialects import arith, scf
 from xdsl.dialects.builtin import Builtin
 from xdsl.dialects.func import Func
 from xdsl.parser import Parser
@@ -27,6 +28,8 @@ def main() -> None:
     ctx = Context()
     ctx.load_dialect(Builtin)
     ctx.load_dialect(Func)
+    ctx.load_dialect(scf.Scf)
+    ctx.load_dialect(arith.Arith)
     ctx.load_dialect(SoftHier)
 
     with open(args.input) as f:

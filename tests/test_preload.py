@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from softhier_mlir.sim.preload import HBM_BASE, make_preload_elf, read_preload_elf
+from softhier_mlir.sim.preload import HBM_BASE, SENTINEL_MAGIC, make_preload_elf, read_preload_elf, sentinel_array
 
 
 def test_preload_roundtrip(tmp_path):
@@ -29,6 +29,33 @@ def test_preload_rejects_allocator_region_and_overlap(tmp_path):
         make_preload_elf(tmp_path / "b.elf", {0x1000: np.zeros(64, np.float16), 0x1040: np.zeros(4, np.float16)})
     with pytest.raises(ValueError):
         make_preload_elf(tmp_path / "c.elf", {0x1010: np.zeros(4, np.float16)})
+
+
+def test_sentinel_is_last_segment(tmp_path):
+    sent = sentinel_array()
+    assert sent.shape == (1, 32) and sent.nbytes == 64 and (sent.view(np.uint32) == SENTINEL_MAGIC).all()
+    arrays = {0x200000: np.zeros((8, 8), np.float16), 0x1000: np.ones((4, 4), np.float16), 0x300000: sent}
+    back = read_preload_elf(make_preload_elf(tmp_path / "s.elf", arrays))
+    assert list(back) == [0x1000, 0x200000, 0x300000]           # written in offset order: the sentinel lands last
+    assert back[0x300000] == sent.tobytes()
+
+
+def test_smolvla_emit_waits_before_first_use():
+    """The emitted program must not touch preloaded data before softhier.preload_wait on the last segment."""
+    from softhier_mlir.frontend import smolvla
+    rng = np.random.default_rng(2)
+    D, FF = smolvla.D, smolvla.FF
+    P = {"wpe": (D, D), "bpe": (1, D), "pos": (16, D), "gpost": (1, D), "bepost": (1, D)}
+    for nm, shp in (("wq", (D, D)), ("wk", (D, D)), ("wv", (D, D)), ("wo", (D, D)), ("w1", (D, FF)), ("w2", (FF, D)), ("bq", (1, D)), ("bk", (1, D)),
+                    ("bv", (1, D)), ("bo", (1, D)), ("b1", (1, FF)), ("b2", (1, D)), ("g1", (1, D)), ("be1", (1, D)), ("g2", (1, D)), ("be2", (1, D))):
+        P[nm + "0"] = shp
+    data = {f"p_{k}": rng.standard_normal(v).astype(np.float16) for k, v in P.items()}
+    data["xp"] = rng.standard_normal((16, D)).astype(np.float16); data["meta"] = np.array([16, 1, 0])
+    mlir, pre = smolvla.emit(data, layers=1)
+    last = max(pre); assert pre[last].tobytes() == sentinel_array().tobytes()
+    lines = mlir.splitlines()
+    first_use = next(i for i, ln in enumerate(lines) if "softhier.gemm" in ln or "softhier.dump_samples" in ln)
+    assert any("softhier.preload_wait %sentinel" in ln for ln in lines[:first_use])
 
 
 def test_smolvla_layout_and_im2col():

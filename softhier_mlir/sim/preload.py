@@ -3,8 +3,13 @@
 The flex_cluster chip has an `hbm_preloader` (utils.loader.loader.ElfLoader) that, at reset,
 writes every PT_LOAD segment of the given ELF through the data NoC (cluster (0,0) input) to the
 segment's physical address, 64 KB per request, and then raises `hbm_preload_done` in the control
-registers; the first global barrier of the program blocks until that flag is set, so the
-program sees the data before it runs. The SDK's own helper
+registers; the first global barrier of the program blocks until that flag is set. That flag
+only means the loader has *issued* its last 64 KB request: the data still crosses the NoC at
+link bandwidth (~75 B/ns measured on the ideal-HBM model, i.e. ~13 ms per GB) and the last
+segments land long after the program has started. A program must therefore wait for a sentinel
+written as the LAST segment (`sentinel_array()` placed at the highest offset; the ELF is written
+in offset order) with `softhier.preload_wait` / `sh_preload_wait` before touching preloaded data.
+The SDK's own helper
 (soft_hier/flex_cluster_utilities/preload.py) spells the arrays out as C initialisers and
 compiles them, which does not scale to 100+ MB of weights; this module writes the ELF32
 directly -- the loader only reads the program headers, so no toolchain is involved.
@@ -24,6 +29,9 @@ import numpy as np
 HBM_BASE = 0xC0000000
 MIN_OFFSET = 0x1000
 _ALIGN = 64
+
+SENTINEL_MAGIC = 0x5EEDC0DE   # must match SH_PRELOAD_MAGIC in runtime/sh_rt.inc.c
+SENTINEL_WORDS = 16           # 64 B = one 512-bit NoC flit, so it lands atomically
 
 _EM_RISCV = 243
 _PT_LOAD = 1
@@ -63,6 +71,12 @@ def make_preload_elf(path: str | Path, arrays: dict[int, np.ndarray], hbm_base: 
             f.write(a.tobytes())
         f.truncate(file_off)
     return path
+
+
+def sentinel_array() -> np.ndarray:
+    """The 64 B end-of-preload marker as a [1, 32] fp16 array (raw bits: 16 x SENTINEL_MAGIC), to be
+    placed at the highest preloaded offset; `sh_preload_wait(addr)` spins until it is visible."""
+    return np.full(SENTINEL_WORDS, SENTINEL_MAGIC, dtype=np.uint32).view(np.float16).reshape(1, SENTINEL_WORDS * 2)
 
 
 def read_preload_elf(path: str | Path, hbm_base: int = HBM_BASE) -> dict[int, bytes]:

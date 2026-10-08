@@ -27,6 +27,8 @@ from xdsl.irdl import (
     ParsePropInAttrDict,
     irdl_op_definition,
     operand_def,
+    opt_operand_def,
+    opt_prop_def,
     prop_def,
     result_def,
 )
@@ -275,14 +277,19 @@ class CheckConstOp(IRDLOperation):
 class HbmBufferOp(IRDLOperation):
     """Declares an HBM buffer at a fixed byte ``offset`` from the HBM base.
 
-    Codegen resolves uses of the result to ``hbm_addr(offset)``.
+    Codegen resolves uses of the result to ``hbm_addr(offset)``. With an ``index`` operand
+    (an scf.for induction variable or arith expression over one) the buffer is the
+    ``index``-th of a family laid out ``stride`` bytes apart: ``hbm_addr(offset + index * stride)``,
+    e.g. the weights of layer ``index``.
     """
 
     name = "softhier.hbm_buffer"
     irdl_options = (ParsePropInAttrDict(),)
+    index = opt_operand_def(IndexType)
     offset = prop_def(IntegerAttr)
+    stride = opt_prop_def(IntegerAttr)
     result = result_def(MemRefType)
-    assembly_format = "attr-dict `:` type($result)"
+    assembly_format = "($index^)? attr-dict `:` type($result)"
 
 
 @irdl_op_definition
@@ -307,11 +314,15 @@ class L1BufferOp(IRDLOperation):
 class ViewOp(IRDLOperation):
     """A strided sub-view of an HBM buffer. The result type carries the layout:
     ``memref<rows x cols x f16, strided<[ld, 1], offset: elems>, "hbm_*">`` where the
-    offset is in elements from the source buffer's base."""
+    offset is in elements from the source buffer's base. An optional ``index`` operand adds
+    ``index * stride`` elements (the head loop of attention: head ``index`` of q/k/v/o)."""
     name = "softhier.view"
+    irdl_options = (ParsePropInAttrDict(),)
     src = operand_def(MemRefType)
+    index = opt_operand_def(IndexType)      # optional: the view starts ``index * stride`` elements further
+    stride = opt_prop_def(IntegerAttr)
     result = result_def(MemRefType)
-    assembly_format = "$src attr-dict `:` type($src) `->` type($result)"
+    assembly_format = "$src (`,` $index^)? attr-dict `:` type($src) `->` type($result)"
 
 
 @irdl_op_definition
@@ -387,9 +398,22 @@ class DumpSamplesOp(IRDLOperation):
     name = "softhier.dump_samples"
     irdl_options = (ParsePropInAttrDict(),)
     buf = operand_def(MemRefType)
+    index = opt_operand_def(IndexType)      # optional: printed after the tag (``L`` + 3 -> ``L3``)
     seed = prop_def(IntegerAttr)
     n = prop_def(IntegerAttr)
     tag = prop_def(StringAttr)
+    assembly_format = "$buf (`,` $index^)? attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
+class PreloadWaitOp(IRDLOperation):
+    """Wait until the HBM preload image has landed: cluster 0 spins on the 64 B sentinel buffer
+    (softhier_mlir.sim.preload.sentinel_array(), the image's last segment), then a global barrier.
+    The chip's `hbm_preload_done` only gates on the loader having issued its requests; the data
+    arrives at NoC bandwidth afterwards (docs/SIMULATOR_NOTES.md, HBM preload)."""
+    name = "softhier.preload_wait"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
     assembly_format = "$buf attr-dict `:` type($buf)"
 
 
@@ -400,14 +424,16 @@ class MarkOp(IRDLOperation):
     Place it after an op that ends with a global barrier."""
     name = "softhier.mark"
     irdl_options = (ParsePropInAttrDict(),)
+    index = opt_operand_def(IndexType)      # optional: printed after the tag (``layer`` + 3 -> ``layer3``)
     tag = prop_def(StringAttr)
-    assembly_format = "attr-dict"
+    assembly_format = "($index^)? attr-dict"
 
 
 SoftHier = Dialect(
     "softhier",
     [
         MarkOp,
+        PreloadWaitOp,
         HbmBufferOp,
         L1BufferOp,
         RedmuleOp,

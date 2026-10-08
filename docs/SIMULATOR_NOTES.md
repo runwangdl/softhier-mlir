@@ -25,18 +25,44 @@ removed from `gvsoc-pulp` in 2026-01 and the public SDK (2026-06) only ships the
 `gvsoc ... run --preload <elf>` feeds an ELF to the chip's `hbm_preloader`
 (`utils.loader.loader.ElfLoader`, wired in `flex_cluster.py`). At reset it walks the ELF's
 `PT_LOAD` program headers (sections are ignored) and writes each segment to its `p_paddr` through
-the data NoC at cluster (0,0), 64 KB per request, then raises `hbm_preload_done` in
+the data NoC at cluster (0,0), one 64 KB request at a time, then raises `hbm_preload_done` in
 `ctrl_registers`; `has_preload_binary=1` makes the control registers hold back every global
-barrier until that flag is set, so the first barrier of `sh_init` is where the program waits for
-the data. Verified on the ideal-HBM model (`tests/gvsoc/run.py preload`): fp16 matrices placed at
-4 KB, 70 MB and 200 MB (three different HBM nodes) read back bit-exact; a 165 MiB image
-(the SmolVLA vision tower) loads in a few simulated ms.
+barrier until that flag is set.
+
+**The flag does not mean the data is in HBM.** The program's first mark comes ~25-35 us after
+reset whether the image is 44 KB or 166 MB, while the data arrives at NoC link bandwidth after
+that: on the ideal-HBM model a 15.4 MiB image is complete ~0.21 ms after the program starts
+(~75 B/ns) and the 166 MB SmolVLA image after ~2.7 ms; segments land in file order. (The loader
+issues 64 KB bursts into the FlooNoC network interface at cluster (0,0), which splits them into
+64 B flits and lets the next burst start while flits are still in flight.) A program that reads a
+late segment early gets zeros: this showed up as an all-zero `layer_norm1` output (gamma/beta
+are among the last segments) that changed with how much the program printed before the first
+layer. The fix is in the image + runtime, not the SDK: `make_preload_elf` writes segments in
+offset order, the frontend places `softhier_mlir.sim.preload.sentinel_array()` (64 B = one
+flit, so it lands atomically) at the highest offset, and `softhier.preload_wait %sentinel`
+(`sh_preload_wait`) spins on it from cluster 0, waits 8 us for earlier chunks on longer mesh
+paths and ends with a global barrier. It prints `[sh_preload_wait] image visible after <cycles>`.
+`tests/gvsoc/run.py preload` covers the race (16 MB filler, last segment dumped first;
+`--no-wait` reproduces the zeros).
 
 `softhier_mlir/sim/preload.py` writes that ELF32 directly from `{hbm_offset: ndarray}`
 (no toolchain; the SDK's `flex_cluster_utilities/preload.py` spells arrays out as C initialisers,
 which does not scale past a few MB). Constraints: offsets >= 4 KB (the SDK's `flex_alloc_init`
 keeps the HBM allocator state at `0xC0000000` and the first block header at `+0x400`), 64 B
 aligned, non-overlapping. `run_sim(preload=path)` passes the flag.
+
+## Program size: 64 KB of instruction memory
+
+`ARCH_INSTRUCTION_MEM_SIZE` is 0x10000. The program ELF is loaded from 0x80000000 and anything
+past 64 KB lands in the 1-byte `debug_mem` (`Received out-of-bound request (reqAddr: 0x80010000
+...)` at ~16 us, then nothing). The runtime is ~21 KB; one unrolled SigLIP layer (36 per-head
+attention calls + 16 ops, 64-bit address arithmetic at every call site) is ~33 KB, so 12 unrolled
+layers are ~140 KB. `softhier-translate` therefore lowers `scf.for` over `index` values to C loops
+and `softhier.hbm_buffer %i {offset, stride}` / `softhier.view %src, %i {stride}` to
+`offset + i * stride` addressing; `frontend/smolvla.py` emits one loop over the layers (per-layer
+parameters are allocated at a constant stride) and one over the heads, which keeps the 12-layer
+program at ~50 KB for any depth or sequence length. `tests/gvsoc/run.py smolvla` prints the
+program size; `--unroll` is for 1-2 layers of debugging with the layer-1 intermediate dumps.
 
 Timing probe: `softhier.mark {tag}` prints `[mark] tag <mcycle>` from cluster 0 (clock 1 GHz,
 so cycle deltas are ns; the counter is 32-bit and wraps every 4.29 s, `tests/gvsoc/run.py`

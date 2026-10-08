@@ -17,6 +17,7 @@ GVSoC natively (ideal HBM). Prints PASS/FAIL and the ROI in ns.
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -24,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from softhier_mlir.sim.gvsoc import build_sw, run_sim  # noqa: E402
+from softhier_mlir.sim.gvsoc import PERF_RE, build_sw, run_sim  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
@@ -176,36 +177,51 @@ def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers:
     return ok
 
 
-def run_preload(offsets=(0x1000, 70 << 20, 200 << 20), rows: int = 64, cols: int = 96, nsamples: int = 64) -> bool:
-    """HBM preload: three fp16 matrices at the given HBM byte offsets (spanning several HBM nodes)
-    go in through `--preload`; the program only dumps samples of them, the host compares."""
-    from softhier_mlir.sim.preload import make_preload_elf
+def run_preload(offsets=(0x1000, 70 << 20, 200 << 20), rows: int = 64, cols: int = 96, nsamples: int = 64,
+                filler_mb: int = 16, wait: bool = True) -> bool:
+    """HBM preload: fp16 matrices at the given HBM byte offsets (spanning several HBM nodes) go in
+    through `--preload`; the program only dumps samples of them, the host compares. A `filler_mb`
+    block at 1 MB makes the image big enough that its last segments land well after the program
+    starts (the loader's done flag only means "issued"); the samples are taken right after
+    `softhier.preload_wait` on the sentinel, highest offset first. wait=False shows the race."""
+    from softhier_mlir.sim.preload import make_preload_elf, sentinel_array
     from softhier_mlir.testing import lcg
     app = HERE / "mlir_app"
     rng = np.random.default_rng(7)
     arrays = {off: (rng.standard_normal((rows, cols)) * 2).astype(np.float16) for off in offsets}
+    if filler_mb:
+        arrays[1 << 20] = (rng.standard_normal(((filler_mb << 20) // 8192, 4096)) * 2).astype(np.float16)
+    sent_off = max(off + a.nbytes for off, a in arrays.items()); sent_off = (sent_off + 0xFFFF) & ~0xFFFF
+    arrays[sent_off] = sentinel_array()
     elf = make_preload_elf(app / "preload.elf", arrays)
     lines, dumps = [], []
-    for i, off in enumerate(offsets):
-        t = f'memref<{rows}x{cols}xf16, "hbm_west">'
+    for i, off in enumerate(sorted(arrays)):
+        a = arrays[off]
+        t = f'memref<{a.shape[0]}x{a.shape[1]}xf16, "hbm_west">'
         lines.append(f"    %b{i} = softhier.hbm_buffer {{offset = {off} : i32}} : {t}")
-        dumps.append(f'    softhier.dump_samples %b{i} {{seed = {300 + i} : i32, n = {nsamples} : i32, tag = "P{i}"}} : {t}')
-    body = "\n".join(lines + ['    softhier.mark {tag = "t0"}'] + dumps + ['    softhier.mark {tag = "t1"}'])
+        if off == sent_off:
+            waitop = f"    softhier.preload_wait %b{i} : {t}"
+        else:
+            dumps.append(f'    softhier.dump_samples %b{i} {{seed = {300 + i} : i32, n = {nsamples} : i32, tag = "P{i}"}} : {t}')
+    body = "\n".join(lines + ['    softhier.mark {tag = "t0"}'] + ([waitop] if wait else []) + ['    softhier.mark {tag = "t1"}']
+                      + dumps[::-1] + ['    softhier.mark {tag = "t2"}'])
     mlir = f"builtin.module {{\n  func.func @preload_test() {{\n{body}\n    func.return\n  }}\n}}\n"
     (app / "preload.mlir").write_text(mlir)
     (app / "main.c").write_text(lower_and_translate(app / "preload.mlir", None))
     build_sw(app)
     r = run_sim(preload=elf)
     got = lcg.parse_samples(r["stdout"])
-    marks = [ln for ln in r["stdout"].splitlines() if ln.startswith("[mark]")]
+    info = [ln for ln in r["stdout"].splitlines() if ln.startswith("[mark]") or ln.startswith("[sh_preload_wait]")]
     ok = r["ok"]
-    print(f"{'PASS' if ok else 'FAIL'} preload {len(offsets)} arrays ({elf.stat().st_size} B elf) roi={r['roi_ns']} ns wall={r['wall_s']}s marks={marks}")
-    for i, off in enumerate(offsets):
+    print(f"{'PASS' if ok else 'FAIL'} preload {len(arrays)} segments ({elf.stat().st_size / 2 ** 20:.1f} MiB elf, wait={wait}) roi={r['roi_ns']} ns wall={r['wall_s']}s {info}")
+    for i, off in enumerate(sorted(arrays)):
+        if off == sent_off:
+            continue
         tag = f"P{i}"
         if tag not in got:
             print(f"     {tag} @0x{off:x} MISSING"); ok = False; continue
         bad, maxerr = lcg.compare_samples(got[tag], arrays[off].astype(np.float32), atol=0, rtol=0, show=3)
-        print(f"     {tag} @0x{off:08x} samples={len(got[tag])} bad={bad} maxerr={maxerr} {'PASS' if bad == 0 else 'FAIL'}")
+        print(f"     {tag} @0x{off:08x} {arrays[off].shape} samples={len(got[tag])} bad={bad} maxerr={maxerr} {'PASS' if bad == 0 else 'FAIL'}")
         ok &= bad == 0
     if not r["ok"]:
         print(r["stdout"][-1500:])
@@ -227,35 +243,100 @@ def parse_marks(stdout: str) -> dict[str, int]:
     return out
 
 
+def layer_times(marks: dict[str, int]) -> dict[int, tuple[int, int]]:
+    """{layer: (attention ns, mlp+proj ns)} from the mark sequence ... attn<n>, layer<n>, [ldump<n>] ...;
+    the attention segment starts at the previous mark, so the dump marks keep the sample printing out."""
+    out, prev_t = {}, None
+    for tag, t in marks.items():
+        m = re.fullmatch(r"(attn|layer)(\d+)", tag)
+        if prev_t is not None and m:
+            n = int(m.group(2))
+            if m.group(1) == "attn":
+                out[n] = [t - prev_t, 0]
+            else:
+                out.setdefault(n, [0, 0])[1] = t - prev_t
+        prev_t = t
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def dump_times(marks: dict[str, int]) -> list[int]:
+    """ns spent in sample dumps (segments ending at a *dump mark)."""
+    out, prev_t = [], None
+    for tag, t in marks.items():
+        if prev_t is not None and tag.endswith("dump"):
+            out.append(t - prev_t)
+        prev_t = t
+    return out
+
+
+def _elf_load_segments(elf: Path) -> list[tuple[int, int]]:
+    """[(paddr, filesz)] of the PT_LOAD segments of an ELF32 (the program's footprint)."""
+    import struct
+    raw = Path(elf).read_bytes()
+    phoff = struct.unpack_from("<I", raw, 28)[0]; phentsize, phnum = struct.unpack_from("<HH", raw, 42)
+    out = []
+    for i in range(phnum):
+        t, _off, _va, pa, fsz, *_ = struct.unpack_from("<8I", raw, phoff + i * phentsize)
+        if t == 1:
+            out.append((pa, fsz))
+    return out
+
+
 def run_smolvla(npz: str, layers: int | None, attn: int, cluster: int, nsamples: int = 64, dumps=None,
-                log: Path | None = None, timeout: int = 48 * 3600, app_dir: Path | None = None) -> bool:
+                log: Path | None = None, timeout: int = 48 * 3600, app_dir: Path | None = None, unroll: bool = False,
+                from_log: Path | None = None) -> bool:
     """SmolVLA vision tower (real weights via HBM preload) -> compare sampled device tensors against
-    the fp32 HF reference and the fp16-program floor stored in the npz by `smolvla.py prepare`."""
+    the fp32 HF reference and the fp16-program floor stored in the npz by `smolvla.py prepare`.
+    from_log: skip build + simulation and re-evaluate an existing simulator log."""
     from softhier_mlir.frontend import smolvla
     from softhier_mlir.sim.preload import make_preload_elf
-    from softhier_mlir.testing import lcg
+    data = dict(np.load(npz))
+    npz_layers = int(data["meta"][1])
+    layers = npz_layers if layers is None else layers
+    seq = int(data["xp"].shape[0])
+    dumps = tuple(dumps) if dumps else ("EMB",) + tuple(f"L{n}" for n in range(1, layers + 1)) + ("OUT",)
+    if layers != npz_layers:      # the npz's OUT is the post-LN after all its layers: redo it after layer `layers` on the host
+        def ln(a, g, b):
+            a = a.astype(np.float32); m = a.mean(1, keepdims=True); v = a.var(1, keepdims=True)
+            return (a - m) / np.sqrt(v + 1e-6) * g.astype(np.float32) + b.astype(np.float32)
+        data["ref_OUT"] = ln(data[f"ref_L{layers}"], data["p_gpost"], data["p_bepost"])
+        data["np_OUT"] = ln(data[f"np_L{layers}"], data["p_gpost"], data["p_bepost"]).astype(np.float16).astype(np.float32)
+    if from_log is not None:
+        stdout = Path(from_log).read_text()
+        rois = [int(v) for v in PERF_RE.findall(stdout)]
+        print(f"[smolvla] re-evaluating {from_log}: seq={seq} layers={layers} roi={rois[0] if rois else None} ns")
+        return report_smolvla(data, stdout, layers, dumps, bool(rois))
     app = Path(app_dir) if app_dir else HERE / "smolvla_app"     # own dir so runs can go concurrently
     app.mkdir(parents=True, exist_ok=True)
     rt = (HERE / "../../runtime").resolve()
     (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c PARENT_SCOPE)\n"
                                         f"set(INCLUDE_DIRS {rt} PARENT_SCOPE)\n")
-    data = np.load(npz)
-    layers = int(data["meta"][1]) if layers is None else layers
-    seq = int(data["xp"].shape[0])
-    dumps = tuple(dumps) if dumps else ("EMB",) + tuple(f"L{n}" for n in range(1, layers + 1)) + ("OUT",)
-    mlir, pre = smolvla.emit(data, layers, attn, cluster, dumps=dumps, nsamples=nsamples)
+    mlir, pre = smolvla.emit(data, layers, attn, cluster, dumps=dumps, nsamples=nsamples, unroll=unroll)
     (app / "smolvla.mlir").write_text(mlir)
     elf = make_preload_elf(app / "smolvla_preload.elf", pre)
     (app / "main.c").write_text(lower_and_translate(app / "smolvla.mlir", None))
     build_sw(app)
-    print(f"[smolvla] seq={seq} layers={layers} attn={attn} cluster={cluster} preload {elf.stat().st_size / 2 ** 20:.1f} MiB; simulating...", flush=True)
+    text = sum(sz for _, sz in _elf_load_segments(build_sw.last_elf) if sz)   # the cluster instruction memory is 64 KB
+    print(f"[smolvla] seq={seq} layers={layers} attn={attn} cluster={cluster} {'unrolled' if unroll else 'looped'} "
+          f"preload {elf.stat().st_size / 2 ** 20:.1f} MiB, program {text / 1024:.1f} KB; simulating...", flush=True)
     r = run_sim(preload=elf, timeout=timeout, log=log)
     (app / "last_run.log").write_text(r["stdout"])
-    got = lcg.parse_samples(r["stdout"])
-    marks = parse_marks(r["stdout"])
-    ok = r["ok"]
-    print(f"{'PASS' if ok else 'FAIL'} smolvla seq={seq} layers={layers} attn={attn} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
-    for ln in r["stdout"].splitlines():
+    print(f"{'PASS' if r['ok'] else 'FAIL'} smolvla seq={seq} layers={layers} attn={attn} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    ok = report_smolvla(data, r["stdout"], layers, dumps, r["ok"])
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
+
+
+def report_smolvla(data: dict, stdout: str, layers: int, dumps: tuple, ok: bool) -> bool:
+    """Timing (marks) + accuracy of the sampled tensors. A tensor passes when every sample is within
+    atol = 3% of the tensor's max |ref| (+ 5% relative) of the HF fp32 reference: the program is fp16 end
+    to end (fp16 operands and RedMulE fp16 accumulation), so ~1e-2 of the tensor scale is the floor, and
+    the post layernorm amplifies the last layer's error by gamma / row-std (~6x for this checkpoint)."""
+    from softhier_mlir.testing import lcg
+    got = lcg.parse_samples(stdout)
+    marks = parse_marks(stdout)
+    for ln in stdout.splitlines():
         if ln.startswith("[sh_"):
             print("     " + ln)
     prev_t, prev_tag = None, None
@@ -263,46 +344,30 @@ def run_smolvla(npz: str, layers: int | None, attn: int, cluster: int, nsamples:
         if prev_t is not None:
             print(f"     time {prev_tag:>8} -> {tag:<8} {(t - prev_t) / 1e6:9.3f} ms")
         prev_t, prev_tag = t, tag
+    per_layer = layer_times(marks)
+    for n, (ta, tm) in sorted(per_layer.items()):
+        print(f"     layer {n:2d}: attention {ta / 1e6:8.3f} ms  mlp+proj {tm / 1e6:8.3f} ms  total {(ta + tm) / 1e6:8.3f} ms")
+    if per_layer:
+        tot = [ta + tm for ta, tm in per_layer.values()]
+        print(f"     per-layer simulated time: mean {np.mean(tot) / 1e6:.3f} ms over {len(tot)} layers (dump printing excluded); "
+              f"total marked compute {(marks.get('end', 0) - marks.get('start', 0) - sum(d for d in dump_times(marks))) / 1e6:.3f} ms")
     for tag in dumps:
         if tag not in got:
             print(f"     {tag:<4} MISSING"); ok = False; continue
-        floor = data[f"np_{tag}"].astype(np.float32)
+        floor = data[tag if tag.startswith("p_") else f"np_{tag}"].astype(np.float32)   # p_<name>: the preloaded parameter itself
         has_hf = f"ref_{tag}" in data
         ref = data[f"ref_{tag}"].astype(np.float32) if has_hf else floor   # HF fp32 when it exists, else the fp16 floor
         vals = np.array([v for _, _, v in got[tag]]); want = np.array([ref[r_, c] for r_, c, _ in got[tag]])
         err = np.abs(vals - want)
-        rel = err.max() / (np.abs(ref).max() + 1e-12)
-        bad_hf, _ = lcg.compare_samples(got[tag], ref, atol=0.05, rtol=0.05, show=2)
-        bad_fl, maxerr_fl = lcg.compare_samples(got[tag], floor, atol=0.02, rtol=0.02)
-        print(f"     {tag:<4} samples={len(got[tag])} vs {'HF fp32' if has_hf else 'fp16 floor'}: max abs {err.max():.4f} "
-              f"(|ref| max {np.abs(ref).max():.2f}, rel-to-max {rel:.2e}) bad={bad_hf}; vs fp16 floor: max abs {maxerr_fl:.4f} bad={bad_fl} "
-              f"{'PASS' if bad_hf == 0 else 'FAIL'}")
+        scale = np.abs(ref).max() + 1e-12
+        atol = max(0.05, 0.03 * scale) if not tag.startswith("p_") else 0.0
+        bad_hf, _ = lcg.compare_samples(got[tag], ref, atol=atol, rtol=0.05 if atol else 0.0, show=2)
+        bad_fl, maxerr_fl = lcg.compare_samples(got[tag], floor, atol=atol, rtol=0.05 if atol else 0.0)
+        print(f"     {tag:<4} samples={len(got[tag])} vs {'HF fp32' if has_hf else 'fp16 floor'}: max abs {err.max():.4f} median {np.median(err):.4f} "
+              f"(|ref| max {scale:.2f}, rel-to-max {err.max() / scale:.2e}) bad={bad_hf}; vs fp16 floor: max abs {maxerr_fl:.4f} bad={bad_fl} "
+              f"{'PASS' if bad_hf == 0 else 'FAIL'} (atol {atol:.3f}, rtol 0.05)")
         ok &= bad_hf == 0
-    if not r["ok"]:
-        print(r["stdout"][-1500:])
     return ok
-
-
-def run_mesh(modes: list[str], heads: int = 12) -> bool:
-    """tests/gvsoc/mesh_slices: `heads` clusters each write one 64-column slice of a 256x768 output.
-    MODE 0 gemm, 1 dma stores, 2 scalar stores, 3 gemm serialized, 4 gemm private buffers,
-    5 scores+softmax+P.V (the attention sequence), 6/7 as 5 + a follow-up 16-cluster GEMM reading it."""
-    app = HERE / "mesh_slices"
-    all_ok = True
-    for m in modes:
-        mode, _, defs = m.partition(":")
-        (app / "shape.h").write_text(f"#define MODE {mode}\n#define NH {heads}\n" + "".join(f"#define {d}\n" for d in defs.split(",") if d))
-        build_sw(app)
-        r = run_sim()
-        ok = r["ok"] and "MESH_PASS" in r["stdout"]
-        all_ok &= ok
-        print(f"{'PASS' if ok else 'FAIL'} mesh_slices mode={m} heads={heads} roi={r['roi_ns']} ns wall={r['wall_s']}s")
-        for ln in r["stdout"].splitlines():
-            if ln.startswith("[") and "FAIL" in ln and "mesh_slices" not in ln:
-                print("     " + ln)
-        if not r["ok"]:
-            print(r["stdout"][-1500:])
-    return all_ok
 
 
 # passes each example needs (none = already in the softhier dialect)
@@ -365,6 +430,9 @@ if __name__ == "__main__":
     ap.add_argument("--cols", type=int, default=768)
     ap.add_argument("--cluster", default=None, help="executing cluster: 0 or all (default 0; smolvla: all)")
     ap.add_argument("--app-dir", help="smolvla: app/build dir (default tests/gvsoc/smolvla_app)")
+    ap.add_argument("--no-wait", action="store_true", help="preload: skip softhier.preload_wait (demonstrates the race)")
+    ap.add_argument("--unroll", action="store_true", help="smolvla: unrolled program (1-2 layers; enables the layer-1 intermediate dumps)")
+    ap.add_argument("--from-log", help="smolvla: re-evaluate an existing simulator log instead of building and simulating")
     ap.add_argument("files", nargs="*", help="mlir: input .mlir files")
     ap.add_argument("-p", "--passes", help="mlir: pass pipeline for softhier-opt (default: per-example table)")
     ap.add_argument("--shapes", nargs="*")
@@ -389,10 +457,11 @@ if __name__ == "__main__":
     elif a.test == "siglip-mlir":
         ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers)
     elif a.test == "preload":
-        ok = run_preload()
+        ok = run_preload(wait=not a.no_wait)
     elif a.test == "smolvla":
         ok = run_smolvla(a.npz, None if a.all_layers else a.layers, a.attn, -1 if a.cluster == "all" else int(a.cluster),
-                         a.nsamples, a.dumps, Path(a.log) if a.log else None, app_dir=a.app_dir)
+                         a.nsamples, a.dumps, Path(a.log) if a.log else None, app_dir=a.app_dir, unroll=a.unroll,
+                         from_log=Path(a.from_log) if a.from_log else None)
     else:
         ok = run_mlir(a.files, a.passes)
     sys.exit(0 if ok else 1)

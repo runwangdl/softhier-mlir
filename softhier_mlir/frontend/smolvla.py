@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 
 from softhier_mlir.frontend.siglip import _Emitter
+from softhier_mlir.sim.preload import sentinel_array
 
 PREFIX = "model.vlm_with_expert.vlm.model.vision_model."
 IMG, PATCH, D, FF, HEADS, LAYERS = 512, 16, 768, 3072, 12, 12
@@ -186,16 +187,29 @@ def prepare(ckpt: str | Path, seq: int, out: str | Path, layers: int = LAYERS, i
 
 
 # ----------------------------------------------------------------------------- program
+PARAMS = [("wq", D, D), ("wk", D, D), ("wv", D, D), ("wo", D, D), ("w1", D, FF), ("w2", FF, D),
+          ("bq", 1, D), ("bk", 1, D), ("bv", 1, D), ("bo", 1, D), ("b1", 1, FF), ("b2", 1, D),
+          ("g1", 1, D), ("be1", 1, D), ("g2", 1, D), ("be2", 1, D)]
+
+
 def emit(npz: str | Path | dict, layers: int | None = None, attn: int = -1, cluster: int = -1,
-         dumps: tuple[str, ...] = ("EMB", "L1", "OUT"), nsamples: int = 64, marks: bool = True) -> tuple[str, dict[int, np.ndarray]]:
+         dumps: tuple[str, ...] = ("EMB", "L1", "OUT"), nsamples: int = 64, marks: bool = True,
+         unroll: bool = False) -> tuple[str, dict[int, np.ndarray]]:
     """-> (mlir, {hbm_offset: fp16 array to preload}).
 
     cluster: executing cluster of GEMMs / row ops (-1 = SH_ALL: output tiles / row blocks dealt
              round-robin over all clusters, global barrier after each op).
     attn:    cluster of the per-head QK^T / softmax / PV ops (-1 = SH_ALL per op, heads sequential;
              0 = everything on cluster 0). Heads are never run concurrently on different clusters.
-    dumps:   EMB (embeddings), L<n> (output of layer n), OUT (post layernorm) and, for layer 1,
-             LN1 / Q / K / P0 / O / H / G (same meaning as frontend/siglip.py)."""
+    dumps:   EMB (embeddings), L<n> (output of layer n), OUT (post layernorm), p_<name> (a preloaded
+             parameter read back: checks the preload path itself) and, with unroll=True only, the
+             layer-1 intermediates LN1 / Q / K / P0 / O / H / G (same meaning as frontend/siglip.py).
+    unroll:  False (default): one scf.for over the layers (per-layer parameters are a constant HBM
+             stride apart) and one over the heads, so the code size does not grow with the depth
+             (the cluster instruction memory is 64 KB; 12 unrolled layers are ~140 KB). True: every
+             op spelled out, for 1-2 layers of debugging with the intermediate dumps.
+    Timing marks: start / emb / attn<n> / layer<n> / end (+ embdump / ldump<n> after a dump, so the
+    sample printing can be excluded)."""
     data = np.load(npz) if isinstance(npz, (str, Path)) else npz
     P = {k[2:]: data[k] for k in data if k.startswith("p_")}
     xp = data["xp"]
@@ -209,6 +223,12 @@ def emit(npz: str | Path | dict, layers: int | None = None, attn: int = -1, clus
     cl = f"cluster = {cluster} : i32"
     hc = f"cluster = {attn} : i32"
 
+    def alloc(rows, cols):
+        """an HBM offset without a declaration (same rounding as _Emitter.buf)"""
+        off = e.next_off
+        e.next_off += (rows * cols * 2 + 4095) & ~4095
+        return off
+
     def B(name, rows, cols, arr=None):
         if arr is not None:
             assert arr.shape == (rows, cols), (name, arr.shape, rows, cols)
@@ -216,31 +236,62 @@ def emit(npz: str | Path | dict, layers: int | None = None, attn: int = -1, clus
         T[name] = e.buf(name, rows, cols)
         return name
 
-    def mark(tag):
+    def mark(tag, idx=None):
         if marks:
-            e.op(f'softhier.mark {{tag = "{tag}"}}')
+            e.op(f'softhier.mark {idx + " " if idx else ""}{{tag = "{tag}"}}')
 
-    def dump(tag, name, seed, view=None):
+    def dump(tag, name, seed, view=None, idx=None, out_tag=None):
         if tag in dumps:
-            e.op(f'softhier.dump_samples %{name} {{seed = {seed} : i32, n = {nsamples} : i32, tag = "{tag}"}} : {view or T[name]}')
+            e.op(f'softhier.dump_samples %{name}{", " + idx if idx else ""} {{seed = {seed} : i32, n = {nsamples} : i32, '
+                 f'tag = "{out_tag or tag}"}} : {view or T[name]}')
+            return True
+        return False
 
-    # inputs + activations
+    def dump_mark(tag, dumped, idx=None):
+        """dumps print from cluster 0 only; a barrier + mark keeps that time out of the next segment"""
+        if dumped and marks:
+            e.op("softhier.group_barrier {grid_x = 4 : i32, grid_y = 4 : i32}")
+            mark(tag, idx)
+
+    # inputs + activations (x is the residual stream, updated in place by every layer)
     B("xp", seq, D, xp); B("pos", seq, D, P["pos"])
     for nm, r, c in [("x", seq, D), ("ln1", seq, D), ("q", seq, D), ("k", seq, D), ("v", seq, D), ("kT", D, seq),
                      ("sc", HEADS * seq, seq), ("o", seq, D), ("ao", seq, D), ("h", seq, D), ("ln2", seq, D),
-                     ("f1", seq, FF), ("g", seq, FF), ("f2", seq, D), ("out", seq, D), ("fin", seq, D)]:
+                     ("f1", seq, FF), ("g", seq, FF), ("f2", seq, D), ("fin", seq, D)]:
         B(nm, r, c)
-    # parameters (preloaded)
+    # parameters (preloaded): per-layer families at a constant stride
     B("wpe", D, D, P["wpe"]); B("bpe", 1, D, P["bpe"]); B("gpost", 1, D, P["gpost"]); B("bepost", 1, D, P["bepost"])
+    layer0_off, stride = {}, 0
     for L in range(layers):
-        for nm, r, c in [("wq", D, D), ("wk", D, D), ("wv", D, D), ("wo", D, D), ("w1", D, FF), ("w2", FF, D),
-                         ("bq", 1, D), ("bk", 1, D), ("bv", 1, D), ("bo", 1, D), ("b1", 1, FF), ("b2", 1, D),
-                         ("g1", 1, D), ("be1", 1, D), ("g2", 1, D), ("be2", 1, D)]:
-            B(f"{nm}{L}", r, c, P[f"{nm}{L}"])
+        begin = e.next_off
+        for nm, r, c in PARAMS:
+            if unroll:
+                B(f"{nm}{L}", r, c, P[f"{nm}{L}"])
+            else:
+                off = alloc(r, c)
+                assert P[f"{nm}{L}"].shape == (r, c)
+                pre[off] = P[f"{nm}{L}"]
+                if L == 0:
+                    layer0_off[nm] = off
+                    T[nm] = f'memref<{r}x{c}xf16, "{e.space}">'
+        if L == 0:
+            stride = e.next_off - begin
+    sent = sentinel_array()
+    B("sentinel", *sent.shape, sent)    # highest offset = last segment of the image: lands last
+    mark("preload")
+    e.op(f"softhier.preload_wait %sentinel : {T['sentinel']}")
+    for tag in dumps:                   # p_<name>: read a preloaded parameter back (preload-path check)
+        nm = tag[2:]
+        if tag.startswith("p_") and (nm in T if not nm[-1].isdigit() else nm in P):
+            if nm in T and nm[-1].isdigit() is False:
+                dump(tag, nm, 100 + sum(map(ord, tag)) % 50)
+            elif unroll:
+                dump(tag, nm, 100 + sum(map(ord, tag)) % 50)
 
     gem = lambda tm, tn, tk: f"tile_m = {tm} : i32, tile_n = {tn} : i32, tile_k = {tk} : i32, pipeline"  # noqa: E731
     big, qk, pv = gem(256, 256, 256), gem(256, 256, dh), gem(256, dh, 256)
     seeds = {"EMB": 200, "LN1": 206, "Q": 201, "K": 207, "P0": 209, "O": 202, "H": 203, "G": 204, "OUT": 205}
+    hv = lambda rows, cols, ld, eoff: f'memref<{rows}x{cols}xf16, strided<[{ld}, 1], offset: {eoff}>, "{e.space}">'  # noqa: E731
 
     # patch embedding + position embedding
     mark("start")
@@ -248,49 +299,93 @@ def emit(npz: str | Path | dict, layers: int | None = None, attn: int = -1, clus
     e.op(f"softhier.add_bias %x, %bpe -> %x {{{cl}}} : {T['x']}, {T['bpe']} -> {T['x']}")
     e.op(f"softhier.add %x, %pos -> %x {{{cl}}} : {T['x']}, {T['pos']} -> {T['x']}")
     mark("emb")
-    dump("EMB", "x", seeds["EMB"])
+    dump_mark("embdump", dump("EMB", "x", seeds["EMB"]))
 
-    xin = "x"
-    for L in range(layers):
-        W = lambda nm: f"{nm}{L}"  # noqa: E731
-        e.op(f"softhier.layernorm %{xin}, %{W('g1')}, %{W('be1')} -> %ln1 {{eps = {LN_EPS:.1e} : f32, {cl}}} : {T[xin]}, {T[W('g1')]}, {T[W('be1')]} -> {T['ln1']}")
+    def head(L, hd):
+        """attention of one head; L / hd are ints (unrolled) or (SSA index name, None) in a loop"""
+        if hd is None:    # loop mode: views at index %h
+            sfx, idx = "", "%hd"
+            def view(name, src, rows, cols, ld, stride):
+                t = hv(rows, cols, ld, 0)
+                e.op(f"%{name} = softhier.view %{src}, {idx} {{stride = {stride} : i32}} : {T[src]} -> {t}")
+                return t
+            qh = view("qh", "q", seq, dh, D, dh); kh = view("kTh", "kT", dh, seq, seq, dh * seq)
+            sh = view("sh", "sc", seq, seq, seq, seq * seq); vh = view("vh", "v", seq, dh, D, dh); oh = view("oh", "o", seq, dh, D, dh)
+            names = ("qh", "kTh", "sh", "vh", "oh")
+        else:
+            sfx = f"{L}_{hd}"
+            qh = e.view(f"q{sfx}", "q", T["q"], seq, dh, D, hd * dh)
+            kh = e.view(f"kT{sfx}", "kT", T["kT"], dh, seq, seq, hd * dh * seq)
+            sh = e.view(f"s{sfx}", "sc", T["sc"], seq, seq, seq, hd * seq * seq)
+            vh = e.view(f"v{sfx}", "v", T["v"], seq, dh, D, hd * dh)
+            oh = e.view(f"o{sfx}", "o", T["o"], seq, dh, D, hd * dh)
+            names = (f"q{sfx}", f"kT{sfx}", f"s{sfx}", f"v{sfx}", f"o{sfx}")
+        nq, nk, ns, nv, no = names
+        e.op(f"softhier.gemm %{nq}, %{nk} into %{ns} {{fmt = \"fp16\", {qk}, {hc}}} : {qh}, {kh}, {sh}")
+        e.op(f"softhier.softmax %{ns} -> %{ns} {{scale = {1 / math.sqrt(dh)!r} : f32, {hc}}} : {sh} -> {sh}")
+        e.op(f"softhier.gemm %{ns}, %{nv} into %{no} {{fmt = \"fp16\", {pv}, {hc}}} : {sh}, {vh}, {oh}")
+        if L == 0 and hd == 0:
+            dump("P0", ns, seeds["P0"], sh)
+
+    def layer(L):
+        """one encoder layer; L: int (unrolled: parameters %wq3 ...) or None (loop body: %wq at index %L)"""
+        W = (lambda nm: f"{nm}{L}") if L is not None else (lambda nm: nm)  # noqa: E731
+        n1 = f"{L + 1}" if L is not None else None          # 1-based layer number for tags
+        idx = None if L is not None else "%L1"
+        e.op(f"softhier.layernorm %x, %{W('g1')}, %{W('be1')} -> %ln1 {{eps = {LN_EPS:.1e} : f32, {cl}}} : {T['x']}, {T[W('g1')]}, {T[W('be1')]} -> {T['ln1']}")
         for dst, w, bias in (("q", "wq", "bq"), ("k", "wk", "bk"), ("v", "wv", "bv")):
             e.op(f"softhier.gemm %ln1, %{W(w)} into %{dst} {{fmt = \"fp16\", {big}, {cl}}} : {T['ln1']}, {T[W(w)]}, {T[dst]}")
             e.op(f"softhier.add_bias %{dst}, %{W(bias)} -> %{dst} {{{cl}}} : {T[dst]}, {T[W(bias)]} -> {T[dst]}")
         e.op(f"softhier.transpose %k -> %kT {{{cl}}} : {T['k']} -> {T['kT']}")
         if L == 0:
-            dump("LN1", "ln1", seeds["LN1"]); dump("Q", "q", seeds["Q"]); dump("K", "k", seeds["K"])
-        for hd in range(HEADS):
-            qh = e.view(f"q{L}_{hd}", "q", T["q"], seq, dh, D, hd * dh)
-            kh = e.view(f"kT{L}_{hd}", "kT", T["kT"], dh, seq, seq, hd * dh * seq)
-            sh = e.view(f"s{L}_{hd}", "sc", T["sc"], seq, seq, seq, hd * seq * seq)
-            vh = e.view(f"v{L}_{hd}", "v", T["v"], seq, dh, D, hd * dh)
-            oh = e.view(f"o{L}_{hd}", "o", T["o"], seq, dh, D, hd * dh)
-            e.op(f"softhier.gemm %q{L}_{hd}, %kT{L}_{hd} into %s{L}_{hd} {{fmt = \"fp16\", {qk}, {hc}}} : {qh}, {kh}, {sh}")
-            e.op(f"softhier.softmax %s{L}_{hd} -> %s{L}_{hd} {{scale = {1 / math.sqrt(dh)!r} : f32, {hc}}} : {sh} -> {sh}")
-            e.op(f"softhier.gemm %s{L}_{hd}, %v{L}_{hd} into %o{L}_{hd} {{fmt = \"fp16\", {pv}, {hc}}} : {sh}, {vh}, {oh}")
-            if L == 0 and hd == 0:
-                dump("P0", f"s{L}_{hd}", seeds["P0"], sh)
+            dump_mark("qkdump", dump("LN1", "ln1", seeds["LN1"]) | dump("Q", "q", seeds["Q"]) | dump("K", "k", seeds["K"]))
+        if L is None:
+            e.op("scf.for %hd = %c0 to %cH step %c1 {")
+            head(L, None)
+            e.op("}")
+        else:
+            for hd in range(HEADS):
+                head(L, hd)
         e.op("softhier.group_barrier {grid_x = 4 : i32, grid_y = 4 : i32}")
-        mark(f"L{L + 1}attn")
+        mark(f"attn{n1}" if n1 else "attn", idx)
         if L == 0:
-            dump("O", "o", seeds["O"])
+            dump_mark("odump", dump("O", "o", seeds["O"]))
         e.op(f"softhier.gemm %o, %{W('wo')} into %ao {{fmt = \"fp16\", {big}, {cl}}} : {T['o']}, {T[W('wo')]}, {T['ao']}")
         e.op(f"softhier.add_bias %ao, %{W('bo')} -> %ao {{{cl}}} : {T['ao']}, {T[W('bo')]} -> {T['ao']}")
-        e.op(f"softhier.add %{xin}, %ao -> %h {{{cl}}} : {T[xin]}, {T['ao']} -> {T['h']}")
+        e.op(f"softhier.add %x, %ao -> %h {{{cl}}} : {T['x']}, {T['ao']} -> {T['h']}")
         e.op(f"softhier.layernorm %h, %{W('g2')}, %{W('be2')} -> %ln2 {{eps = {LN_EPS:.1e} : f32, {cl}}} : {T['h']}, {T[W('g2')]}, {T[W('be2')]} -> {T['ln2']}")
         e.op(f"softhier.gemm %ln2, %{W('w1')} into %f1 {{fmt = \"fp16\", {big}, {cl}}} : {T['ln2']}, {T[W('w1')]}, {T['f1']}")
         e.op(f"softhier.add_bias %f1, %{W('b1')} -> %f1 {{{cl}}} : {T['f1']}, {T[W('b1')]} -> {T['f1']}")
         e.op(f"softhier.gelu %f1 -> %g {{{cl}}} : {T['f1']} -> {T['g']}")
         e.op(f"softhier.gemm %g, %{W('w2')} into %f2 {{fmt = \"fp16\", {big}, {cl}}} : {T['g']}, {T[W('w2')]}, {T['f2']}")
         e.op(f"softhier.add_bias %f2, %{W('b2')} -> %f2 {{{cl}}} : {T['f2']}, {T[W('b2')]} -> {T['f2']}")
-        e.op(f"softhier.add %h, %f2 -> %out {{{cl}}} : {T['h']}, {T['f2']} -> {T['out']}")
-        mark(f"L{L + 1}")
-        if L == 0:
-            dump("H", "h", seeds["H"]); dump("G", "g", seeds["G"])
-        dump(f"L{L + 1}", "out", 220 + L)
-        xin = "out"
-    e.op(f"softhier.layernorm %{xin}, %gpost, %bepost -> %fin {{eps = {LN_EPS:.1e} : f32, {cl}}} : {T[xin]}, {T['gpost']}, {T['bepost']} -> {T['fin']}")
+        e.op(f"softhier.add %h, %f2 -> %x {{{cl}}} : {T['h']}, {T['f2']} -> {T['x']}")
+        mark(f"layer{n1}" if n1 else "layer", idx)
+        if L is not None:
+            d = dump(f"L{n1}", "x", 220 + L)
+            if L == 0:
+                d |= dump("H", "h", seeds["H"]) | dump("G", "g", seeds["G"])
+        else:   # loop body: every layer's output when any L<n> is requested
+            d = any(t.startswith("L") and t[1:].isdigit() for t in dumps)
+            if d:
+                e.op(f'softhier.dump_samples %x, {idx} {{seed = 220 : i32, n = {nsamples} : i32, tag = "L"}} : {T["x"]}')
+        dump_mark(f"ldump{n1}" if n1 else "ldump", d, idx)
+
+    if unroll:
+        for L in range(layers):
+            layer(L)
+    else:
+        e.op("%c0 = arith.constant 0 : index")
+        e.op("%c1 = arith.constant 1 : index")
+        e.op(f"%cH = arith.constant {HEADS} : index")
+        e.op(f"%cL = arith.constant {layers} : index")
+        e.op("scf.for %L = %c0 to %cL step %c1 {")
+        e.op("%L1 = arith.addi %L, %c1 : index")
+        for nm, r, c in PARAMS:
+            e.op(f"%{nm} = softhier.hbm_buffer %L {{offset = {layer0_off[nm]} : i32, stride = {stride} : i32}} : {T[nm]}")
+        layer(None)
+        e.op("}")
+    e.op(f"softhier.layernorm %x, %gpost, %bepost -> %fin {{eps = {LN_EPS:.1e} : f32, {cl}}} : {T['x']}, {T['gpost']}, {T['bepost']} -> {T['fin']}")
     mark("end")
     dump("OUT", "fin", seeds["OUT"])
     body = "\n".join(e.lines)
@@ -312,12 +407,13 @@ def main() -> None:
     pe.add_argument("--layers", type=int)
     pe.add_argument("--attn", type=int, default=-1)
     pe.add_argument("--cluster", type=int, default=-1)
+    pe.add_argument("--unroll", action="store_true")
     a = ap.parse_args()
     if a.cmd == "prepare":
         prepare(a.ckpt, a.seq, a.out, a.layers, a.image_seed)
     else:
         import sys
-        sys.stdout.write(emit(a.npz, a.layers, a.attn, a.cluster)[0])
+        sys.stdout.write(emit(a.npz, a.layers, a.attn, a.cluster, unroll=a.unroll)[0])
 
 
 if __name__ == "__main__":
