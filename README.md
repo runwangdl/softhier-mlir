@@ -11,10 +11,41 @@ leaving a **thin `softhier` dialect** for only the irreducible hardware ops.
 Backend reuse follows [`snax-mlir`](https://github.com/KULeuven-MICAS/snax-mlir)
 (Snitch/RISC-V dialects) rather than a from-scratch codegen.
 
-> Status: **working end-to-end.** A network's GEMMs written in standard
-> `linalg.matmul` lower to the `softhier` dialect, generate C against the SoftHier
-> `flex_` runtime, and run on GVSoC with numerically-verified results — including
-> a 2-layer MLP and multi-tile (512³) GEMMs.
+> Status (2026-10-08): **the compiler emits calls into an operator library** (`runtime/`,
+> "softhier-ops") instead of inline runtime code. A SigLIP/ViT encoder layer written by the
+> frontend (`softhier_mlir/frontend/siglip.py`) lowers to the `softhier` dialect, translates to
+> C, builds and runs on the SoftHier GVSoC with every tensor matching a numpy reference on one
+> cluster (S=256, D=768, 12 heads, FFN 3072). GEMMs run on one cluster, round-robin over all 16,
+> or as a mesh-wide SUMMA; the 8 original examples still pass end to end.
+
+## Layout (what calls what)
+
+```
+softhier_mlir/frontend/siglip.py   model -> softhier dialect (HBM buffers, strided views, per-head attention)
+softhier_mlir/dialects/softhier.py the dialect: gemm, layernorm, softmax, gelu, add, add_bias, transpose, view,
+                                   redmule/l1 ops, test-data ops (hbm_fill_lcg, dump_samples)
+softhier_mlir/transforms/          linalg-to-softhier, pipeline-gemm, distribute-summa (policy = attributes)
+softhier_mlir/backend/emit_c.py    one library call per op; generated main.c includes only runtime/sh_ops.h
+runtime/sh_ops.h                   the library API (SPMD: every op is called by all cores of all clusters)
+runtime/sh_gemm.inc.c              tiled GEMM (any tm/tn/tk, split-K, double-buffered, cluster=0|SH_ALL), SUMMA
+runtime/sh_rowops.inc.c            layernorm / softmax / gelu / add / bias / scale / transpose on HBM tensors
+runtime/sh_test.inc.c              on-device LCG data + sampled dumps; host twin in softhier_mlir/testing/lcg.py
+softhier_mlir/sim/gvsoc.py         build (x86 chroot, private build dir) + run (ideal HBM) + Arch knobs
+tests/gvsoc/run.py                 gemm | rowops | siglip | siglip-mlir | mlir <files>: build, simulate, compare
+docs/SIMULATOR_NOTES.md            the gvsoc model bugs found on the way and the conventions relied on
+```
+
+## Quick start
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]" numpy
+bash tests/run_filecheck.sh                                   # compiler tests (no simulator)
+python tests/gvsoc/run.py gemm                                # library GEMM shapes on gvsoc, self-checked
+python tests/gvsoc/run.py mlir examples/*.mlir                # every example end to end
+python tests/gvsoc/run.py siglip-mlir --seq 256 --cluster 0   # one encoder layer through the compiler
+python -m softhier_mlir.frontend.siglip --layers 12 --no-test # the dialect module of a 12-layer encoder
+```
+Simulator setup (aarch64 host, x86 toolchain chroot, ideal HBM) is described in `softhier_mlir/sim/gvsoc.py`.
 
 **Docs:** [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — how to generate & run, and how to
 add a new op (step by step) · [`docs/DESIGN.md`](docs/DESIGN.md) — the dialect
