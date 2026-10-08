@@ -193,13 +193,15 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
               f"(|actions| max {np.abs(want).max():.3f}); vs fp16 floor: max abs {np.abs(vals - floor_xt[steps]).max():.4f}; "
               f"floor vs lerobot: {np.abs(floor_xt[steps] - want).max():.4f}")
         ok &= err.max() < 0.1
+    full = layers == 16          # the lerobot intermediates exist for the full model only; else compare with the twin
     if "EMB0" in got:
-        compare("EMB0", got["EMB0"], data["ref_s0_emb"], atol=0.05, rtol=0.03, floor=floor_inter.get("EMB"))
+        compare("EMB0", got["EMB0"], data["ref_s0_emb"] if full else floor_inter["EMB"], atol=0.05, rtol=0.03, floor=floor_inter.get("EMB"))
     for L in range(layers):
-        if f"H{L}" in got and f"ref_s0_h_{L}" in data:
-            compare(f"H{L}", got[f"H{L}"], data[f"ref_s0_h_{L}"], atol=max(0.05, 0.02 * float(np.abs(data[f'ref_s0_h_{L}']).max())), rtol=0.05, floor=floor_inter.get(f"H{L}"))
-        if f"O{L}" in got and f"ref_s0_att_{L}" in data:
-            compare(f"O{L}", got[f"O{L}"], data[f"ref_s0_att_{L}"], atol=0.05, rtol=0.05, floor=floor_inter.get(f"O{L}"))
+        if f"H{L}" in got:
+            ref = data[f"ref_s0_h_{L}"] if full else floor_inter[f"H{L}"]
+            compare(f"H{L}", got[f"H{L}"], ref, atol=max(0.05, 0.02 * float(np.abs(ref).max())), rtol=0.05, floor=floor_inter.get(f"H{L}"))
+        if f"O{L}" in got:
+            compare(f"O{L}", got[f"O{L}"], data[f"ref_s0_att_{L}"] if full else floor_inter[f"O{L}"], atol=0.05, rtol=0.05, floor=floor_inter.get(f"O{L}"))
     if not ok and from_log is None:
         print(stdout[-1500:])
     return ok

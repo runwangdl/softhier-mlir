@@ -38,6 +38,15 @@ void     sh_preload_wait(uint64_t sentinel);  /* all cores: block until the HBM 
 
 #define SH_ALL 0xFFFFFFFFu   /* `cluster` argument: split the work over all clusters (global barrier at the end) */
 
+/* Run fn() on a private per-core stack of `bytes_per_core` bytes carved from the top of the cluster's 128 KB stack
+ * memory (below the 4 KB the SDK start code uses). flex_start.s spaces the three harts' initial stacks only 1 KB
+ * apart (`sll t0, a0, 0xa`), so a function with a few hundred bytes of spilled locals that calls printf (the generated
+ * kernel: one 64-bit address per HBM buffer + the mark/dump printfs on core 0) overruns the next hart's stack and
+ * clobbers its saved return address (seen as an illegal instruction at a data address on pe1). Call from every core;
+ * SH_CORE_STACK_BYTES x 3 + 4 KB <= ARCH_CLUSTER_STACK_SIZE. */
+#define SH_CORE_STACK_BYTES 40960u
+void sh_call_on_core_stack(void (*fn)(void), uint32_t bytes_per_core);
+
 /* ---- formats ------------------------------------------------------------------------ */
 enum sh_fmt { SH_FP16 = 0, SH_FP8 = 1, SH_INT16 = 2, SH_INT8 = 3 };
 

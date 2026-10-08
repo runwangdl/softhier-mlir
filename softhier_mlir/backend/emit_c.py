@@ -478,14 +478,14 @@ static void {kernel_name}_checks(void) {{   // test outputs (not timed)
 int main(void) {{
     sh_init();
     const int timekeeper = (sh_cluster_id() == 0 && sh_is_first_core());  // the timer is global: one core stamps it
-    {kernel_name}_inputs();
+    sh_call_on_core_stack({kernel_name}_inputs, SH_CORE_STACK_BYTES);   // private per-core stacks: the SDK's are 1 KB apart
     sh_barrier_global();
     if (timekeeper) sh_timer_start();
-    {kernel_name}();
+    sh_call_on_core_stack({kernel_name}, SH_CORE_STACK_BYTES);
     sh_barrier_global();
     if (timekeeper) sh_timer_end();
     sh_barrier_global();
-    {kernel_name}_checks();
+    sh_call_on_core_stack({kernel_name}_checks, SH_CORE_STACK_BYTES);
     sh_barrier_global();
     sh_eoc(0);
     return 0;

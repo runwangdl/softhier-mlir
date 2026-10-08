@@ -80,7 +80,7 @@ def load_expert(ckpt: str | Path) -> dict[str, np.ndarray]:
     for k in ("action_in_proj", "action_out_proj", "action_time_mlp_in", "action_time_mlp_out"):
         out[k + ".weight"] = sd[f"model.{k}.weight"].to(torch.float32).numpy()
         out[k + ".bias"] = sd[f"model.{k}.bias"].to(torch.float32).numpy()
-    assert len(out) == 155, len(out)
+    assert len(out) == 153, len(out)   # 145 lm_expert tensors + 4 projections x (weight, bias)
     return out
 
 
@@ -119,7 +119,8 @@ def prepare(ckpt: str | Path, ref: str | Path, out: str | Path) -> Path:
     """expert.npz = weights in library layout (p_*), host tables (p_*), lerobot reference arrays (ref_*)."""
     r = dict(np.load(ref))
     te = np.stack([time_embedding(t) for t in flow_times()])
-    assert np.abs(te - r["time_emb"]).max() < 1e-5, "time embedding twin differs from lerobot's"
+    assert np.abs(te - r["time_emb"]).max() < 1e-3, "time embedding twin differs from lerobot"   # lerobot feeds fp32 t_s
+    te = r["time_emb"].astype(np.float64)                                                          # the table uses lerobot own values
     p = to_library_layout(load_expert(ckpt), te)
     n_valid = int(r["n_valid"])
     p["valid"] = r["prefix_valid"].reshape(1, LP).astype(np.float16)
@@ -227,7 +228,7 @@ def np_flow(P, steps=STEPS, layers=LAYERS, record=False):
         if s == 0:
             inter["FIN"] = fin
         v = _r16(_r16(fin @ f("wout")) + f("bout"))
-        x = _r16(x - 0.1 * v)
+        x = _r16(x + (-1.0 / steps) * v)
         xs.append(x.copy())
     return np.stack(xs), inter
 
@@ -446,7 +447,8 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
     else:
         C = cols   # default 960 columns: a multiple of the head size for the RoPE test
         F("x", S, C, s0 + 1, -16, 16, 0.125); F("b", S, C, s0 + 2, -16, 16, 0.125); F("g", 1, C, s0 + 3, 2, 6, 0.25)
-        d["tab"] = rope_table(np.arange(S) + 7, C); P.B("tab", S, C, d["tab"])
+        if which == "rope":
+            d["tab"] = rope_table(np.arange(S) + 7, C); P.B("tab", S, C, d["tab"])
         P.B("y", S, C)
         sent = sentinel_array(); P.B("sentinel", *sent.shape, sent)
         op(f"softhier.preload_wait %sentinel : {T['sentinel']}")
@@ -486,7 +488,7 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     profile: a mark after every op group of every layer (per-op timing breakdown)."""
     data = np.load(npz) if isinstance(npz, (str, Path)) else npz
     W = {k[2:]: data[k] for k in data if k.startswith("p_")}
-    assert layers % 2 == 0 and layers <= LAYERS
+    assert layers % 2 == 0 and layers <= LAYERS      # layers == 0: the step tail only (debugging)
     if fmt_steps is not None:
         assert len(fmt_steps) == steps, (len(fmt_steps), steps)
     P = _Prog(cluster, nsamples)
@@ -521,10 +523,11 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
             op(f"%{nm} = softhier.hbm_buffer %p {{offset = {pair0[nm]} : i32, stride = {stride} : i32}} : {T[nm]}")
     P.mark("start")
     # once per chunk: the cross layers' prefix KV through their 320 -> 320 k/v projections (step-invariant)
-    op("scf.for %p = %c0 to %cP step %c1 {")
-    slab(["kp_c", "vp_c", "wkx_c", "wvx_c", "kx_c", "vx_c"])
-    P.gemm("kp_c", "wkx_c", "kx_c", *tiles["kv"]); P.gemm("vp_c", "wvx_c", "vx_c", *tiles["kv"])
-    op("}")
+    if layers:
+        op("scf.for %p = %c0 to %cP step %c1 {")
+        slab(["kp_c", "vp_c", "wkx_c", "wvx_c", "kx_c", "vx_c"])
+        P.gemm("kp_c", "wkx_c", "kx_c", *tiles["kv"]); P.gemm("vp_c", "wvx_c", "vx_c", *tiles["kv"])
+        op("}")
     P.mark("kvproj")
     op(f"softhier.add %x0, %zero -> %x {{{P.cl}}} : {T['x0']}, {T['zero']} -> {T['x']}")     # x = x0 (copy: x0 stays intact)
     op("scf.for %s = %c0 to %cS step %c1 {")
@@ -543,23 +546,24 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
         P.mark("emb", "%s")
     if "EMB" in dumps:
         P.dump("h", 310, "EMB", "%s")
-    op("scf.for %p = %c0 to %cP step %c1 {")
-    op("%L0 = arith.muli %p, %c2 : index"); op("%L1 = arith.addi %L0, %c1 : index")
-    op("%i0 = arith.addi %s16, %L0 : index"); op("%i1 = arith.addi %s16, %L1 : index")
-    slab([f"{nm}_s" for nm, _, _ in SELF] + [f"{nm}_c" for nm, _, _ in CROSS if nm not in ("wkx", "wvx", "kp", "vp")])
-    _layer_ops(P, "s", "self", {k: f"{k}_s" for k in ("g1", "g2", "wqkv", "wo", "wgu", "wd", "kp", "vp")}, step="%s", fmt_steps=fs,
-               tiles=tiles, prof=profile, pidx="%i0")
-    if "O" in dumps:
-        P.dump("o", 311, "O", "%i0")
-    if "H" in dumps:
-        P.dump("h", 312, "H", "%i0")
-    _layer_ops(P, "c", "cross", {k: f"{k}_c" for k in ("g1", "g2", "wq", "wo", "wgu", "wd", "kx", "vx")}, step="%s", fmt_steps=fs,
-               tiles=tiles, prof=profile, pidx="%i1")
-    if "O" in dumps:
-        P.dump("o", 311, "O", "%i1")
-    if "H" in dumps:
-        P.dump("h", 312, "H", "%i1")
-    op("}")
+    if layers:
+        op("scf.for %p = %c0 to %cP step %c1 {")
+        op("%L0 = arith.muli %p, %c2 : index"); op("%L1 = arith.addi %L0, %c1 : index")
+        op("%i0 = arith.addi %s16, %L0 : index"); op("%i1 = arith.addi %s16, %L1 : index")
+        slab([f"{nm}_s" for nm, _, _ in SELF] + [f"{nm}_c" for nm, _, _ in CROSS if nm not in ("wkx", "wvx", "kp", "vp")])
+        _layer_ops(P, "s", "self", {k: f"{k}_s" for k in ("g1", "g2", "wqkv", "wo", "wgu", "wd", "kp", "vp")}, step="%s", fmt_steps=fs,
+                   tiles=tiles, prof=profile, pidx="%i0")
+        if "O" in dumps:
+            P.dump("o", 311, "O", "%i0")
+        if "H" in dumps:
+            P.dump("h", 312, "H", "%i0")
+        _layer_ops(P, "c", "cross", {k: f"{k}_c" for k in ("g1", "g2", "wq", "wo", "wgu", "wd", "kx", "vx")}, step="%s", fmt_steps=fs,
+                   tiles=tiles, prof=profile, pidx="%i1")
+        if "O" in dumps:
+            P.dump("o", 311, "O", "%i1")
+        if "H" in dumps:
+            P.dump("h", 312, "H", "%i1")
+        op("}")
     op(f"softhier.rmsnorm %h, %gf -> %fin {{eps = {RMS_EPS:.1e} : f32, {P.cl}}} : {T['h']}, {T['gf']} -> {T['fin']}")
     P.gemm("fin", "wout", "vt", *tiles["out"], step="%s", fmt_steps=fs)
     op(f"softhier.add_bias %vt, %bout -> %vt {{{P.cl}}} : {T['vt']}, {T['bout']} -> {T['vt']}")
