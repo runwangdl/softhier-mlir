@@ -131,6 +131,7 @@ softhier_mlir/tools/softhier_opt.py the opt driver
 softhier_mlir/frontend/siglip.py   SigLIP/ViT encoder emitter (--fused: softhier.attention per layer)
 runtime/                           softhier-ops C library the generated code calls (sh_gemm, sh_attention, ...)
 tests/filecheck/                   FileCheck tests
+softhier_mlir/sim/trace.py         gvsoc trace (redmule/idma/cluster_registers) -> Perfetto JSON / PNG / utilisation; sim/viewer builds an HTML timeline
 tests/gvsoc/run.py                 on-simulator tests: gemm | rowops | fp16cvt | attention [--composed] | mesh | siglip | siglip-mlir [--fused] | mlir
 tests/gvsoc/ubench/                cost-model micro-benchmarks (docs/DSE.md)
 ```
