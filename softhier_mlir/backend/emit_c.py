@@ -20,12 +20,13 @@ deeper than a layer or two (an unrolled 12-layer SigLIP is ~140 KB of code).
 from __future__ import annotations
 
 from xdsl.dialects import arith, func, scf
-from xdsl.dialects.builtin import FloatAttr, IntegerAttr, MemRefType, ModuleOp, StridedLayoutAttr
+from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr, MemRefType, ModuleOp, StridedLayoutAttr
 from xdsl.ir import Block, BlockArgument, Operation, SSAValue
 
 from softhier_mlir.dialects.softhier import (
     AttentionOp,
     AxpyOp,
+    CallOp,
     CrossAttentionOp,
     DumpAllOp,
     AddBiasOp,
@@ -412,6 +413,12 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             tok = bufs.haddr(op.mask) if op.mask is not None else "0"
             b(f"{ind}sh_x_attention({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
               f"{Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
+
+        elif isinstance(op, CallOp):
+            vals = []
+            for v in op.operands_:
+                vals.append(f"(uint32_t)({idx.expr(v)})" if isinstance(v.type, IndexType) else bufs.haddr(v))
+            b(f"{ind}{op.callee.data}({op.args.data.format(*vals)});")
 
         elif isinstance(op, DumpAllOp):
             rows, cols, ld, _ = bufs.geom(op.buf)

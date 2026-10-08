@@ -191,24 +191,44 @@ def np_attention(q, kp, vp, ko, vo, tok, scale=SCALE):
     return o
 
 
-def np_layer(h, P, L, kp, vp, tok, rq, rk, kx=None, vx=None):
-    """One expert layer on the fp16-floor model; P holds fp16 arrays named as in to_library_layout. Returns
-    (h_out, intermediates dict)."""
+FP8_FAMILIES = ("wqkv", "wq", "wo", "wgu", "wd")      # the layer GEMMs an fp8 step runs in fp8 (suffix / output projections stay fp16)
+
+
+def quantize_expert(P, layers: int = LAYERS) -> dict[str, tuple[np.ndarray, int]]:
+    """{weight name: (e4m3 codes, e_w)} of every layer GEMM weight (frontend.fp8.quant_weight, per-tensor scale)."""
+    from softhier_mlir.frontend import fp8
+    return {f"{fam}{L}": fp8.quant_weight(P[f"{fam}{L}"].astype(np.float32))
+            for L in range(layers) for fam in FP8_FAMILIES if f"{fam}{L}" in P}
+
+
+def np_gemm(x, P, wname, q8=None):
+    """x @ W on the fp16-floor model; with q8 (quantize_expert) holding wname: the device's fp8 step (RN4(x) 2^k against
+    the expanded codes, fp32 accumulation, fp16 result)."""
+    if q8 is not None and wname in q8:
+        from softhier_mlir.frontend import fp8
+        code, e_w = q8[wname]
+        return _r16(fp8.rn4(x, 8 + e_w).astype(np.float32) @ fp8.w_prime(code).astype(np.float32))
+    return _r16(x @ P[wname].astype(np.float32))
+
+
+def np_layer(h, P, L, kp, vp, tok, rq, rk, kx=None, vx=None, q8=None):
+    """One expert layer on the fp16-floor model; P holds fp16 arrays named as in to_library_layout; q8: fp8 weights of
+    this step's GEMMs (None: fp16). Returns (h_out, intermediates dict)."""
     f = lambda k: P[k].astype(np.float32)  # noqa: E731
     xn = np_rmsnorm(h, f(f"g1{L}"))
     if L % 2 == 0:
-        qkv = _r16(xn @ f(f"wqkv{L}"))
+        qkv = np_gemm(xn, P, f"wqkv{L}", q8)
         q, k, v = np_rope(qkv[:, :DQ], rq), np_rope(qkv[:, DQ:DQ + DKV], rk), qkv[:, DQ + DKV:]
         o = np_attention(q, kp, vp, k, v, tok)
     else:
-        q = np_rope(_r16(xn @ f(f"wq{L}")), rq)
+        q = np_rope(np_gemm(xn, P, f"wq{L}", q8), rq)
         o = np_attention(q, kx, vx, None, None, tok)
-    h1 = _r16(h + _r16(o @ f(f"wo{L}")))
+    h1 = _r16(h + np_gemm(o, P, f"wo{L}", q8))
     xn2 = np_rmsnorm(h1, f(f"g2{L}"))
-    gu = _r16(xn2 @ f(f"wgu{L}"))
+    gu = np_gemm(xn2, P, f"wgu{L}", q8)
     g, u = gu[:, :FF], gu[:, FF:]
     m = _r16(g / (1 + np.exp(-g)) * u)
-    h2 = _r16(h1 + _r16(m @ f(f"wd{L}")))
+    h2 = _r16(h1 + np_gemm(m, P, f"wd{L}", q8))
     return h2, {"XN": xn, "Q": q, "O": o, "H1": h1, "M": m, "H": h2}
 
 
@@ -216,9 +236,12 @@ def np_kv_proj(P, L, kp, vp):
     return _r16(kp.astype(np.float32) @ P[f"wkx{L}"].astype(np.float32)), _r16(vp.astype(np.float32) @ P[f"wvx{L}"].astype(np.float32))
 
 
-def np_flow(P, steps=STEPS, layers=LAYERS, record=False, num_steps=STEPS):
+def np_flow(P, steps=STEPS, layers=LAYERS, record=False, num_steps=STEPS, fmt_steps=None, q8=None):
     """The device program on the fp16-floor model: the first `steps` steps of the `num_steps` schedule (dt = -1/num_steps);
-    returns x_t per step [steps+1, 50, 32] (+ step-0 intermediates)."""
+    returns x_t per step [steps+1, 50, 32] (+ step-0 intermediates). fmt_steps: per-step "fp16" | "fp8" of the layer
+    GEMMs (fp8: the device's e4m3 path, frontend/fp8.py; q8 = quantize_expert(P) to reuse)."""
+    if fmt_steps is not None and q8 is None and "fp8" in fmt_steps:
+        q8 = quantize_expert(P, layers)
     f = lambda k: P[k].astype(np.float32)  # noqa: E731
     tok, rq_s, rq_c = P["tok"], P["rq_self"], P["rq_cross"]
     kx = {L: np_kv_proj(P, L, P[f"kp{L}"], P[f"vp{L}"]) for L in range(1, layers, 2)}
@@ -230,11 +253,12 @@ def np_flow(P, steps=STEPS, layers=LAYERS, record=False, num_steps=STEPS):
         h = _r16(_r16(e1 @ f("wto")) + f("bto"))
         if s == 0:
             inter["EMB"] = h
+        qs = q8 if (fmt_steps is not None and fmt_steps[s] == "fp8") else None
         for L in range(layers):
             if L % 2 == 0:
-                h, it = np_layer(h, P, L, P[f"kp{L}"], P[f"vp{L}"], tok, rq_s, rq_s)
+                h, it = np_layer(h, P, L, P[f"kp{L}"], P[f"vp{L}"], tok, rq_s, rq_s, q8=qs)
             else:
-                h, it = np_layer(h, P, L, None, None, tok, rq_c, None, *kx[L])
+                h, it = np_layer(h, P, L, None, None, tok, rq_c, None, *kx[L], q8=qs)
             if s == 0 and record:
                 inter[f"H{L}"] = it["H"]; inter[f"O{L}"] = it["O"]
         fin = np_rmsnorm(h, f("gf"))
@@ -312,6 +336,41 @@ class _Prog:
         self.op(f'softhier.gemm %{x}, %{w} into %{z}{st} {{fmt = "fp16"{fs}, tile_m = {tm} : i32, tile_n = {tn} : i32, '
                 f'tile_k = {tk} : i32, pipeline, {cl or self.cl}}} : {self.T[x]}, {self.T[w]}, {self.T[z]}')
 
+    def geom(self, name):
+        """(rows, cols, ld) of a declared buffer / view from its memref type string."""
+        import re
+        m = re.match(r"memref<(\d+)x(\d+)x\w+(?:, strided<\[(\d+), 1\])?", self.T[name])
+        r, c = int(m[1]), int(m[2])
+        return r, c, int(m[3]) if m[3] else c
+
+    def at(self, name, off, rows, cols, elem="f16"):
+        """declare a buffer at a known HBM offset (no allocation, no preload)"""
+        self.T[name] = f'memref<{rows}x{cols}x{elem}, "{self.sp}">'
+        self.op(f"%{name} = softhier.hbm_buffer {{offset = {off} : i32}} : {self.T[name]}")
+        return name
+
+    def slot_raw(self, name, rows, cols, arr, elem):
+        """a slab slot of a non-fp16 array (uint8 fp8 codes, int16 scale exponents)"""
+        off = self.e.next_off
+        self.e.next_off += (arr.nbytes + 4095) & ~4095
+        self.pre[off] = np.ascontiguousarray(arr)
+        self.T[name] = f'memref<{rows}x{cols}x{elem}, "{self.sp}">'
+        return off
+
+    def call(self, callee, operands, args):
+        """softhier.call: args is a C argument template, {i} = operand i (memref -> HBM address, index -> C expression)"""
+        types = ", ".join(self.T[o[1:]] if o[1:] in self.T else "index" for o in operands)
+        self.op(f'softhier.call {", ".join(operands)} {{callee = "{callee}", args = "{args}"}} : {types}')
+
+    def gemm_step(self, x, w16, w8, wq16, ke, z, tm, tn, tk, step, table, mode):
+        """one weight GEMM at the step's format (sh_f_gemm_step: fp16, or fp8 e4m3 via `mode` 0 / 1 / 2)"""
+        M, K, ldx = self.geom(x); _, N, ldw = self.geom(w16); _, _, ldz = self.geom(z)
+        cfg = f"&(sh_gemm_cfg){{{{ .tm = {tm}, .tn = {tn}, .tk = {tk}, .pipeline = 1, .accumulate = 0, .fmt = 0, .l1_base = 0 }}}}"
+        fmt = f"((const uint32_t[]){{{{{table}}}}})[{{6}}]"
+        cl = "SH_ALL" if "cluster = -1" in self.cl else "0"
+        self.call("sh_f_gemm_step", [f"%{x}", f"%{w16}", f"%{w8}", f"%{wq16}", f"%{ke}", f"%{z}", step],
+                  f"{{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {{5}}, {M}, {N}, {K}, {ldx}, {ldw}, {ldz}, {cfg}, {fmt}, {mode}, {cl}")
+
     def module(self, name):
         body = "\n".join(self.e.lines)
         return f"builtin.module {{\n  func.func @{name}() {{\n{body}\n    func.return\n  }}\n}}\n"
@@ -322,39 +381,64 @@ TILES = {"qkv": (S, 64, D), "o": (S, 48, DQ), "gu": (S, 256, 240), "d": (S, 48, 
          "a": (S, 48, AD), "t": (S, 48, D), "out": (S, 32, D)}
 
 
-def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_steps=None, tiles=TILES, prof=False, pidx=None):
+def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_steps=None, tiles=TILES, prof=False, pidx=None,
+               flow=None, lidx=None):
     """Emit one expert layer. names: parameter / KV SSA names for this layer; kind 'self' | 'cross'.
-    Activations: h (residual, in place), xn, qkv (q | k | v for self; q for cross), o, ao, gu, m, f2."""
+    Activations: h (residual, in place), xn, qkv (q | k | v for self; q for cross), o, ao, gu, m, f2.
+    flow (docs/FLOW_DATAFLOW.md): {"kvs": selfmask} -> KV-stationary attention (sh_f_attention_kvs, layer index lidx);
+    {"fp8": (table, mode)} -> the weight GEMMs through sh_f_gemm_step (names carry <w>8 / <w>k / <w>q slots)."""
     T, op, cl = P.T, P.op, P.cl
+    flow = flow or {}
     m = lambda tag: P.mark(tag, pidx) if prof else None  # noqa: E731
+
+    def G(x, w, z, fam):
+        if "fp8" in flow:
+            table, mode = flow["fp8"]
+            P.gemm_step(x, names[w], names[w + "8"], names.get(w + "q", names[w]), names[w + "k"], z, *tiles[fam], step, table, mode)
+        else:
+            P.gemm(x, names[w], z, *tiles[fam], step=step, fmt_steps=fmt_steps)
+
+    def kvs_attn(own):
+        o_ = ["%q", "%k", "%v", "%tok", "%o", lidx] if own else ["%q", "%tok", "%o", lidx]
+        ldq, ldk, ldo = P.geom("q")[2], P.geom("k")[2], P.geom("o")[2]
+        a = ("{0}, {1}, {2}, {3}, {4}, {5}" if own else "{0}, 0, 0, {1}, {2}, {3}") + \
+            f", {flow['kvs']}u, {S}, {LP}, {S}, {H}, {HKV}, {DH}, {ldq}, {ldk if own else 0}, {ldk if own else 0}, {ldo}, {SCALE!r}f"
+        P.call("sh_f_attention_kvs", o_, a)
+
     op(f"softhier.rmsnorm %h, %{names['g1']} -> %xn {{eps = {RMS_EPS:.1e} : f32, {cl}}} : {T['h']}, {T[names['g1']]} -> {T['xn']}")
     if kind == "self":
-        P.gemm("xn", names["wqkv"], "qkv", *tiles["qkv"], step=step, fmt_steps=fmt_steps)
+        G("xn", "wqkv", "qkv", "qkv")
         m("qkv")
         op(f"softhier.rope %q, %rq_self -> %q {{head_dim = {DH} : i32, {cl}}} : {T['q']}, {T['rq_self']} -> {T['q']}")
         op(f"softhier.rope %k, %rq_self -> %k {{head_dim = {DH} : i32, {cl}}} : {T['k']}, {T['rq_self']} -> {T['k']}")
         m("rope")
+    if kind == "self" and "kvs" in flow:
+        kvs_attn(True)
+    elif kind == "self":
         op(f"softhier.cross_attention %q, %{names['kp']}, %{names['vp']} own %k, %v mask %tok -> %o "
            f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T['q']}, {T[names['kp']]}, {T[names['vp']]} "
            f"own {T['k']}, {T['v']} mask {T['tok']} -> {T['o']}")
     else:
-        P.gemm("xn", names["wq"], "q", *tiles["qkv"], step=step, fmt_steps=fmt_steps)
+        G("xn", "wq", "q", "qkv")
         m("qkv")
         op(f"softhier.rope %q, %rq_cross -> %q {{head_dim = {DH} : i32, {cl}}} : {T['q']}, {T['rq_cross']} -> {T['q']}")
         m("rope")
-        op(f"softhier.cross_attention %q, %{names['kx']}, %{names['vx']} mask %tok -> %o "
-           f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T['q']}, {T[names['kx']]}, {T[names['vx']]} "
-           f"mask {T['tok']} -> {T['o']}")
+        if "kvs" in flow:
+            kvs_attn(False)
+        else:
+            op(f"softhier.cross_attention %q, %{names['kx']}, %{names['vx']} mask %tok -> %o "
+               f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T['q']}, {T[names['kx']]}, {T[names['vx']]} "
+               f"mask {T['tok']} -> {T['o']}")
     m("attn")
-    P.gemm("o", names["wo"], "ao", *tiles["o"], step=step, fmt_steps=fmt_steps)
+    G("o", "wo", "ao", "o")
     op(f"softhier.add %h, %ao -> %h {{{cl}}} : {T['h']}, {T['ao']} -> {T['h']}")
     m("oproj")
     op(f"softhier.rmsnorm %h, %{names['g2']} -> %xn {{eps = {RMS_EPS:.1e} : f32, {cl}}} : {T['h']}, {T[names['g2']]} -> {T['xn']}")
-    P.gemm("xn", names["wgu"], "gu", *tiles["gu"], step=step, fmt_steps=fmt_steps)
+    G("xn", "wgu", "gu", "gu")
     m("gateup")
     op(f"softhier.silu_mul %ga, %up -> %ga {{{cl}}} : {T['ga']}, {T['up']} -> {T['ga']}")   # m = silu(g) u in place over g
     m("silu")
-    P.gemm("ga", names["wd"], "f2", *tiles["d"], step=step, fmt_steps=fmt_steps)
+    G("ga", "wd", "f2", "d")
     op(f"softhier.add %h, %f2 -> %h {{{cl}}} : {T['h']}, {T['f2']} -> {T['h']}")
     m("down")
 
@@ -446,6 +530,35 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
         d[name] = lcg.fill_fp16(rows, cols, sd, lo, hi, scale)
         P.B(name, rows, cols, d[name])
     ref = {}
+    if which.startswith("gemm8"):   # one fp8 weight GEMM (gate|up shape) in the three sh_f_gemm_step modes + fp16; docs/FLOW_DATAFLOW.md
+        from softhier_mlir.frontend import fp8 as F8
+        fam = which[len("gemm8"):] or "gu"
+        K_, N_ = {"gu": (D, 2 * FF), "qkv": (D, DQ + 2 * DKV), "o": (DQ, D), "d": (FF, D)}[fam]
+        rng = np.random.default_rng(seed)
+        x = (rng.standard_normal((S, K_)) * 1.5).astype(np.float16)
+        w = rng.uniform(-0.0664, 0.0664, (K_, N_)).astype(np.float16)
+        code, e_w = F8.quant_weight(w.astype(np.float32))
+        for nm in ("x0", "x1", "x2"):
+            P.B(nm, S, K_, x)
+        P.B("w16", K_, N_, w); P.B("wq", K_, N_, F8.w_prime(code))
+        P.at("w8", P.e.next_off, K_, N_, "i8"); P.pre[P.e.next_off] = code; P.e.next_off += (code.nbytes + 4095) & ~4095
+        P.at("ke", P.e.next_off, 1, 32, "i16"); P.pre[P.e.next_off] = np.full((1, 32), 8 + e_w, np.int16); P.e.next_off += 4096
+        for nm in ("z16", "z0", "z1", "z2"):
+            P.B(nm, S, N_)
+        sent = sentinel_array(); P.B("sentinel", *sent.shape, sent)
+        op(f"softhier.preload_wait %sentinel : {T['sentinel']}")
+        op("%c0 = arith.constant 0 : index")
+        tm, tn, tk = TILES[fam if fam != "gu" else "gu"]
+        P.mark("start")
+        P.gemm("x0", "w16", "z16", tm, tn, tk); P.mark("fp16")
+        for mode, xn, zn in ((0, "x0", "z0"), (1, "x1", "z1"), (2, "x2", "z2")):
+            P.gemm_step(xn, "w16", "w8", "wq", "ke", zn, tm, tn, tk, "%c0", "1", mode)
+            P.mark(f"fp8mode{mode}")
+        for nm, sd in (("z0", 330), ("z2", 330), ("z16", 330)):
+            P.dump(nm, sd, nm.upper())
+        ref["Z0"] = ref["Z2"] = F8.gemm_ref(x, code, e_w).astype(np.float32)
+        ref["Z16"] = (x.astype(np.float32) @ w.astype(np.float32)).astype(np.float16).astype(np.float32)
+        return P.module(f"expert_op_{which}"), P.pre, ref
     if which in ("attn", "xattn"):
         F("q", S, DQ, s0 + 1, -8, 8, 0.125); F("kp", LP, DKV, s0 + 2, -8, 8, 0.125); F("vp", LP, DKV, s0 + 3, -8, 8, 0.125)
         F("k", S, DKV, s0 + 4, -8, 8, 0.125); F("v", S, DKV, s0 + 5, -8, 8, 0.125)
@@ -501,9 +614,15 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
 
 def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, fmt_steps: list[str] | None = None,
               profile: bool = False, dumps: tuple[str, ...] = ("X",), nsamples: int = 64, tiles=TILES,
-              kv_base: int | None = None, kv_stride: int = KV_STRIDE, s_pad: int = S_PAD, num_steps: int = STEPS) -> tuple[str, dict]:
+              kv_base: int | None = None, kv_stride: int = KV_STRIDE, s_pad: int = S_PAD, num_steps: int = STEPS,
+              attn: str = "stream", fp8_mode: int | None = None) -> tuple[str, dict]:
     """Step 2/3: the flow loop: the first `steps` steps of the `num_steps` Euler schedule (dt = -1/num_steps, time table
     row s). Returns (mlir, preload). layers must be even (self/cross pairs).
+    attn: "stream" (sh_x_attention: every head re-streams its kv head's prefix K / V from HBM every step) or "kvs"
+    (KV-stationary: the chunk's prefix KV dealt into TCDM once, sh_f_kvs_deal / sh_f_attention_kvs; docs/FLOW_DATAFLOW.md).
+    fp8_mode: None, or 0 / 1 / 2 = real fp8 steps of the layer GEMMs (fmt_steps "fp16" | "fp8" per step) with the fp8
+    weights expanded on the cores / not expanded (timing of a DMA-path cast; numbers invalid) / from a host-expanded
+    fp16 copy (the numbers of 0 and 1); sh_f_gemm_step.
     Prefix KV: read in the VLM prefix program's layout (frontend.smolvla emit_vlm): layer L keys at
     kv_base + L * kv_stride as [s_pad, 320] fp16 (rows >= 241 padding), values at + s_pad * 640; kv_base=None
     allocates the region here and preloads the host's KV into it (padded to s_pad rows), otherwise the region is
@@ -539,13 +658,35 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     SELF = [("wqkv", D, DQ + 2 * DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D)]
     CROSS = [("wq", D, DQ), ("wkx", DKV, DKV), ("wvx", DKV, DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D),
              ("kx", LP, DKV), ("vx", LP, DKV)]
+    # fp8 steps (docs/FLOW_DATAFLOW.md): per layer GEMM weight an e4m3 byte copy <w>8, its k = 8 + e_w (<w>k, int16) and,
+    # for mode 2, the host-expanded fp16 copy <w>q
+    f8 = {}
+    if fp8_mode is not None:
+        from softhier_mlir.frontend import fp8 as F8
+        q8 = quantize_expert(W, layers)
+        for spec in (SELF, CROSS):
+            for nm, r, c in list(spec):
+                if nm in FP8_FAMILIES:
+                    spec.append((nm + "8", r, c)); spec.append((nm + "k", 1, 32))
+                    f8[nm + "8"], f8[nm + "k"] = (nm, "code"), (nm, "kexp")
+                    if fp8_mode == 2:
+                        spec.append((nm + "q", r, c)); f8[nm + "q"] = (nm, "wq")
     pair0, stride = {}, 0
     for p in range(layers // 2):
         begin = P.e.next_off
         for L, spec, sfx in ((2 * p, SELF, "s"), (2 * p + 1, CROSS, "c")):
             for nm, r, c in spec:
-                arr = W.get(f"{nm}{L}")
-                off = P.slot(f"{nm}_{sfx}", r, c, arr)
+                if nm in f8:
+                    fam, what = f8[nm]
+                    code, e_w = q8[f"{fam}{L}"]
+                    if what == "code":
+                        off = P.slot_raw(f"{nm}_{sfx}", r, c, code, "i8")
+                    elif what == "kexp":
+                        off = P.slot_raw(f"{nm}_{sfx}", r, c, np.full((1, 32), 8 + e_w, np.int16), "i16")
+                    else:
+                        off = P.slot(f"{nm}_{sfx}", r, c, F8.w_prime(code))
+                else:
+                    off = P.slot(f"{nm}_{sfx}", r, c, W.get(f"{nm}{L}"))
                 if p == 0:
                     pair0[f"{nm}_{sfx}"] = off
         if p == 0:
@@ -571,10 +712,25 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
         P.gemm("kp_c", "wkx_c", "kx_c", *tiles["kv"]); P.gemm("vp_c", "wvx_c", "vx_c", *tiles["kv"])
         op("}")
     P.mark("kvproj")
+    flow = {}
+    if attn == "kvs" and layers:      # deal the whole chunk's prefix KV into TCDM (sh_f_kvs_deal), once
+        selfmask = sum(1 << L for L in range(0, layers, 2))
+        P.at("kvs_k0", kvoff["kp_s"], LP, DKV); P.at("kvs_v0", kvoff["vp_s"], LP, DKV)
+        P.at("kvs_kx0", pair0["kx_c"], LP, DKV); P.at("kvs_vx0", pair0["vx_c"], LP, DKV)
+        P.call("sh_f_kvs_deal", ["%kvs_k0", "%kvs_v0", "%kvs_kx0", "%kvs_vx0"],
+               f"{{0}}, {{1}}, {2 * kv_stride}ull, {{2}}, {{3}}, {stride}ull, {layers}, {selfmask}u, {LP}, {S}, {HKV}, {GROUP}, {DH}, {DKV}")
+        P.mark("kvdeal")
+        flow["kvs"] = selfmask
+    else:
+        assert attn == "stream", attn
+    fs = fmt_steps
+    if fp8_mode is not None:          # per-step format of the layer GEMMs only; the suffix / output projections stay fp16
+        assert fmt_steps is not None
+        flow["fp8"] = (",".join("1" if f == "fp8" else "0" for f in fmt_steps), fp8_mode)
+        fs = None
     op(f"softhier.add %x0, %zero -> %x {{{P.cl}}} : {T['x0']}, {T['zero']} -> {T['x']}")     # x = x0 (copy: x0 stays intact)
     op("scf.for %s = %c0 to %cS step %c1 {")
     op("%s16 = arith.muli %s, %c16 : index")
-    fs = fmt_steps
     # suffix embedding: e = x Wa + ba; e1 = silu(e Wti + tb[s]); h = e1 Wto + bto
     P.gemm("x", "wa", "e", *tiles["a"], step="%s", fmt_steps=fs)
     op(f"softhier.add_bias %e, %ba -> %e {{{P.cl}}} : {T['e']}, {T['ba']} -> {T['e']}")
@@ -593,14 +749,15 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
         op("%L0 = arith.muli %p, %c2 : index"); op("%L1 = arith.addi %L0, %c1 : index")
         op("%i0 = arith.addi %s16, %L0 : index"); op("%i1 = arith.addi %s16, %L1 : index")
         slab([f"{nm}_s" for nm, _, _ in SELF] + ["kp_s", "vp_s"] + [f"{nm}_c" for nm, _, _ in CROSS if nm not in ("wkx", "wvx")])
-        _layer_ops(P, "s", "self", {k: f"{k}_s" for k in ("g1", "g2", "wqkv", "wo", "wgu", "wd", "kp", "vp")}, step="%s", fmt_steps=fs,
-                   tiles=tiles, prof=profile, pidx="%i0")
+        xs = [nm for nm, _, _ in SELF if nm in f8]; xc = [nm for nm, _, _ in CROSS if nm in f8]
+        _layer_ops(P, "s", "self", {k: f"{k}_s" for k in ("g1", "g2", "wqkv", "wo", "wgu", "wd", "kp", "vp", *xs)}, step="%s", fmt_steps=fs,
+                   tiles=tiles, prof=profile, pidx="%i0", flow=flow, lidx="%L0")
         if "O" in dumps:
             P.dump("o", 311, "O", "%i0")
         if "H" in dumps:
             P.dump("h", 312, "H", "%i0")
-        _layer_ops(P, "c", "cross", {k: f"{k}_c" for k in ("g1", "g2", "wq", "wo", "wgu", "wd", "kx", "vx")}, step="%s", fmt_steps=fs,
-                   tiles=tiles, prof=profile, pidx="%i1")
+        _layer_ops(P, "c", "cross", {k: f"{k}_c" for k in ("g1", "g2", "wq", "wo", "wgu", "wd", "kx", "vx", *xc)}, step="%s", fmt_steps=fs,
+                   tiles=tiles, prof=profile, pidx="%i1", flow=flow, lidx="%L1")
         if "O" in dumps:
             P.dump("o", 311, "O", "%i1")
         if "H" in dumps:
