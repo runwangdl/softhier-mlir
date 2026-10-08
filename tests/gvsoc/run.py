@@ -428,11 +428,14 @@ def run_smolvla_vlm(npz: str, layers: int | None, attn: int, cluster: int, nsamp
         dumps = (("EMB",) if layer0 == 0 else ()) + tuple(f"{t}{i}" for i in range(layer0 + 1, last + 1) for t in ("L", "K", "V")) \
             + (("OUT",) if last == npz_layers else ())
     dumps = tuple(dumps)
+    # padded language rows are computed by both sides but never read (masked as keys everywhere); lerobot gives such a
+    # query uniform attention over its 241 keys, the device over S_pad = 256 (15 zero rows), so they are not compared
+    valid = smolvla.prefix_layout(int(data["meta"][2]), data["lang_mask"])["pad"]
     if from_log is not None:
         stdout = Path(from_log).read_text()
         rois = [int(v) for v in PERF_RE.findall(stdout)]
-        print(f"[smolvla-vlm] re-evaluating {from_log}: tokens={n} layers={layers} roi={rois[0] if rois else None} ns")
-        return report_smolvla(data, stdout, layers, dumps, bool(rois))
+        print(f"[smolvla-vlm] re-evaluating {from_log}: tokens={n} layers {layer0 + 1}..{last} roi={rois[0] if rois else None} ns")
+        return report_smolvla(data, stdout, layers, dumps, bool(rois), valid)
     app = Path(app_dir) if app_dir else HERE / "smolvla_vlm_app"
     app.mkdir(parents=True, exist_ok=True)
     rt = (HERE / "../../runtime").resolve()
@@ -451,19 +454,21 @@ def run_smolvla_vlm(npz: str, layers: int | None, attn: int, cluster: int, nsamp
     r = run_sim(preload=elf, timeout=timeout, log=log)
     (app / "last_run.log").write_text(r["stdout"])
     print(f"{'PASS' if r['ok'] else 'FAIL'} smolvla-vlm tokens={n} layers {layer0 + 1}..{last} attn={attn} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
-    ok = report_smolvla(data, r["stdout"], layers, dumps, r["ok"])
+    ok = report_smolvla(data, r["stdout"], layers, dumps, r["ok"], valid)
     if not r["ok"]:
         print(r["stdout"][-1500:])
     return ok
 
 
-def report_smolvla(data: dict, stdout: str, layers: int, dumps: tuple, ok: bool) -> bool:
+def report_smolvla(data: dict, stdout: str, layers: int, dumps: tuple, ok: bool, valid_rows=None) -> bool:
     """Timing (marks) + accuracy of the sampled tensors. A tensor passes when every sample is within
     atol = 3% of the tensor's max |ref| (+ 5% relative) of the HF fp32 reference: the program is fp16 end
     to end (fp16 operands and RedMulE fp16 accumulation), so ~1e-2 of the tensor scale is the floor, and
     the post layernorm amplifies the last layer's error by gamma / row-std (~6x for this checkpoint)."""
     from softhier_mlir.testing import lcg
     got = lcg.parse_samples(stdout)
+    if valid_rows is not None:      # rows nobody reads (padded language tokens): not compared
+        got = {t: [(r_, c, v) for r_, c, v in smp if valid_rows[r_]] for t, smp in got.items()}
     marks = parse_marks(stdout)
     for ln in stdout.splitlines():
         if ln.startswith("[sh_"):
