@@ -382,8 +382,11 @@ class AddBiasOp(IRDLOperation):
 class AttentionOp(IRDLOperation):
     """Fused multi-head attention on HBM tensors: for every head ``h`` (columns
     ``[h*dh, (h+1)*dh)`` of the ``S x D`` operands, ``dh = D / heads``)
-    ``o_h = softmax(scale * q_h k_h^T) v_h``, each head computed entirely inside one
-    cluster's TCDM (S <= 256). ``cluster = -1`` deals head ``h`` to cluster ``h % P``."""
+    ``o_h = softmax(scale * q_h k_h^T) v_h``, processed as work items of ``q_block`` query rows
+    (the head's K / K^T / V and the ``q_block x S`` scores stay inside one cluster's TCDM).
+    ``cluster = -1`` deals the ``heads * S / q_block`` items in contiguous chunks over the
+    clusters. ``q_block`` is a policy attribute (``softhier_mlir.frontend.siglip.attention_q_block``
+    is the rule); absent, the library applies the same rule (``sh_attention_q_block``)."""
     name = "softhier.attention"
     irdl_options = (ParsePropInAttrDict(),)
     q = operand_def(MemRefType)
@@ -392,6 +395,7 @@ class AttentionOp(IRDLOperation):
     o = operand_def(MemRefType)
     scale = prop_def(FloatAttr)
     heads = prop_def(IntegerAttr)
+    q_block = opt_prop_def(IntegerAttr)
     assembly_format = "$q `,` $k `,` $v `->` $o attr-dict `:` type($q) `,` type($k) `,` type($v) `->` type($o)"
 
 

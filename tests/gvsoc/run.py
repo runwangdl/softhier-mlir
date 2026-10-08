@@ -154,30 +154,42 @@ def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: in
     return ok
 
 
-def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers: int = 1, nsamples: int = 64, fused: bool = False) -> bool:
-    """Frontend -> softhier-translate -> gvsoc, compared against the same numpy reference as `siglip`."""
+def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers: int = 1, nsamples: int = 64, fused: bool = False,
+                    trace: Path | None = None, tiles: str = "model") -> bool:
+    """Frontend -> softhier-translate -> gvsoc, compared against the same numpy reference as `siglip`.
+    trace: also record the RedMulE / iDMA / barrier activity (gvsoc --trace) into this log, for
+    `python -m softhier_mlir.sim.trace <log> --png ...`. tiles: the frontend's GEMM tile policy."""
     from softhier_mlir.frontend import siglip
     from softhier_mlir.testing import lcg, siglip_ref
     app = HERE / "mlir_app"
-    mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples, fused_attention=fused)
+    mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples,
+                       fused_attention=fused, tiles=tiles)
     (app / "siglip.mlir").write_text(mlir)
     (app / "main.c").write_text(lower_and_translate(app / "siglip.mlir", None))
     build_sw(app)
-    r = run_sim(timeout=7200)
+    r = run_sim(timeout=7200, traces=("redmule", "idma", "cluster_registers") if trace else (), log=trace)
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"]
     print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} attention={'fused' if fused else 'per-head'} roi={r['roi_ns']} ns wall={r['wall_s']}s")
     for ln in r["stdout"].splitlines():
-        if ln.startswith("[sh_"):
+        if ln.startswith("[sh_") or ln.startswith("[mark]"):
             print("     " + ln)
+    marks = parse_marks(r["stdout"])
+    if marks:
+        prev = None
+        for tag, t in marks.items():
+            if prev is not None:
+                print(f"     time {prev[0]:>8} -> {tag:<8} {(t - prev[1]) / 1e6:9.3f} ms")
+            prev = (tag, t)
     for tag, arr in ref.items():
         if tag not in got:
             continue
         bad, maxerr = lcg.compare_samples(got[tag], arr, atol=0.05, rtol=0.05, show=2)
         print(f"     {tag:<4} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
         ok &= bad == 0
-    (app / "last_run.log").write_text(r["stdout"])
+    if trace is None:
+        (app / "last_run.log").write_text(r["stdout"])
     return ok
 
 
@@ -390,12 +402,13 @@ def attention_reference(S: int, D: int, H: int, scale: float = 0.125) -> np.ndar
     return o
 
 
-def run_attention(seq: int, d: int, heads: int, cluster: str, composed: bool, nsamples: int = 128) -> bool:
-    """Fused sh_attention (or the composed transpose+gemm+softmax+gemm path) vs numpy; prints the ROI."""
+def run_attention(seq: int, d: int, heads: int, cluster: str, composed: bool, nsamples: int = 128, extra: str = "") -> bool:
+    """Fused sh_attention (or the composed transpose+gemm+softmax+gemm path) vs numpy; prints the ROI.
+    extra: more shape.h lines (Q_BLOCK=<rows>, SH_ATTN_KT_DMA=0, ... from --define)."""
     from softhier_mlir.testing import lcg
     app = HERE / "attention"
     (app / "shape.h").write_text(f"#define SEQ {seq}\n#define D_MODEL {d}\n#define N_HEADS {heads}\n"
-                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n#define COMPOSED {1 if composed else 0}\n")
+                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n#define COMPOSED {1 if composed else 0}\n" + extra)
     build_sw(app)
     r = run_sim(timeout=7200)
     ref = attention_reference(seq, d, heads)
@@ -489,9 +502,11 @@ if __name__ == "__main__":
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
     ap.add_argument("--offsets", help="gemm: HBM byte offsets X,W,Z (hex ok; 64 MB per HBM node), default all in node 0")
-    ap.add_argument("--define", nargs="*", default=[], help="siglip: extra NAME[=VALUE] macros for shape.h")
+    ap.add_argument("--define", nargs="*", default=[], help="siglip / attention: extra NAME[=VALUE] macros for shape.h")
     ap.add_argument("--composed", action="store_true", help="attention: the per-head library-call path instead of the fused kernel")
     ap.add_argument("--fused", action="store_true", help="siglip-mlir: use the fused softhier.attention op")
+    ap.add_argument("--trace", help="siglip-mlir: record the RedMulE/iDMA/barrier activity into this log (softhier_mlir.sim.trace)")
+    ap.add_argument("--tiles", default="model", help="siglip-mlir: GEMM tile policy, 'model' (softhier_mlir.dse.tiling) or 'tm,tn,tk'")
     a = ap.parse_args()
     if a.cluster is None:
         a.cluster = "all" if a.test == "smolvla" else "0"
@@ -508,9 +523,11 @@ if __name__ == "__main__":
         ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0",
                         extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "attention":
-        ok = run_attention(a.seq, a.d, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples)
+        ok = run_attention(a.seq, a.d, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples,
+                           extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "siglip-mlir":
-        ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused)
+        ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused,
+                             trace=Path(a.trace) if a.trace else None, tiles=a.tiles)
     elif a.test == "preload":
         ok = run_preload(wait=not a.no_wait)
     elif a.test == "smolvla":

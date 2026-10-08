@@ -332,8 +332,9 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             _, _, ldk, _ = bufs.geom(op.k)
             _, _, ldv, _ = bufs.geom(op.v)
             _, _, ldo, _ = bufs.geom(op.o)
-            b(f"{ind}sh_attention({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
-              f"{S}, {D}, {op.heads.value.data}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
+            qb = _int_attr(op, "q_block", 0)      # q-block policy attribute; 0 / absent = the library's rule
+            b(f"{ind}sh_attention{'_q' if qb else ''}({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
+              f"{S}, {D}, {op.heads.value.data}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {_cluster(op)}{f', {qb}' if qb else ''});")
 
         elif isinstance(op, TransposeOp) and bufs.space(op.src) != "tcdm":
             rows, cols, lds, _ = bufs.geom(op.src)

@@ -41,14 +41,19 @@ int main(void) {
     }
     sh_barrier_global();
 #else
-    rc = sh_attention(q, k, v, o, S, D, H, D, D, D, D, scale, CLUSTER);
+#ifndef Q_BLOCK
+#define Q_BLOCK 0      /* 0: the library's sh_attention_q_block rule (run.py attention --define Q_BLOCK=64 overrides) */
+#endif
+    rc = sh_attention_q(q, k, v, o, S, D, H, D, D, D, D, scale, CLUSTER, Q_BLOCK);
     if (CLUSTER != SH_ALL) sh_barrier_global();
 #endif
     if (lead) {
         sh_timer_end();
         if (rc) sh_printf("[attention] rc=%d ATTENTION_FAIL\n", rc);
 #if !COMPOSED
-        if (CLUSTER != SH_ALL || H <= sh_num_clusters()) {   /* cluster 0's last head: per-phase cycles */
+        {   /* cluster 0's last work item: per-phase cycles, then the cluster's whole time */
+            const uint32_t sq = Q_BLOCK ? Q_BLOCK : sh_attention_q_block(S, DH, H, CLUSTER == SH_ALL ? sh_num_clusters() : 1);
+            sh_printf("[attention] q block %u rows: %u work items\n", sq, sq ? H * (S / sq) : 0);
             static const char *ph[6] = { "stage+kT", "-", "scores", "softmax", "pv", "norm+store" };
             uint32_t prev = sh_attention_profile(S, DH, 0);
             for (uint32_t i = 1; i <= 6; ++i) {
@@ -56,7 +61,8 @@ int main(void) {
                 if (i != 2) sh_printf("[attention] phase %-10s %u cycles\n", ph[i - 1], c - prev);
                 prev = c;
             }
-            sh_printf("[attention] total %u cycles (cluster 0, last head)\n", sh_attention_profile(S, DH, 6) - sh_attention_profile(S, DH, 0));
+            sh_printf("[attention] total %u cycles (cluster 0, last work item); cluster 0 all items %u cycles\n",
+                      sh_attention_profile(S, DH, 6) - sh_attention_profile(S, DH, 0), sh_attention_profile(S, DH, 6) - sh_attention_profile(S, DH, 7));
         }
 #endif
         sh_test_dump_samples(o, S, DH, D, 301, NSAMPLES, "O0");
