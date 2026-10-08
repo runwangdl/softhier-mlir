@@ -68,7 +68,9 @@ def parse_shape(s: str) -> dict:
     return dict(M=m, N=n, K=k, tm=tm, tn=tn, tk=tk, pipeline=pipe, accumulate=acc, cluster=cluster)
 
 
-def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False) -> bool:
+def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False, offsets: tuple | None = None) -> bool:
+    """offsets: HBM byte offsets of X, W, Z (default X at HBM_START, W at 16 MB, Z at 32 MB: all in HBM node 0;
+    a node is 64 MB and has its own NoC edge port, docs/DSE.md section 8)."""
     from softhier_mlir.testing import lcg
     app = HERE / "gemm"
     all_ok = True
@@ -77,6 +79,8 @@ def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False) -> bool
         M, N, K, acc = c["M"], c["N"], c["K"], c["accumulate"]
         # == the fills in gemm/main.c (X at HBM_START, W at 16 MB, Z at 32 MB or behind a larger W; Z0 = 3.0 when accumulating)
         off = {"x": HBM_START, "w": 0x01000000, "z": max(0x02000000, 0x01000000 + ((K * N * 2 + 0xFFFFF) & ~0xFFFFF))}
+        if offsets:
+            off = {"x": max(offsets[0], HBM_START), "w": offsets[1], "z": offsets[2]}
         x = lcg.fill_fp16(M, K, 1, 0, 64, 1 / 4096) if real else lcg.fill_fp16(M, K, 1, -1, 1)
         w = lcg.fill_fp16(K, N, 2, -16, 16, 0.125) if real else lcg.fill_fp16(K, N, 2, -2, 2)
         z = lcg.fill_fp16(M, N, 3, 3 if acc else 0, 3 if acc else 0)
@@ -293,30 +297,45 @@ def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: in
     return ok
 
 
-def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers: int = 1, nsamples: int = 64, fused: bool = False) -> bool:
-    """Frontend -> softhier-translate -> gvsoc, compared against the same numpy reference as `siglip`."""
+def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers: int = 1, nsamples: int = 64, fused: bool = False,
+                    trace: Path | None = None, tiles: str = "model", hbm_split: bool = False) -> bool:
+    """Frontend -> softhier-translate -> gvsoc, compared against the same numpy reference as `siglip`.
+    trace: also record the RedMulE / iDMA / barrier activity (gvsoc --trace) into this log, for
+    `python -m softhier_mlir.sim.trace <log> --png ...`. tiles: the frontend's GEMM tile policy.
+    hbm_split: parameters in HBM node 1, activations in node 0."""
     from softhier_mlir.frontend import siglip
     from softhier_mlir.testing import lcg, siglip_ref
     app = HERE / "mlir_app"
-    mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples, fused_attention=fused)
+    mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples,
+                       fused_attention=fused, tiles=tiles, hbm_split=hbm_split)
     (app / "siglip.mlir").write_text(mlir)
     (app / "main.c").write_text(lower_and_translate(app / "siglip.mlir", None, pre := translate_preload(app)))
     build_sw(app)
-    r = run_sim(timeout=7200, preload=pre if pre and pre.exists() else None)
+    r = run_sim(timeout=7200, preload=pre if pre and pre.exists() else None,
+                traces=("redmule", "idma", "cluster_registers") if trace else (), log=trace)
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"]
-    print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} attention={'fused' if fused else 'per-head'} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} attention={'fused' if fused else 'per-head'} "
+          f"tiles={tiles} hbm_split={hbm_split} roi={r['roi_ns']} ns wall={r['wall_s']}s (layer segments: the marks below)")
     for ln in r["stdout"].splitlines():
-        if ln.startswith("[sh_"):
+        if ln.startswith("[sh_") or ln.startswith("[mark]"):
             print("     " + ln)
+    marks = parse_marks(r["stdout"])
+    if marks:
+        prev = None
+        for tag, t in marks.items():
+            if prev is not None:
+                print(f"     time {prev[0]:>8} -> {tag:<8} {(t - prev[1]) / 1e6:9.3f} ms")
+            prev = (tag, t)
     for tag, arr in ref.items():
         if tag not in got:
             continue
         bad, maxerr = lcg.compare_samples(got[tag], arr, atol=0.05, rtol=0.05, show=2)
         print(f"     {tag:<4} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
         ok &= bad == 0
-    (app / "last_run.log").write_text(r["stdout"])
+    if trace is None:
+        (app / "last_run.log").write_text(r["stdout"])
     return ok
 
 
@@ -377,8 +396,10 @@ def parse_marks(stdout: str) -> dict[str, int]:
     out, prev, acc = {}, None, 0
     for ln in stdout.splitlines():
         if ln.startswith("[mark] "):
-            _, tag, c = ln.split()
-            c = int(c)
+            m = re.match(r"\[mark\] (\w+) (\d+)$", ln)   # a gvsoc trace line can be glued to the mark (--trace runs)
+            if not m:
+                continue
+            tag, c = m.group(1), int(m.group(2))
             if prev is not None:
                 acc += (c - prev) % (1 << 32)
             prev = c
@@ -580,8 +601,9 @@ def attention_reference(S: int, D: int, H: int, scale: float = 0.125) -> np.ndar
     return o
 
 
-def run_attention(seq: int, d: int, heads: int, cluster: str, composed: bool, nsamples: int = 128) -> bool:
-    """Fused sh_attention (or the composed transpose+gemm+softmax+gemm path) vs numpy; prints the ROI."""
+def run_attention(seq: int, d: int, heads: int, cluster: str, composed: bool, nsamples: int = 128, extra: str = "") -> bool:
+    """Fused sh_attention (or the composed transpose+gemm+softmax+gemm path) vs numpy; prints the ROI.
+    extra: more shape.h lines (Q_BLOCK=<rows>, SH_ATTN_KT_DMA=0, ... from --define)."""
     from softhier_mlir.testing import lcg
     app = HERE / "attention"
     mb = (seq * d * 2 + 4095) & ~4095           # == attention/main.c: q, k, v, o, then kT and the H score matrices
@@ -590,7 +612,7 @@ def run_attention(seq: int, d: int, heads: int, cluster: str, composed: bool, ns
                                sentinel_off=HBM_START + 5 * mb + heads * seq * seq * 2)
     (app / "shape.h").write_text(f"#define SEQ {seq}\n#define D_MODEL {d}\n#define N_HEADS {heads}\n"
                                  f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n#define COMPOSED {1 if composed else 0}\n"
-                                 f"#define HBM_START 0x{HBM_START:x}\n" + pre_h)
+                                 f"#define HBM_START 0x{HBM_START:x}\n" + pre_h + extra)
     build_sw(app)
     r = run_sim(timeout=7200, preload=pre)
     ref = attention_reference(seq, d, heads)
@@ -752,15 +774,20 @@ if __name__ == "__main__":
     ap.add_argument("--modes", nargs="*", default=["0", "1", "2", "5", "6"], help="mesh: MODE[:DEF,...]")
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
-    ap.add_argument("--define", nargs="*", default=[], help="siglip: extra NAME[=VALUE] macros for shape.h")
+    ap.add_argument("--offsets", help="gemm: HBM byte offsets X,W,Z (hex ok; 64 MB per HBM node), default all in node 0")
+    ap.add_argument("--define", nargs="*", default=[], help="siglip / attention: extra NAME[=VALUE] macros for shape.h")
     ap.add_argument("--composed", action="store_true", help="attention: the per-head library-call path instead of the fused kernel")
     ap.add_argument("--fused", action="store_true", help="siglip-mlir: use the fused softhier.attention op")
+    ap.add_argument("--trace", help="siglip-mlir: record the RedMulE/iDMA/barrier activity into this log (softhier_mlir.sim.trace)")
+    ap.add_argument("--tiles", default="model", help="siglip-mlir: GEMM tile policy, 'model' (softhier_mlir.dse.tiling) or 'tm,tn,tk'")
+    ap.add_argument("--hbm-split", action="store_true", help="siglip-mlir: parameters in HBM node 1, activations in node 0")
     a = ap.parse_args()
     DATA = a.data
     if a.cluster is None:
         a.cluster = "all" if a.test in ("smolvla", "smolvla-vlm") else "0"
     if a.test == "gemm":
-        ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
+        ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real,
+                      tuple(int(v, 0) for v in a.offsets.split(",")) if a.offsets else None)
     elif a.test == "gemm-seq":
         ok = run_gemm_seq()
     elif a.test == "rowops":
@@ -779,9 +806,11 @@ if __name__ == "__main__":
         ok = run_siglip(a.seq, a.d, a.ff, (a.heads or 12), "SH_ALL" if a.cluster == "all" else "0",
                         extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "attention":
-        ok = run_attention(a.seq, a.d, (a.heads or 12), "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples)
+        ok = run_attention(a.seq, a.d, (a.heads or 12), "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples,
+                           extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "siglip-mlir":
-        ok = run_siglip_mlir(a.seq, a.d, a.ff, (a.heads or 12), "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused)
+        ok = run_siglip_mlir(a.seq, a.d, a.ff, (a.heads or 12), "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused,
+                             trace=Path(a.trace) if a.trace else None, tiles=a.tiles, hbm_split=a.hbm_split)
     elif a.test == "preload":
         ok = run_preload(wait=not a.no_wait)
     elif a.test == "smolvla":

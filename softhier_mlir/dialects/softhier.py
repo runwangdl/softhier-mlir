@@ -386,8 +386,11 @@ class AddBiasOp(IRDLOperation):
 class AttentionOp(IRDLOperation):
     """Fused multi-head attention on HBM tensors: for every head ``h`` (columns
     ``[h*dh, (h+1)*dh)`` of the ``S x D`` operands, ``dh = D / heads``)
-    ``o_h = softmax(scale * q_h k_h^T) v_h``, each head computed entirely inside one
-    cluster's TCDM (S <= 256). ``cluster = -1`` deals head ``h`` to cluster ``h % P``."""
+    ``o_h = softmax(scale * q_h k_h^T) v_h``, processed as work items of ``q_block`` query rows
+    (the head's K / K^T / V and the ``q_block x S`` scores stay inside one cluster's TCDM).
+    ``cluster = -1`` deals the ``heads * S / q_block`` items in contiguous chunks over the
+    clusters. ``q_block`` is a policy attribute (``softhier_mlir.frontend.siglip.attention_q_block``
+    is the rule); absent, the library applies the same rule (``sh_attention_q_block``)."""
     name = "softhier.attention"
     irdl_options = (ParsePropInAttrDict(),)
     q = operand_def(MemRefType)
@@ -398,6 +401,7 @@ class AttentionOp(IRDLOperation):
     scale = prop_def(FloatAttr)
     heads = prop_def(IntegerAttr)
     kv_heads = opt_prop_def(IntegerAttr)    # grouped-query attention: k / v are S x (kv_heads * dh); query head h uses kv head h // (heads / kv_heads)
+    q_block = opt_prop_def(IntegerAttr)     # q-block work-item policy (0/absent = library rule), see sh_attention_q
     assembly_format = "$q `,` $k `,` $v (`,` $mask^)? `->` $o attr-dict `:` type($q) `,` type($k) `,` type($v) (`,` type($mask)^)? `->` type($o)"
 
 

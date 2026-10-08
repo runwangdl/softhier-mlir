@@ -7,6 +7,7 @@
 int main(void) {
     sh_init();
     const uint32_t M = GEMM_M, N = GEMM_N, K = GEMM_K;
+    /* OFF_*: HBM byte offsets (node = offset / 64 MB; run.py gemm --offsets places X/W/Z in different nodes) */
     const uint64_t x = sh_hbm_addr(OFF_X), w = sh_hbm_addr(OFF_W), z = sh_hbm_addr(OFF_Z);
     uint32_t bad = 0;
 #ifdef SH_PRELOAD   /* inputs are in the host's preload image: wait for its last segment (global barrier inside) */

@@ -194,8 +194,10 @@ PARAMS = [("wq", D, D), ("wk", D, D), ("wv", D, D), ("wo", D, D), ("w1", D, FF),
 
 def emit(npz: str | Path | dict, layers: int | None = None, attn: int = -1, cluster: int = -1,
          dumps: tuple[str, ...] = ("EMB", "L1", "OUT"), nsamples: int = 64, marks: bool = True,
-         unroll: bool = False) -> tuple[str, dict[int, np.ndarray]]:
+         unroll: bool = False, tiles: str | None = "model") -> tuple[str, dict[int, np.ndarray]]:
     """-> (mlir, {hbm_offset: fp16 array to preload}).
+
+    tiles:   GEMM tile policy of the projections / FFN (siglip.gemm_tile_attrs: "model", "tm,tn,tk" or None = 256^3).
 
     cluster: executing cluster of GEMMs / row ops (-1 = SH_ALL: output tiles / row blocks dealt
              round-robin over all clusters, global barrier after each op).
@@ -289,7 +291,11 @@ def emit(npz: str | Path | dict, layers: int | None = None, attn: int = -1, clus
                 dump(tag, nm, 100 + sum(map(ord, tag)) % 50)
 
     gem = lambda tm, tn, tk: f"tile_m = {tm} : i32, tile_n = {tn} : i32, tile_k = {tk} : i32, pipeline"  # noqa: E731
-    big, qk, pv = gem(256, 256, 256), gem(256, 256, dh), gem(256, dh, 256)
+    qk, pv = gem(256, 256, dh), gem(256, dh, 256)
+    # the big GEMMs take the cost-model tile (softhier_mlir.dse.tiling: largest tiles TCDM holds, the GEMMs are HBM-bound)
+    from softhier_mlir.frontend.siglip import gemm_tile_attrs
+    big = proj = gemm_tile_attrs(seq, D, D, cluster, tiles)
+    fc1, fc2 = gemm_tile_attrs(seq, FF, D, cluster, tiles), gemm_tile_attrs(seq, D, FF, cluster, tiles)
     seeds = {"EMB": 200, "LN1": 206, "Q": 201, "K": 207, "P0": 209, "O": 202, "H": 203, "G": 204, "OUT": 205}
     hv = lambda rows, cols, ld, eoff: f'memref<{rows}x{cols}xf16, strided<[{ld}, 1], offset: {eoff}>, "{e.space}">'  # noqa: E731
 
@@ -354,10 +360,10 @@ def emit(npz: str | Path | dict, layers: int | None = None, attn: int = -1, clus
         e.op(f"softhier.add_bias %ao, %{W('bo')} -> %ao {{{cl}}} : {T['ao']}, {T[W('bo')]} -> {T['ao']}")
         e.op(f"softhier.add %x, %ao -> %h {{{cl}}} : {T['x']}, {T['ao']} -> {T['h']}")
         e.op(f"softhier.layernorm %h, %{W('g2')}, %{W('be2')} -> %ln2 {{eps = {LN_EPS:.1e} : f32, {cl}}} : {T['h']}, {T[W('g2')]}, {T[W('be2')]} -> {T['ln2']}")
-        e.op(f"softhier.gemm %ln2, %{W('w1')} into %f1 {{fmt = \"fp16\", {big}, {cl}}} : {T['ln2']}, {T[W('w1')]}, {T['f1']}")
+        e.op(f"softhier.gemm %ln2, %{W('w1')} into %f1 {{fmt = \"fp16\", {fc1}, {cl}}} : {T['ln2']}, {T[W('w1')]}, {T['f1']}")
         e.op(f"softhier.add_bias %f1, %{W('b1')} -> %f1 {{{cl}}} : {T['f1']}, {T[W('b1')]} -> {T['f1']}")
         e.op(f"softhier.gelu %f1 -> %g {{{cl}}} : {T['f1']} -> {T['g']}")
-        e.op(f"softhier.gemm %g, %{W('w2')} into %f2 {{fmt = \"fp16\", {big}, {cl}}} : {T['g']}, {T[W('w2')]}, {T['f2']}")
+        e.op(f"softhier.gemm %g, %{W('w2')} into %f2 {{fmt = \"fp16\", {fc2}, {cl}}} : {T['g']}, {T[W('w2')]}, {T['f2']}")
         e.op(f"softhier.add_bias %f2, %{W('b2')} -> %f2 {{{cl}}} : {T['f2']}, {T[W('b2')]} -> {T['f2']}")
         e.op(f"softhier.add %h, %f2 -> %x {{{cl}}} : {T['h']}, {T['f2']} -> {T['x']}")
         mark(f"layer{n1}" if n1 else "layer", idx)
