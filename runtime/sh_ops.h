@@ -119,5 +119,22 @@ static inline uint32_t sh_f2h(float f) {
     __asm__ ("fcvt.h.s %1, %2, rne\n\tfmv.x.w %0, %1" : "=r"(h), "=&f"(t) : "f"(f));
     return h;
 }
+/* 4-wide variants: one asm block each, so the four independent fmv/fcvt chains are issued
+ * interleaved (the Snitch FPU model overlaps independent instructions but GCC schedules the
+ * dependent pairs back to back). p must hold 4 halves. */
+static inline void sh_h2f4(const uint16_t *p, float *a0, float *a1, float *a2, float *a3) {
+    const uint32_t h0 = p[0] | 0xFFFF0000u, h1 = p[1] | 0xFFFF0000u, h2 = p[2] | 0xFFFF0000u, h3 = p[3] | 0xFFFF0000u;
+    __asm__ ("fmv.w.x %0, %4\n\tfmv.w.x %1, %5\n\tfmv.w.x %2, %6\n\tfmv.w.x %3, %7\n\t"
+             "fcvt.s.h %0, %0\n\tfcvt.s.h %1, %1\n\tfcvt.s.h %2, %2\n\tfcvt.s.h %3, %3"
+             : "=&f"(*a0), "=&f"(*a1), "=&f"(*a2), "=&f"(*a3) : "r"(h0), "r"(h1), "r"(h2), "r"(h3));
+}
+static inline void sh_f2h4(uint16_t *p, float a0, float a1, float a2, float a3) {
+    uint32_t h0, h1, h2, h3; float t0, t1, t2, t3;
+    __asm__ ("fcvt.h.s %4, %8, rne\n\tfcvt.h.s %5, %9, rne\n\tfcvt.h.s %6, %10, rne\n\tfcvt.h.s %7, %11, rne\n\t"
+             "fmv.x.w %0, %4\n\tfmv.x.w %1, %5\n\tfmv.x.w %2, %6\n\tfmv.x.w %3, %7"
+             : "=&r"(h0), "=&r"(h1), "=&r"(h2), "=&r"(h3), "=&f"(t0), "=&f"(t1), "=&f"(t2), "=&f"(t3)
+             : "f"(a0), "f"(a1), "f"(a2), "f"(a3));
+    p[0] = (uint16_t)h0; p[1] = (uint16_t)h1; p[2] = (uint16_t)h2; p[3] = (uint16_t)h3;
+}
 
 #endif /* SH_OPS_H */
