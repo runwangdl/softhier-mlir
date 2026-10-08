@@ -18,6 +18,7 @@ from xdsl.dialects.builtin import FloatAttr, IntegerAttr, MemRefType, ModuleOp, 
 from softhier_mlir.dialects.softhier import (
     AddBiasOp,
     AddOp,
+    AttentionOp,
     CheckConstOp,
     DumpSamplesOp,
     GeluOp,
@@ -247,6 +248,14 @@ def emit_kernel(fn: func.FuncOp, bufs: _Buffers) -> str:
         elif isinstance(op, AddBiasOp):
             rows, cols, ld, _ = bufs.geom(op.x)
             b(f"    sh_add_bias({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.bias)}, {rows}, {cols}, {ld}, {_cluster(op)});")
+
+        elif isinstance(op, AttentionOp):
+            S, D, ldq, _ = bufs.geom(op.q)
+            _, _, ldk, _ = bufs.geom(op.k)
+            _, _, ldv, _ = bufs.geom(op.v)
+            _, _, ldo, _ = bufs.geom(op.o)
+            b(f"    sh_attention({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
+              f"{S}, {D}, {op.heads.value.data}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
 
         elif isinstance(op, TransposeOp) and bufs.space(op.src) != "tcdm":
             rows, cols, lds, _ = bufs.geom(op.src)

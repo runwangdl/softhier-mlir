@@ -20,6 +20,19 @@ removed from `gvsoc-pulp` in 2026-01 and the public SDK (2026-06) only ships the
 | 9 | core 0 hangs forever in a loop over a TCDM buffer at offset 0 | TCDM address 0 is `NULL` to GCC (and the SDK L1 allocator lives at 0x10) | the library never stages data below TCDM 0x1000 (`SH_ROWOPS_L1_BASE`) |
 | 10 | software softmax / LN / GELU results depend on the *binary layout*: `siglip --cluster all` failed (P0 = softmax(-x), negative "probabilities", O off by 0.8) while `--cluster 0`, or the same binary plus an unrelated `printf`, passed; identical numbers whether the heads ran concurrently or serialized | Snitch core <-> FP-subsystem integer-register hazard: `fcvt.w.s`, `flt.s`, `feq.s`, `fmv.x.s`, `fclass.s` (and the fp16/fp8 scalar variants) lack the `nseq` tag that the `.d` versions have, so they are queued in the FPU sequence buffer; the integer core runs ahead, reads the destination register before the subsystem wrote it, and the late write-back clobbers newer values (insn trace: `addi a5,a5,127` / `slli` execute before `fcvt.w.s a5`, then `fmv.w.x fa4,a5` gets the stale `a5`). Only bites when the sequence buffer is non-empty, i.e. depends on cycle timing / code alignment | patch `gvsoc_snitch_fp_int_nseq.patch` (ISA tables: add `nseq` to every scalar FP instruction with an integer operand), regenerate `isa_snitch_rv32imfdva.cpp`, rebuild `gen_isa_snitch_rv32imfdva_cpp_*`; until it is installed, run with `SOFTHIER_MODEL_DIR=<dir with the patched .so>` (see below) |
 
+Findings from the fused attention kernel (`runtime/sh_attention.inc.c`, 2026-10-08), not patched:
+
+| # | Symptom | Root cause | Workaround |
+|---|---|---|---|
+| 6 | `fcvt.w.s` followed by `fcvt.s.w` of its result (the usual `(float)(int)x` range reduction) returns garbage; an integer ALU consumer of the same result is correct | `snitch_fp_ss.cpp` snapshots the integer register file when an instruction is offloaded; an FP instruction that reads the integer result of a preceding FP->int move is offloaded before that result is written back | never feed an FP->int result straight back into the FPU: consume it with ALU ops first (`sh_attention_head` builds the `2^k` exponent field on the integer side) |
+| 7 | the 3 cores of a cluster together run no faster than one: an ALU-only loop goes from 16 to 47 cycles/iteration when the other two cores run the same loop | no instruction cache: every core refetches each line over the shared `instr_router` (8 B/cycle) from `instr_mem`, ~2 cycles per instruction even for one core | instruction count is the cost metric on the cores (an int op is not free); use RedMulE / iDMA for everything that can be; the softmax in `sh_attention_head` is fetch-bound at ~60 cycles/element |
+
+Measured costs on one Snitch core, data in TCDM (cycles per operation, `tests` micro-benchmarks 2026-10-08): dependent
+TCDM load ~13 (non-volatile, pipelined: ~5), `flw` 3, `fsw` ~12, dependent `fadd`/`fmul`/`fmadd` 3-4, every FP->int
+move (`fmv.x.w`, `fcvt.w.s`, `flt`+branch) ~15 round trip, `fcvt.s.h`/`fcvt.h.s` (Zfh conversions, unlike `flh`/`fsh`)
+work and cost ~4, software `sh_fp16_to_f32` 40, `sh_f32_to_fp16` 72, `sh_expf` ~60. iDMA 2-D transfers with 2-byte
+elements (an in-TCDM transpose: 64 descriptors of 256 x 2 B) work and take ~1 cycle per element.
+
 Other facts the library relies on:
 - RedMulE convention: `flex_redmule_config(m, n, k)` computes `Y[m,k] += X[m,n] . W[n,k]`
   (the contraction is `n`). `sh_gemm` therefore calls `config(tm, tk, tn)`.

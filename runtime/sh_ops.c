@@ -15,4 +15,5 @@
 #include "sh_gemm.inc.c"
 #include "sh_l1.inc.c"
 #include "sh_rowops.inc.c"
+#include "sh_attention.inc.c"
 #include "sh_test.inc.c"

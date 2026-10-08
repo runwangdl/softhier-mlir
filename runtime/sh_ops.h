@@ -76,6 +76,23 @@ void sh_add_bias(uint64_t y, uint64_t x, uint64_t bias_row, uint32_t rows, uint3
 void sh_scale(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, float s, uint32_t cluster);
 void sh_transpose(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint32_t ld_src, uint32_t ld_dst, uint32_t cluster); /* dst[cols,rows] */
 
+/* ---- fused attention (runtime/sh_attention.inc.c) ------------------------------------------
+ * One head, entirely inside the executing cluster's TCDM (S <= 256):
+ *   o[S,dh] = softmax(scale * q[S,dh] . k[S,dh]^T) . v[S,dh]      (fp16 in HBM, leading dims in elements)
+ * RedMulE for both GEMMs, k transposed in L1, fp32 row softmax on the cores. `cluster` = the one
+ * cluster that runs it (other clusters return at once; no global barrier). Returns 0, or <0 if S or
+ * the L1 budget is exceeded (reason printed by the first core). */
+int sh_attention_head(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, uint32_t dh,
+                      uint32_t ldq, uint32_t ldk, uint32_t ldv, uint32_t ldo, float scale, uint32_t cluster);
+/* Multi-head over column slices (head h = columns [h*dh, (h+1)*dh), dh = D/H) of q/k/v/o. cluster == SH_ALL
+ * deals head h to cluster h % P and ends with a global barrier. Call from all cores of all clusters. */
+int sh_attention(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, uint32_t D, uint32_t H,
+                 uint32_t ldq, uint32_t ldk, uint32_t ldv, uint32_t ldo, float scale, uint32_t cluster);
+uint32_t sh_attention_l1_bytes(uint32_t S, uint32_t dh);   /* TCDM bytes one head needs */
+/* mcycle stamp `phase` (0 entry, 1 staged, 2 transposed, 3 scores, 4 softmax, 5 P.V, 6 stored) of the last
+ * sh_attention_head run on the calling cluster (kept in its TCDM; first core's counter). */
+uint32_t sh_attention_profile(uint32_t S, uint32_t dh, uint32_t phase);
+
 /* ---- TCDM-resident ops (calling cluster only; intra-cluster sync inside) ------------------ */
 uint32_t sh_l1_addr(uint32_t off);                                   /* TCDM byte offset -> address */
 void     sh_l1_zero(uint32_t off, uint32_t bytes);                   /* via ZOMEM iDMA */

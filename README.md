@@ -80,6 +80,8 @@ Verified on GVSoC (`../softhier/gvsoc`, RedMule traces + on-device checks):
 | `softhier.hbm_buffer` / `hbm_fill` / `hbm_fill_col_parity` | HBM buffer declare / fill |
 | `softhier.check_const` / `hbm_check_const` | on-device self-verify (prints PASS/FAIL) |
 | `softhier.cluster_pos` | this cluster's (x,y) |
+| `softhier.view` / `layernorm` / `softmax` / `gelu` / `add` / `add_bias` | strided HBM views + row-wise fp16 tensor ops (`sh_*` library calls) |
+| `softhier.attention %q, %k, %v -> %o {scale, heads}` | fused multi-head attention: each head's `softmax(scale q k^T) v` inside one cluster's TCDM (`sh_attention`) |
 
 Memref memory spaces select the physical space / HBM edge:
 `"tcdm"`, `"remote_tcdm"`, `"hbm_west" | "hbm_south" | "hbm_north" | "hbm_east"`.
@@ -126,8 +128,11 @@ softhier_mlir/dialects/softhier.py the dialect (types + ops)
 softhier_mlir/transforms/          lowering passes (WIP)
 softhier_mlir/dse/                 workload IR, analytic cost model, calibration, sweep driver
 softhier_mlir/tools/softhier_opt.py the opt driver
+softhier_mlir/frontend/siglip.py   SigLIP/ViT encoder emitter (--fused: softhier.attention per layer)
+runtime/                           softhier-ops C library the generated code calls (sh_gemm, sh_attention, ...)
 tests/filecheck/                   FileCheck tests
-tests/gvsoc/                       on-simulator tests (run.py) + ubench (cost-model micro-benchmarks)
+tests/gvsoc/run.py                 on-simulator tests: gemm | rowops | fp16cvt | attention [--composed] | mesh | siglip | siglip-mlir [--fused] | mlir
+tests/gvsoc/ubench/                cost-model micro-benchmarks (docs/DSE.md)
 ```
 
 ## Why this can work

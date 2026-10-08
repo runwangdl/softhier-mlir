@@ -368,6 +368,23 @@ class AddBiasOp(IRDLOperation):
 
 
 @irdl_op_definition
+class AttentionOp(IRDLOperation):
+    """Fused multi-head attention on HBM tensors: for every head ``h`` (columns
+    ``[h*dh, (h+1)*dh)`` of the ``S x D`` operands, ``dh = D / heads``)
+    ``o_h = softmax(scale * q_h k_h^T) v_h``, each head computed entirely inside one
+    cluster's TCDM (S <= 256). ``cluster = -1`` deals head ``h`` to cluster ``h % P``."""
+    name = "softhier.attention"
+    irdl_options = (ParsePropInAttrDict(),)
+    q = operand_def(MemRefType)
+    k = operand_def(MemRefType)
+    v = operand_def(MemRefType)
+    o = operand_def(MemRefType)
+    scale = prop_def(FloatAttr)
+    heads = prop_def(IntegerAttr)
+    assembly_format = "$q `,` $k `,` $v `->` $o attr-dict `:` type($q) `,` type($k) `,` type($v) `->` type($o)"
+
+
+@irdl_op_definition
 class HbmFillLcgOp(IRDLOperation):
     """Test input: fill with ``scale * randint(lo, hi)`` from the runtime's LCG(seed); the host
     regenerates the same data with softhier_mlir.testing.lcg.fill_fp16."""
@@ -421,6 +438,7 @@ SoftHier = Dialect(
         GeluOp,
         AddOp,
         AddBiasOp,
+        AttentionOp,
         HbmFillLcgOp,
         DumpSamplesOp,
     ],
