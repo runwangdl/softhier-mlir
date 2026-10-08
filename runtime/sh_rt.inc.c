@@ -78,3 +78,21 @@ void sh_preload_wait(uint64_t sentinel) {
     }
     flex_global_barrier_xy();
 }
+
+/* Private per-core stacks (see sh_ops.h): top = stack memory end - 4 KB - core * bytes. The trampoline saves the old
+ * sp on the new stack, calls fn, restores sp. Everything caller-saved is declared clobbered. */
+void sh_call_on_core_stack(void (*fn)(void), uint32_t bytes_per_core) {
+    uint32_t top = (ARCH_CLUSTER_STACK_BASE + ARCH_CLUSTER_STACK_SIZE - 0x1000u - flex_get_core_id() * bytes_per_core) & ~15u;
+    __asm__ volatile (
+        "mv   t0, sp\n\t"
+        "mv   sp, %0\n\t"
+        "addi sp, sp, -16\n\t"
+        "sw   t0, 0(sp)\n\t"
+        "jalr %1\n\t"
+        "lw   t0, 0(sp)\n\t"
+        "mv   sp, t0\n\t"
+        : : "r"(top), "r"(fn)
+        : "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+          "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "ft8", "ft9", "ft10", "ft11",
+          "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7", "memory");
+}

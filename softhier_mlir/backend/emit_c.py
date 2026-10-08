@@ -25,6 +25,9 @@ from xdsl.ir import Block, BlockArgument, Operation, SSAValue
 
 from softhier_mlir.dialects.softhier import (
     AttentionOp,
+    AxpyOp,
+    CrossAttentionOp,
+    DumpAllOp,
     AddBiasOp,
     AddOp,
     CheckConstOp,
@@ -228,8 +231,11 @@ class _Buffers:
         return self.info[val][3]
 
 
-def _gemm_cfg(op: GemmOp) -> str:
+def _gemm_cfg(op: GemmOp, idx: _Index | None = None) -> str:
     fmt = _FMT.get(op.fmt.data, "SH_FP16")
+    if op.fmt_steps is not None and op.step is not None and idx is not None:   # per-step format table indexed by `step`
+        table = ", ".join(_FMT.get(f.data, "SH_FP16") for f in op.fmt_steps.data)
+        fmt = f"((const uint32_t[]){{{table}}})[{idx.expr(op.step)}]"
     return (f"{{ .tm = {_int_attr(op, 'tile_m', 0)}, .tn = {_int_attr(op, 'tile_n', 0)}, "
             f".tk = {_int_attr(op, 'tile_k', 0)}, .pipeline = {1 if 'pipeline' in op.attributes else 0}, "
             f".accumulate = {1 if 'accumulate' in op.attributes else 0}, .fmt = {fmt}, .l1_base = 0 }}")
@@ -293,7 +299,7 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             m, k, ldx, _ = bufs.geom(op.x)
             _k2, n, ldw, _ = bufs.geom(op.w)
             _m2, _n2, ldz, _ = bufs.geom(op.z)
-            cfg = _gemm_cfg(op)
+            cfg = _gemm_cfg(op, idx)
             args = f"{bufs.haddr(op.x)}, {bufs.haddr(op.w)}, {bufs.haddr(op.z)}, {m}, {n}, {k}, {ldx}, {ldw}, {ldz}, &cfg"
             if "summa" in op.attributes:
                 b(f"{ind}{{ sh_gemm_cfg cfg = {cfg};  // mesh-wide SUMMA")
@@ -340,8 +346,13 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
               f"{op.head_dim.value.data}, {_cluster(op)});")
 
         elif isinstance(op, SiluMulOp):
-            rows, cols, ld, _ = bufs.geom(op.a)
-            b(f"{ind}sh_silu_mul({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {ld}, {_cluster(op)});")
+            rows, cols, lda, _ = bufs.geom(op.a)
+            ldy = bufs.geom(op.y)[2]
+            if op.b is not None and ldy == lda == bufs.geom(op.b)[2]:      # sh_llm kernel: one leading dimension
+                b(f"{ind}sh_silu_mul({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {lda}, {_cluster(op)});")
+            else:                                                            # strided views / plain SiLU: the expert's kernel
+                bb, ldb = (bufs.haddr(op.b), bufs.geom(op.b)[2]) if op.b is not None else ("0", 0)
+                b(f"{ind}sh_x_silu_mul({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bb}, {rows}, {cols}, {ldy}, {lda}, {ldb}, {_cluster(op)});")
 
         elif isinstance(op, ScaleOp):
             rows, cols, ld, _ = bufs.geom(op.x)
@@ -379,6 +390,36 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             else:
                 b(f"{ind}sh_attention{'_q' if qb else ''}({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
                   f"{S}, {D}, {H}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {_cluster(op)}{f', {qb}' if qb else ''});")
+
+        elif isinstance(op, AxpyOp):
+            rows, cols, lda, _ = bufs.geom(op.a)
+            ldy, ldb = bufs.geom(op.y)[2], bufs.geom(op.b)[2]
+            b(f"{ind}sh_x_axpy({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {ldy}, {lda}, {ldb}, {_f(op.alpha)}, {_cluster(op)});")
+
+        elif isinstance(op, CrossAttentionOp):
+            Sq, _, ldq, _ = bufs.geom(op.q)
+            Lp, _, ldkp, _ = bufs.geom(op.kp)
+            _, _, ldvp, _ = bufs.geom(op.vp)
+            _, _, ldo, _ = bufs.geom(op.o)
+            heads, kvh = op.heads.value.data, op.kv_heads.value.data
+            dh = bufs.geom(op.q)[1] // heads
+            if op.ko is not None:
+                So, _, ldko, _ = bufs.geom(op.ko)
+                _, _, ldvo, _ = bufs.geom(op.vo)
+                own = f"{bufs.haddr(op.ko)}, {bufs.haddr(op.vo)}"
+            else:
+                So, ldko, ldvo, own = 0, 0, 0, "0, 0"
+            tok = bufs.haddr(op.mask) if op.mask is not None else "0"
+            b(f"{ind}sh_x_attention({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
+              f"{Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
+
+        elif isinstance(op, DumpAllOp):
+            rows, cols, ld, _ = bufs.geom(op.buf)
+            if op.index is None:
+                b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_test_dump_all({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, \"{op.tag.data}\");")
+            else:
+                b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_test_dump_all_idx({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
+                  f"\"{op.tag.data}\", (uint32_t)({idx.expr(op.index)}));")
 
         elif isinstance(op, TransposeOp) and bufs.space(op.src) != "tcdm":
             rows, cols, lds, _ = bufs.geom(op.src)
@@ -499,14 +540,14 @@ static void {kernel_name}_checks(void) {{   // test outputs (not timed)
 int main(void) {{
     sh_init();
     const int timekeeper = (sh_cluster_id() == 0 && sh_is_first_core());  // the timer is global: one core stamps it
-    {kernel_name}_inputs();
+    sh_call_on_core_stack({kernel_name}_inputs, SH_CORE_STACK_BYTES);   // private per-core stacks: the SDK's are 1 KB apart
     sh_barrier_global();
     if (timekeeper) sh_timer_start();
-    {kernel_name}();
+    sh_call_on_core_stack({kernel_name}, SH_CORE_STACK_BYTES);
     sh_barrier_global();
     if (timekeeper) sh_timer_end();
     sh_barrier_global();
-    {kernel_name}_checks();
+    sh_call_on_core_stack({kernel_name}_checks, SH_CORE_STACK_BYTES);
     sh_barrier_global();
     sh_eoc(0);
     return 0;

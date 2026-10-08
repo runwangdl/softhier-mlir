@@ -6,7 +6,7 @@
 int main(void) {
     sh_init();
     const uint32_t R = ROWS, C = COLS;
-    const uint32_t mb = R * C * 2;
+    const uint32_t mb = R * C * 2 < 8192 ? 8192 : R * C * 2;   /* >= 2 x 4 KB: `be` sits at 2*mb + 4096, before `ln` at 3*mb */
     const uint64_t h0 = sh_hbm_addr(HBM_START);   /* layout mirrored in run.py run_rowops */
     const uint64_t x = h0, b = h0 + mb, g = h0 + 2 * mb, be = h0 + 2 * mb + 4096;
     const uint64_t ln = h0 + 3 * mb, sm = h0 + 4 * mb, ge = h0 + 5 * mb, ad = h0 + 6 * mb,

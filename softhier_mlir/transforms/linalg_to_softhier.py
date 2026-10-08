@@ -51,7 +51,7 @@ class LowerMatmul(RewritePattern):
         y = op.outputs[0]
         fmt = _fmt(y.type.element_type)
         if _space(y.type).startswith("hbm"):
-            gemm = GemmOp(operands=[x, w, y], properties={"fmt": StringAttr(fmt)})
+            gemm = GemmOp(operands=[x, w, y, []], properties={"fmt": StringAttr(fmt)})   # [] = no `step` operand
             rewriter.replace_matched_op([gemm])
         else:
             zero = L1ZeroOp(operands=[y])

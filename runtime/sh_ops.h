@@ -38,6 +38,15 @@ void     sh_preload_wait(uint64_t sentinel);  /* all cores: block until the HBM 
 
 #define SH_ALL 0xFFFFFFFFu   /* `cluster` argument: split the work over all clusters (global barrier at the end) */
 
+/* Run fn() on a private per-core stack of `bytes_per_core` bytes carved from the top of the cluster's 128 KB stack
+ * memory (below the 4 KB the SDK start code uses). flex_start.s spaces the three harts' initial stacks only 1 KB
+ * apart (`sll t0, a0, 0xa`), so a function with a few hundred bytes of spilled locals that calls printf (the generated
+ * kernel: one 64-bit address per HBM buffer + the mark/dump printfs on core 0) overruns the next hart's stack and
+ * clobbers its saved return address (seen as an illegal instruction at a data address on pe1). Call from every core;
+ * SH_CORE_STACK_BYTES x 3 + 4 KB <= ARCH_CLUSTER_STACK_SIZE. */
+#define SH_CORE_STACK_BYTES 40960u
+void sh_call_on_core_stack(void (*fn)(void), uint32_t bytes_per_core);
+
 /* ---- formats ------------------------------------------------------------------------ */
 enum sh_fmt { SH_FP16 = 0, SH_FP8 = 1, SH_INT16 = 2, SH_INT8 = 3 };
 
@@ -104,6 +113,29 @@ uint32_t sh_attention_q_block(uint32_t S, uint32_t dh, uint32_t H, uint32_t P);
  * 0 item start, 1/2 operands staged (+ k transposed on a head change), 3 scores, 4 softmax, 5 P.V, 6 o normalised
  * and stored, 7 entry of the sh_attention call (so phase 6 - phase 7 = the cluster's whole time). */
 uint32_t sh_attention_profile(uint32_t S, uint32_t dh, uint32_t phase);
+
+/* ---- SmolVLA action-expert ops (runtime/sh_expert.inc.c, prefix sh_x_) --------------------------------
+ * Row ops with a leading dimension per operand (strided views, e.g. the gate | up halves of one buffer). */
+void sh_x_silu_mul(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, uint32_t cluster); /* y = silu(a) * b; b == 0: y = silu(a) */
+void sh_x_axpy(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, float alpha, uint32_t cluster); /* y = a + alpha b */
+/* GQA attention of Sq query tokens over a stationary prefix KV (Lp rows of kp / vp, Hkv heads of dh columns) plus,
+ * when ko != 0, So own keys/values attended causally (query i sees own key j iff j <= i). tok: the prefix's uint16
+ * token-class array (sh_llm convention, SH_LLM_PAD = padding key; 0 = no mask). Query head h uses kv head h / (H / Hkv).
+ * Head h runs inside one cluster's TCDM; cluster == SH_ALL deals head h to cluster h % P and ends with a global
+ * barrier. Returns 0, or <0 on a constraint violation. Differs from sh_attention_gqa by the two key sources of
+ * different lengths (Sq queries over Lp + So keys). */
+int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                   uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
+                   uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo,
+                   float scale, uint32_t cluster);
+int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                        uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
+                        uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster);
+uint32_t sh_x_attention_l1_bytes(uint32_t Sq, uint32_t L, uint32_t dh);                        /* L = Lp + So */
+uint32_t sh_x_attention_profile(uint32_t Sq, uint32_t L, uint32_t dh, uint32_t phase);         /* mcycle stamps 0 entry, 1 staged, 2 scores, 3 softmax, 4 P.V, 5 stored */
+/* Print every element of a matrix ("<tag> r c hex"; tag<idx> variant). Calling core. */
+void sh_test_dump_all(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag);
+void sh_test_dump_all_idx(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag, uint32_t idx);
 
 /* ---- TCDM-resident ops (calling cluster only; intra-cluster sync inside) ------------------ */
 uint32_t sh_l1_addr(uint32_t off);                                   /* TCDM byte offset -> address */
