@@ -122,12 +122,12 @@ def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: in
     return ok
 
 
-def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers: int = 1, nsamples: int = 64) -> bool:
+def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers: int = 1, nsamples: int = 64, fused: bool = False) -> bool:
     """Frontend -> softhier-translate -> gvsoc, compared against the same numpy reference as `siglip`."""
     from softhier_mlir.frontend import siglip
     from softhier_mlir.testing import lcg, siglip_ref
     app = HERE / "mlir_app"
-    mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples)
+    mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples, fused_attention=fused)
     (app / "siglip.mlir").write_text(mlir)
     (app / "main.c").write_text(lower_and_translate(app / "siglip.mlir", None))
     build_sw(app)
@@ -135,7 +135,7 @@ def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers:
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"]
-    print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} attention={'fused' if fused else 'per-head'} roi={r['roi_ns']} ns wall={r['wall_s']}s")
     for ln in r["stdout"].splitlines():
         if ln.startswith("[sh_"):
             print("     " + ln)
@@ -265,7 +265,7 @@ if __name__ == "__main__":
     elif a.test == "attention":
         ok = run_attention(a.seq, a.d, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples)
     elif a.test == "siglip-mlir":
-        ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers)
+        ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused)
     else:
         ok = run_mlir(a.files, a.passes)
     sys.exit(0 if ok else 1)

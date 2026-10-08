@@ -37,11 +37,16 @@ class _Emitter:
 
 def emit(seq: int, d: int, ff: int, heads: int, layers: int = 1, cluster: int = -1,
          test: bool = True, dumps: tuple[str, ...] = ("X", "LN1", "Q", "K", "KT", "P0", "V", "O", "H", "G", "OUT"),
-         nsamples: int = 64) -> str:
+         nsamples: int = 64, fused_attention: bool = False) -> str:
+    """`fused_attention=True` emits one `softhier.attention` op (every head inside one cluster's TCDM) instead
+    of the K transpose + per-head gemm / softmax / gemm through HBM; the kT / sc buffers and the KT / P0 dumps
+    then do not exist."""
     dh = d // heads
     e = _Emitter()
     T: dict[str, str] = {}
     cl = f"cluster = {cluster} : i32"
+    if fused_attention:
+        dumps = tuple(t for t in dumps if t not in ("KT", "P0"))
 
     def B(name, rows, cols):
         T[name] = e.buf(name, rows, cols)
@@ -55,6 +60,8 @@ def emit(seq: int, d: int, ff: int, heads: int, layers: int = 1, cluster: int = 
     for nm, r, c in [("x", seq, d), ("ln1", seq, d), ("q", seq, d), ("k", seq, d), ("v", seq, d), ("kT", d, seq),
                      ("sc", heads * seq, seq), ("o", seq, d), ("ao", seq, d), ("h", seq, d), ("ln2", seq, d),
                      ("f1", seq, ff), ("g", seq, ff), ("f2", seq, d), ("out", seq, d)]:
+        if fused_attention and nm in ("kT", "sc"):
+            continue
         B(nm, r, c)
     fill("x", 1, -16, 16, 0.125)
     # parameters per layer (seeds continue the layer-0 numbering: siglip_ref uses the same scheme)
@@ -81,17 +88,21 @@ def emit(seq: int, d: int, ff: int, heads: int, layers: int = 1, cluster: int = 
         for dst, w, bias in (("q", "wq", "bq"), ("k", "wk", "bk"), ("v", "wv", "bv")):
             e.op(f"softhier.gemm %ln1, %{W(w)} into %{dst} {{fmt = \"fp16\", {big}, {cl}}} : {T['ln1']}, {T[W(w)]}, {T[dst]}")
             e.op(f"softhier.add_bias %{dst}, %{W(bias)} -> %{dst} {{{cl}}} : {T[dst]}, {T[W(bias)]} -> {T[dst]}")
-        e.op(f"softhier.transpose %k -> %kT {{{cl}}} : {T['k']} -> {T['kT']}")
-        for hd in range(heads):
-            hc = f"cluster = {hd % 16 if cluster < 0 else cluster} : i32"
-            qh = e.view(f"q{L}_{hd}", "q", T["q"], seq, dh, d, hd * dh)
-            kh = e.view(f"kT{L}_{hd}", "kT", T["kT"], dh, seq, seq, hd * dh * seq)
-            sh = e.view(f"s{L}_{hd}", "sc", T["sc"], seq, seq, seq, hd * seq * seq)
-            vh = e.view(f"v{L}_{hd}", "v", T["v"], seq, dh, d, hd * dh)
-            oh = e.view(f"o{L}_{hd}", "o", T["o"], seq, dh, d, hd * dh)
-            e.op(f"softhier.gemm %q{L}_{hd}, %kT{L}_{hd} into %s{L}_{hd} {{fmt = \"fp16\", {qk}, {hc}}} : {qh}, {kh}, {sh}")
-            e.op(f"softhier.softmax %s{L}_{hd} -> %s{L}_{hd} {{scale = {1 / dh ** 0.5!r} : f32, {hc}}} : {sh} -> {sh}")
-            e.op(f"softhier.gemm %s{L}_{hd}, %v{L}_{hd} into %o{L}_{hd} {{fmt = \"fp16\", {pv}, {hc}}} : {sh}, {vh}, {oh}")
+        if fused_attention:
+            e.op(f"softhier.attention %q, %k, %v -> %o {{scale = {1 / dh ** 0.5!r} : f32, heads = {heads} : i32, {cl}}} "
+                 f": {T['q']}, {T['k']}, {T['v']} -> {T['o']}")
+        else:
+            e.op(f"softhier.transpose %k -> %kT {{{cl}}} : {T['k']} -> {T['kT']}")
+            for hd in range(heads):
+                hc = f"cluster = {hd % 16 if cluster < 0 else cluster} : i32"
+                qh = e.view(f"q{L}_{hd}", "q", T["q"], seq, dh, d, hd * dh)
+                kh = e.view(f"kT{L}_{hd}", "kT", T["kT"], dh, seq, seq, hd * dh * seq)
+                sh = e.view(f"s{L}_{hd}", "sc", T["sc"], seq, seq, seq, hd * seq * seq)
+                vh = e.view(f"v{L}_{hd}", "v", T["v"], seq, dh, d, hd * dh)
+                oh = e.view(f"o{L}_{hd}", "o", T["o"], seq, dh, d, hd * dh)
+                e.op(f"softhier.gemm %q{L}_{hd}, %kT{L}_{hd} into %s{L}_{hd} {{fmt = \"fp16\", {qk}, {hc}}} : {qh}, {kh}, {sh}")
+                e.op(f"softhier.softmax %s{L}_{hd} -> %s{L}_{hd} {{scale = {1 / dh ** 0.5!r} : f32, {hc}}} : {sh} -> {sh}")
+                e.op(f"softhier.gemm %s{L}_{hd}, %v{L}_{hd} into %o{L}_{hd} {{fmt = \"fp16\", {pv}, {hc}}} : {sh}, {vh}, {oh}")
         e.op("softhier.group_barrier {grid_x = 4 : i32, grid_y = 4 : i32}")
         e.op(f"softhier.gemm %o, %{W('wo')} into %ao {{fmt = \"fp16\", {big}, {cl}}} : {T['o']}, {T[W('wo')]}, {T['ao']}")
         e.op(f"softhier.add_bias %ao, %{W('bo')} -> %ao {{{cl}}} : {T['ao']}, {T[W('bo')]} -> {T['ao']}")
@@ -127,8 +138,9 @@ def main() -> None:
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--cluster", type=int, default=-1, help="-1 = all clusters")
     ap.add_argument("--no-test", action="store_true", help="no LCG fills / sample dumps")
+    ap.add_argument("--fused", action="store_true", help="fused softhier.attention instead of per-head gemm/softmax/gemm")
     a = ap.parse_args()
-    sys.stdout.write(emit(a.seq, a.d, a.ff, a.heads, a.layers, a.cluster, not a.no_test))
+    sys.stdout.write(emit(a.seq, a.d, a.ff, a.heads, a.layers, a.cluster, not a.no_test, fused_attention=a.fused))
 
 
 if __name__ == "__main__":
