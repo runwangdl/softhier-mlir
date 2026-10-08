@@ -149,6 +149,51 @@ def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers:
     return ok
 
 
+def attention_reference(S: int, D: int, H: int, scale: float = 0.125) -> np.ndarray:
+    """numpy twin of tests/gvsoc/attention/main.c (fp32 math, fp16 rounding where the device stores fp16)."""
+    from softhier_mlir.testing import lcg
+    f = lambda *a, **k: lcg.fill_fp16(*a, **k).astype(np.float32)  # noqa: E731
+    r16 = lambda a: a.astype(np.float16).astype(np.float32)  # noqa: E731
+    q = f(S, D, 21, -8, 8, 0.125); k = f(S, D, 22, -8, 8, 0.125); v = f(S, D, 23, -16, 16, 0.125)
+    dh = D // H
+    o = np.zeros((S, D), np.float32)
+    for hd in range(H):
+        sl = slice(hd * dh, (hd + 1) * dh)
+        s = r16(q[:, sl] @ k[:, sl].T) * scale
+        p = np.exp(s - s.max(1, keepdims=True)); p = r16(p / p.sum(1, keepdims=True))
+        o[:, sl] = r16(p @ v[:, sl])
+    return o
+
+
+def run_attention(seq: int, d: int, heads: int, cluster: str, composed: bool, nsamples: int = 128) -> bool:
+    """Fused sh_attention (or the composed transpose+gemm+softmax+gemm path) vs numpy; prints the ROI."""
+    from softhier_mlir.testing import lcg
+    app = HERE / "attention"
+    (app / "shape.h").write_text(f"#define SEQ {seq}\n#define D_MODEL {d}\n#define N_HEADS {heads}\n"
+                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n#define COMPOSED {1 if composed else 0}\n")
+    build_sw(app)
+    r = run_sim(timeout=7200)
+    ref = attention_reference(seq, d, heads)
+    got = lcg.parse_samples(r["stdout"])
+    ok = r["ok"] and "ATTENTION_DONE" in r["stdout"] and "ATTENTION_FAIL" not in r["stdout"]
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[sh_") or ln.startswith("[attention]"):
+            print("     " + ln)
+    dh = d // heads
+    print(f"{'PASS' if ok else 'FAIL'} attention S={seq} D={d} H={heads} dh={dh} cluster={cluster} path={'composed' if composed else 'fused'} "
+          f"roi={r['roi_ns']} ns (1 GHz: {r['roi_ns']} cycles) wall={r['wall_s']}s")
+    for tag, arr in (("O0", ref[:, :dh]), ("O", ref)):
+        if tag not in got:
+            print(f"     {tag:<4} MISSING"); ok = False; continue
+        bad, maxerr = lcg.compare_samples(got[tag], arr, atol=0.05, rtol=0.05, show=3)
+        print(f"     {tag:<4} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
+        ok &= bad == 0
+    (app / "last_run.log").write_text(r["stdout"])
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
+
+
 # passes each example needs (none = already in the softhier dialect)
 EXAMPLE_PASSES = {
     "gemm512_linalg.mlir": "linalg-to-softhier",
@@ -194,7 +239,7 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip", "siglip-mlir"])
+    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip", "siglip-mlir", "attention"])
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--d", type=int, default=768)
@@ -208,6 +253,8 @@ if __name__ == "__main__":
     ap.add_argument("--shapes", nargs="*")
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
+    ap.add_argument("--composed", action="store_true", help="attention: the per-head library-call path instead of the fused kernel")
+    ap.add_argument("--fused", action="store_true", help="siglip-mlir: use the fused softhier.attention op")
     a = ap.parse_args()
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
@@ -215,6 +262,8 @@ if __name__ == "__main__":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0")
     elif a.test == "siglip":
         ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0")
+    elif a.test == "attention":
+        ok = run_attention(a.seq, a.d, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples)
     elif a.test == "siglip-mlir":
         ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers)
     else:
