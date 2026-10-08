@@ -509,6 +509,36 @@ def translate_preload(app: Path) -> Path | None:
     return app / "preload.elf" if DATA == "preload" else None
 
 
+def run_mesh(modes: list[str], heads: int = 12) -> bool:
+    """tests/gvsoc/mesh_slices: `heads` clusters each write one 64-column slice of a 256x768 output.
+    MODE 0 gemm, 1 dma stores, 2 scalar stores, 3 gemm serialized, 4 gemm private buffers,
+    5 scores+softmax+P.V (the attention sequence), 6/7 as 5 + a follow-up 16-cluster GEMM reading it."""
+    app = HERE / "mesh_slices"
+    all_ok = True
+    for m in modes:
+        mode, _, defs = m.partition(":")
+        (app / "shape.h").write_text(f"#define MODE {mode}\n#define NH {heads}\n" + "".join(f"#define {d}\n" for d in defs.split(",") if d))
+        build_sw(app)
+        r = run_sim()
+        ok = r["ok"] and "MESH_PASS" in r["stdout"]
+        all_ok &= ok
+        print(f"{'PASS' if ok else 'FAIL'} mesh_slices mode={m} heads={heads} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+        for ln in r["stdout"].splitlines():
+            if ln.startswith("[") and "FAIL" in ln and "mesh_slices" not in ln:
+                print("     " + ln)
+        if not r["ok"]:
+            print(r["stdout"][-1500:])
+    return all_ok
+
+
+# passes each example needs (none = already in the softhier dialect)
+EXAMPLE_PASSES = {
+    "gemm512_linalg.mlir": "linalg-to-softhier",
+    "mlp_linalg.mlir": "linalg-to-softhier",
+    "gemm1024_summa.mlir": "linalg-to-softhier,distribute-summa,pipeline-gemm",
+}
+
+
 # passes each example needs (none = already in the softhier dialect)
 EXAMPLE_PASSES = {
     "gemm512_linalg.mlir": "linalg-to-softhier",
