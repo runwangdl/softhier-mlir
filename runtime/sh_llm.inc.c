@@ -247,6 +247,9 @@ void sh_softmax_masked(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uin
     sh_llm_rowop(&a, sh_k_softmax_masked, &arg, cluster);
 }
 
+/* The masked head keeps the whole head resident (no q blocking yet); limits and stamps are its own. */
+#define SH_LLM_ATTN_MAX_S 256u
+#define SH_LLM_STAMP(i) do { if (first) ((volatile uint32_t *)local(l.prof))[i] = sh_mcycle(); } while (0)
 /* ---- one attention head with a token mask: o[S,dh] = softmax(scale q k^T + mask) v, all in TCDM --------
  * Same staging / RedMulE / deferred-normalisation structure as sh_attention_head (sh_attention.inc.c; the
  * layout helpers are reused), softmax rows in fp16 SIMD (sh_llm_softmax_row) instead of scalar fp32. The
@@ -257,14 +260,15 @@ int sh_attention_head_masked(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uin
     if (cluster != SH_ALL && flex_get_cluster_id() != cluster) return 0;
     const int first = flex_is_first_core(), dm = flex_is_dm_core();
     const uint32_t core = flex_get_core_id(), NC = ARCH_NUM_CORE_PER_CLUSTER;
-    const sh_attn_l1 l = sh_attn_layout(S, dh, 0);
+    const sh_attn_l1 l = sh_attn_layout(S, dh, S, SH_ATTN_L1_BASE);   /* whole head resident (sq = S) */
+    if (first) *(volatile uint32_t *)local(SH_ATTN_L1_BASE - 4) = l.prof;   /* sh_attention_profile() reads the stamps from here */
     const uint32_t ltok = (l.end + 63) & ~63u, lcls = ltok + ((S * 2 + 63) & ~63u), clsb = (sh_llm_cls_bytes(S) + 63) & ~63u, lend = lcls + NC * clsb;
-    if (S > SH_ATTN_MAX_S || (S & 3) || (dh & 3) || scale <= 0.f || lend > ARCH_CLUSTER_TCDM_SIZE) {
+    if (S > SH_LLM_ATTN_MAX_S || (S & 3) || (dh & 3) || scale <= 0.f || lend > ARCH_CLUSTER_TCDM_SIZE) {
         if (first) sh_printf("[sh_attention_head_masked] S=%u dh=%u: need S <= %u, S %% 4 == 0, dh %% 4 == 0, scale > 0, L1 %u <= %u\n",
-                             S, dh, SH_ATTN_MAX_S, lend, (uint32_t)ARCH_CLUSTER_TCDM_SIZE);
+                             S, dh, SH_LLM_ATTN_MAX_S, lend, (uint32_t)ARCH_CLUSTER_TCDM_SIZE);
         return -1;
     }
-    SH_ATTN_STAMP(0);
+    SH_LLM_STAMP(0);
     if (dm) {
         sh_load_block_async(l.q, q, S, dh, ldq);
         sh_load_block_async(l.k, k, S, dh, ldk);
@@ -277,10 +281,10 @@ int sh_attention_head_masked(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uin
     }
     { volatile uint32_t *h = (volatile uint32_t *)local(lcls + core * clsb); for (uint32_t i = 0; i < 16; ++i) h[i] = 0xFFFFFFFFu; }
     flex_intra_cluster_sync();
-    SH_ATTN_STAMP(1); SH_ATTN_STAMP(2);
+    SH_LLM_STAMP(1); SH_LLM_STAMP(2);
     if (first) { flex_redmule_config(S, dh, S); flex_redmule_trigger(l.q, l.kt, l.s, REDMULE_FP_16); flex_redmule_wait(); }
     flex_intra_cluster_sync();
-    SH_ATTN_STAMP(3);
+    SH_LLM_STAMP(3);
     {
         const sh_sm_consts c = sh_sm_init(scale);
         const uint16_t *tk = (const uint16_t *)local(ltok); uint8_t *scr = (uint8_t *)local(lcls + core * clsb);
@@ -296,10 +300,10 @@ int sh_attention_head_masked(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uin
     }
     sh_fp_fence();
     flex_intra_cluster_sync();
-    SH_ATTN_STAMP(4);
+    SH_LLM_STAMP(4);
     if (first) { flex_redmule_config(S, S, dh); flex_redmule_trigger(l.s, l.v, l.o, REDMULE_FP_16); flex_redmule_wait(); }
     flex_intra_cluster_sync();
-    SH_ATTN_STAMP(5);
+    SH_LLM_STAMP(5);
     {
         const float *sum = (const float *)local(l.sum); const uint32_t dv = dh >> 2;
         for (uint32_t r = core; r < S; r += NC) {
@@ -311,7 +315,7 @@ int sh_attention_head_masked(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uin
     flex_intra_cluster_sync();
     if (dm) sh_store_block_sync(o, l.o, S, dh, ldo);
     flex_intra_cluster_sync();
-    SH_ATTN_STAMP(6);
+    SH_LLM_STAMP(6);
     return 0;
 }
 
