@@ -362,8 +362,8 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
 
         elif isinstance(op, RopeOp):
             rows, cols, ldx, _ = bufs.geom(op.x)
-            ldy, ldt = bufs.geom(op.y)[2], bufs.geom(op.tab)[2]
-            b(f"{ind}sh_x_rope({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.tab)}, {rows}, {cols}, {ldy}, {ldx}, {ldt}, {op.dh.value.data}, {_cluster(op)});")
+            ldy, ldt = bufs.geom(op.y)[2], bufs.geom(op.cos_sin)[2]
+            b(f"{ind}sh_x_rope({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.cos_sin)}, {rows}, {cols}, {ldy}, {ldx}, {ldt}, {op.head_dim.value.data}, {_cluster(op)});")
 
         elif isinstance(op, CrossAttentionOp):
             Sq, _, ldq, _ = bufs.geom(op.q)

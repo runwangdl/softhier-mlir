@@ -437,17 +437,17 @@ class AxpyOp(IRDLOperation):
 
 @irdl_op_definition
 class RopeOp(IRDLOperation):
-    """Rotary embedding in lerobot's ``apply_rope`` convention: every head of ``dh`` columns is rotated
-    half-split, ``y[i] = x1 cos - x2 sin``, ``y[i + dh/2] = x2 cos + x1 sin``, with the per-row table
-    ``tab`` (rows x cols, same column layout as ``x``: per head ``[cos(dh/2) | sin(dh/2)]`` of the row's
-    position) built on the host."""
+    """Rotary position embedding, HF Llama rotate-half convention (== lerobot's ``apply_rope``), on every head
+    of ``head_dim`` columns of each row: ``y1 = x1 cos - x2 sin, y2 = x2 cos + x1 sin`` with ``cos_sin`` a
+    ``rows x head_dim`` table (cos[head_dim/2] then sin[head_dim/2] per row, precomputed by the host for the
+    row's position id). Same op as agent/vlm-prefix (lowered to sh_x_rope here)."""
     name = "softhier.rope"
     irdl_options = (ParsePropInAttrDict(),)
     x = operand_def(MemRefType)
-    tab = operand_def(MemRefType)
+    cos_sin = operand_def(MemRefType)
     y = operand_def(MemRefType)
-    dh = prop_def(IntegerAttr)
-    assembly_format = "$x `,` $tab `->` $y attr-dict `:` type($x) `,` type($tab) `->` type($y)"
+    head_dim = prop_def(IntegerAttr)
+    assembly_format = "$x `,` $cos_sin `->` $y attr-dict `:` type($x) `,` type($cos_sin) `->` type($y)"
 
 
 @irdl_op_definition

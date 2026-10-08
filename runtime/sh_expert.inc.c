@@ -98,9 +98,11 @@ void sh_x_axpy(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols,
     sh_rowop(y, a, b, 0, 0, rows, cols, ldy, lda, ldb, sh_xk_axpy, &alpha, cluster);
 }
 
-/* ---- rope: half-split rotation per head (lerobot apply_rope) with a per-row table ------------------
- * tab row r = per head [cos(r, 0..dh/2) | sin(r, 0..dh/2)] (host-built for the positions of the rows):
- *   y[i] = x1 cos - x2 sin,  y[i + dh/2] = x2 cos + x1 sin.   dh % 8 == 0 for the SIMD path. */
+/* ---- rope: half-split rotation per head (lerobot apply_rope == HF rotate-half) with a per-row table ----
+ * tab row r = [cos(r, 0..dh/2) | sin(r, 0..dh/2)] (dh entries, host-built for the row's position; leading dim
+ * ldtab >= dh), the same for every head of the row:  y[i] = x1 cos - x2 sin,  y[i + dh/2] = x2 cos + x1 sin.
+ * The row driver stages cols elements per table row, so the staged row starts with the dh table entries and the
+ * rest is don't-care (an over-read of the table in HBM). dh % 8 == 0 for the SIMD path. */
 static void sh_xk_rope_s(const sh_blk *k) {
     const uint32_t dh = *(const uint32_t *)k->arg, hh = dh >> 1, cols = k->cols;
     uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
@@ -108,7 +110,7 @@ static void sh_xk_rope_s(const sh_blk *k) {
         const uint16_t *xr = k->x + r * cols, *tr = k->b + r * cols; uint16_t *yr = k->y + r * cols;
         for (uint32_t h0 = 0; h0 < cols; h0 += dh)
             for (uint32_t i = 0; i < hh; ++i) {
-                const float c = sh_h2f(tr[h0 + i]), s = sh_h2f(tr[h0 + hh + i]), x1 = sh_h2f(xr[h0 + i]), x2 = sh_h2f(xr[h0 + hh + i]);
+                const float c = sh_h2f(tr[i]), s = sh_h2f(tr[hh + i]), x1 = sh_h2f(xr[h0 + i]), x2 = sh_h2f(xr[h0 + hh + i]);
                 yr[h0 + i] = (uint16_t)sh_f2h(x1 * c - x2 * s); yr[h0 + hh + i] = (uint16_t)sh_f2h(x2 * c + x1 * s);
             }
     }
@@ -122,7 +124,7 @@ static void sh_xk_rope(const sh_blk *k) {
         const sh_v4h *x = SH_V4CP(k->x + r * cols), *t = SH_V4CP(k->b + r * cols); sh_v4h *y = SH_V4P(k->y + r * cols);
         for (uint32_t h0 = 0; h0 < cv; h0 += dv)
             for (uint32_t i = 0; i < hv; ++i) {
-                const sh_v4h c = t[h0 + i], s = t[h0 + hv + i], x1 = x[h0 + i], x2 = x[h0 + hv + i];
+                const sh_v4h c = t[i], s = t[hv + i], x1 = x[h0 + i], x2 = x[h0 + hv + i];
                 y[h0 + i] = sh_v4_sub(sh_v4_mul(x1, c), sh_v4_mul(x2, s));
                 y[h0 + hv + i] = sh_v4_mac(sh_v4_mul(x2, c), x1, s);
             }

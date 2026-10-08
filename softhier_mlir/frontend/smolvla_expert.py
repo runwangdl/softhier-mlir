@@ -49,13 +49,13 @@ GROUP = H // HKV
 
 
 # ----------------------------------------------------------------------------- host-side tables
-def rope_table(positions: np.ndarray, cols: int, dh: int = DH) -> np.ndarray:
-    """[len(positions), cols] fp16: per head [cos(dh/2) | sin(dh/2)] of lerobot's apply_rope (timescale base^(2i/dh))."""
+def rope_table(positions: np.ndarray, dh: int = DH) -> np.ndarray:
+    """[len(positions), dh] fp16: [cos(dh/2) | sin(dh/2)] of lerobot's apply_rope (timescale base^(2i/dh)) per row,
+    the table every head of the row is rotated with (softhier.rope's cos_sin operand)."""
     half = dh // 2
     timescale = ROPE_BASE ** ((2.0 / dh) * np.arange(half, dtype=np.float64))
     rad = positions.astype(np.float64)[:, None] / timescale[None, :]
-    head = np.concatenate([np.cos(rad), np.sin(rad)], axis=1)                 # [n, dh]
-    return np.ascontiguousarray(np.tile(head, (1, cols // dh)).astype(np.float16))
+    return np.ascontiguousarray(np.concatenate([np.cos(rad), np.sin(rad)], axis=1).astype(np.float16))
 
 
 def time_embedding(t: float, dim: int = D) -> np.ndarray:
@@ -124,8 +124,8 @@ def prepare(ckpt: str | Path, ref: str | Path, out: str | Path) -> Path:
     p = to_library_layout(load_expert(ckpt), te)
     n_valid = int(r["n_valid"])
     p["valid"] = r["prefix_valid"].reshape(1, LP).astype(np.float16)
-    p["rq_self"] = rope_table(n_valid + np.arange(S), DQ)       # self layers: positions prefix_offset + i (q; k uses the first 320 columns)
-    p["rq_cross"] = rope_table(np.arange(S), DQ)                # cross layers: positions i
+    p["rq_self"] = rope_table(n_valid + np.arange(S))           # self layers: positions prefix_offset + i (q and own k)
+    p["rq_cross"] = rope_table(np.arange(S))                    # cross layers: positions i
     for L in range(LAYERS):
         p[f"kp{L}"], p[f"vp{L}"] = r[f"kv_k_{L}"].astype(np.float16), r[f"kv_v_{L}"].astype(np.float16)
     p["x0"] = r["noise"].astype(np.float16)
@@ -150,8 +150,8 @@ def np_rmsnorm(x, g):
 def np_rope(x, tab, dh=DH):
     x, tab = x.astype(np.float32), tab.astype(np.float32)
     y = np.empty_like(x); hh = dh // 2
+    c, s = tab[:, :hh], tab[:, hh:dh]
     for h0 in range(0, x.shape[1], dh):
-        c, s = tab[:, h0:h0 + hh], tab[:, h0 + hh:h0 + dh]
         x1, x2 = x[:, h0:h0 + hh], x[:, h0 + hh:h0 + dh]
         y[:, h0:h0 + hh] = x1 * c - x2 * s
         y[:, h0 + hh:h0 + dh] = x2 * c + x1 * s
@@ -219,7 +219,7 @@ def np_flow(P, steps=STEPS, layers=LAYERS, record=False):
             inter["EMB"] = h
         for L in range(layers):
             if L % 2 == 0:
-                h, it = np_layer(h, P, L, P[f"kp{L}"], P[f"vp{L}"], valid, rq_s, rq_s[:, :DKV])
+                h, it = np_layer(h, P, L, P[f"kp{L}"], P[f"vp{L}"], valid, rq_s, rq_s)
             else:
                 h, it = np_layer(h, P, L, None, None, valid, rq_c, None, *kx[L])
             if s == 0 and record:
@@ -313,8 +313,8 @@ def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_step
     if kind == "self":
         P.gemm("xn", names["wqkv"], "qkv", *tiles["qkv"], step=step, fmt_steps=fmt_steps)
         m("qkv")
-        op(f"softhier.rope %q, %rq_self -> %q {{dh = {DH} : i32, {cl}}} : {T['q']}, {T['rq_self']} -> {T['q']}")
-        op(f"softhier.rope %k, %rk_self -> %k {{dh = {DH} : i32, {cl}}} : {T['k']}, {T['rk_self']} -> {T['k']}")
+        op(f"softhier.rope %q, %rq_self -> %q {{head_dim = {DH} : i32, {cl}}} : {T['q']}, {T['rq_self']} -> {T['q']}")
+        op(f"softhier.rope %k, %rq_self -> %k {{head_dim = {DH} : i32, {cl}}} : {T['k']}, {T['rq_self']} -> {T['k']}")
         m("rope")
         op(f"softhier.cross_attention %q, %{names['kp']}, %{names['vp']} own %k, %v valid %valid -> %o "
            f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T['q']}, {T[names['kp']]}, {T[names['vp']]} "
@@ -322,7 +322,7 @@ def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_step
     else:
         P.gemm("xn", names["wq"], "q", *tiles["qkv"], step=step, fmt_steps=fmt_steps)
         m("qkv")
-        op(f"softhier.rope %q, %rq_cross -> %q {{dh = {DH} : i32, {cl}}} : {T['q']}, {T['rq_cross']} -> {T['q']}")
+        op(f"softhier.rope %q, %rq_cross -> %q {{head_dim = {DH} : i32, {cl}}} : {T['q']}, {T['rq_cross']} -> {T['q']}")
         m("rope")
         op(f"softhier.cross_attention %q, %{names['kx']}, %{names['vx']} valid %valid -> %o "
            f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T['q']}, {T[names['kx']]}, {T[names['vx']]} "
@@ -383,9 +383,8 @@ def emit_layer_test(seed: int = 1, cluster: int = -1, nsamples: int = 128, tiles
     F("valid", 1, LP, s0 + 22, 0, 1, 1.0)
     P.B("kx1", LP, DKV); P.B("vx1", LP, DKV)
     n_valid = 200
-    data["rq_self"], data["rq_cross"] = rope_table(n_valid + np.arange(S), DQ), rope_table(np.arange(S), DQ)
-    P.B("rq_self", S, DQ, data["rq_self"]); P.B("rq_cross", S, DQ, data["rq_cross"])
-    P.view("rk_self", "rq_self", S, DKV, DQ, 0)
+    data["rq_self"], data["rq_cross"] = rope_table(n_valid + np.arange(S)), rope_table(np.arange(S))
+    P.B("rq_self", S, DH, data["rq_self"]); P.B("rq_cross", S, DH, data["rq_cross"])
     sent = sentinel_array(); P.B("sentinel", *sent.shape, sent)
     op(f"softhier.preload_wait %sentinel : {T['sentinel']}")
     # program: KV projection of the cross layer (once per chunk), self layer, cross layer
@@ -403,7 +402,7 @@ def emit_layer_test(seed: int = 1, cluster: int = -1, nsamples: int = 128, tiles
     P.dump("h", 304, "H1"); P.dump("o", 305, "O1"); P.dump("kx1", 306, "KX1"); P.dump("m", 307, "M1")
     # host reference on the numpy twin
     h = _r16(2 * data["hin"].astype(np.float32))
-    h, it0 = np_layer(h, data, 0, data["kp0"], data["vp0"], data["valid"], data["rq_self"], data["rq_self"][:, :DKV])
+    h, it0 = np_layer(h, data, 0, data["kp0"], data["vp0"], data["valid"], data["rq_self"], data["rq_self"])
     ref = {"H0": it0["H"], "O0": it0["O"]}
     kx1, vx1 = np_kv_proj(data, 1, data["kp1"], data["vp1"])
     h, it1 = np_layer(h, data, 1, None, None, data["valid"], data["rq_cross"], None, kx1, vx1)
@@ -411,7 +410,7 @@ def emit_layer_test(seed: int = 1, cluster: int = -1, nsamples: int = 128, tiles
     # QKV0 after RoPE (q, k rotated in place, v untouched)
     xn0 = np_rmsnorm(_r16(2 * data["hin"].astype(np.float32)), data["g10"].astype(np.float32))
     qkv = _r16(xn0 @ data["wqkv0"].astype(np.float32))
-    ref["QKV0"] = np.concatenate([np_rope(qkv[:, :DQ], data["rq_self"]), np_rope(qkv[:, DQ:DQ + DKV], data["rq_self"][:, :DKV]), qkv[:, DQ + DKV:]], axis=1)
+    ref["QKV0"] = np.concatenate([np_rope(qkv[:, :DQ], data["rq_self"]), np_rope(qkv[:, DQ:DQ + DKV], data["rq_self"]), qkv[:, DQ + DKV:]], axis=1)
     return P.module("expert_layer_test"), P.pre, ref
 
 
@@ -448,7 +447,7 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
         C = cols   # default 960 columns: a multiple of the head size for the RoPE test
         F("x", S, C, s0 + 1, -16, 16, 0.125); F("b", S, C, s0 + 2, -16, 16, 0.125); F("g", 1, C, s0 + 3, 2, 6, 0.25)
         if which == "rope":
-            d["tab"] = rope_table(np.arange(S) + 7, C); P.B("tab", S, C, d["tab"])
+            d["tab"] = rope_table(np.arange(S) + 7); P.B("tab", S, DH, d["tab"])
         P.B("y", S, C)
         sent = sentinel_array(); P.B("sentinel", *sent.shape, sent)
         op(f"softhier.preload_wait %sentinel : {T['sentinel']}")
@@ -458,7 +457,7 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
             op(f"softhier.rmsnorm %x, %g -> %y {{eps = {RMS_EPS:.1e} : f32, {P.cl}}} : {T['x']}, {T['g']} -> {T['y']}")
             ref["Y"] = np_rmsnorm(x, g)
         elif which == "rope":
-            op(f"softhier.rope %x, %tab -> %y {{dh = {DH} : i32, {P.cl}}} : {T['x']}, {T['tab']} -> {T['y']}")
+            op(f"softhier.rope %x, %tab -> %y {{head_dim = {DH} : i32, {P.cl}}} : {T['x']}, {T['tab']} -> {T['y']}")
             ref["Y"] = np_rope(x, d["tab"], DH)
         elif which == "silu":
             op(f"softhier.silu_mul %x, %b -> %y {{{P.cl}}} : {T['x']}, {T['b']} -> {T['y']}")
@@ -496,7 +495,6 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     _activations(P)
     for nm in ("x0", "wa", "ba", "wti", "tb", "wto", "bto", "gf", "wout", "bout", "valid", "rq_self", "rq_cross"):
         P.B(nm, *W[nm].shape, W[nm])
-    P.view("rk_self", "rq_self", S, DKV, DQ, 0)
     P.B("zero", S, AD, np.zeros((S, AD), np.float16))
     # parameter slabs: one per (self, cross) pair at a constant stride; the cross layer's projected KV lives in the slab too
     SELF = [("wqkv", D, DQ + 2 * DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D), ("kp", LP, DKV), ("vp", LP, DKV)]

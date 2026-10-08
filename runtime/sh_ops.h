@@ -110,8 +110,8 @@ uint32_t sh_attention_profile(uint32_t S, uint32_t dh, uint32_t phase);
 void sh_x_rmsnorm(uint64_t y, uint64_t x, uint64_t gamma, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t ldx, float eps, uint32_t cluster); /* y = x rsqrt(mean x^2 + eps) gamma */
 void sh_x_silu_mul(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, uint32_t cluster); /* y = silu(a) * b; b == 0: y = silu(a) */
 void sh_x_axpy(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, float alpha, uint32_t cluster); /* y = a + alpha b */
-/* RoPE, lerobot apply_rope convention (half-split rotation per head of dh): tab[rows, cols] (leading dim ldtab) holds per
- * row and per head [cos(dh/2) | sin(dh/2)] for that row's position (host-built table). */
+/* RoPE, lerobot apply_rope == HF rotate-half convention (half-split rotation per head of dh): tab[rows, dh] (leading
+ * dim ldtab) holds per row [cos(dh/2) | sin(dh/2)] for that row's position (host-built table, same for every head). */
 void sh_x_rope(uint64_t y, uint64_t x, uint64_t tab, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t ldx, uint32_t ldtab, uint32_t dh, uint32_t cluster);
 /* GQA attention of Sq query tokens over a stationary prefix KV (Lp rows of kp / vp, Hkv heads of dh columns) plus,
  * when ko != 0, So own keys/values attended causally (query i sees own key j iff j <= i). valid: fp16 row of Lp 1.0/0.0
