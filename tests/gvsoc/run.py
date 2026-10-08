@@ -232,7 +232,7 @@ if __name__ == "__main__":
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
     elif a.test == "rowops":
-        ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0")
+        ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
     elif a.test == "fp16cvt":
         ok = run_fp16cvt()
     elif a.test == "siglip":

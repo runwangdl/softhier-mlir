@@ -5,7 +5,8 @@
  *    headers define non-static functions, so they may be included by exactly one
  *    translation unit: that unit is sh_ops.c (a unity build of sh_*.inc.c).
  *  - Every operator is called by ALL cores of a cluster (SPMD); the operator dispatches
- *    the DM core (iDMA), the first core (RedMulE / scalar math) and syncs internally.
+ *    the DM core (iDMA), the first core (RedMulE) and syncs internally. The row-wise ops
+ *    split every staged block over all three cores (fp16 SIMD, see docs/SIMULATOR_NOTES.md).
  *  - Tensors are fp16 row-major in HBM, addressed by 64-bit byte addresses.
  *  - Operators take an explicit tiling/config struct so the compiler (decide) and the
  *    library (apply) stay separate; 0 means "library default".
@@ -64,7 +65,9 @@ int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uin
 uint32_t sh_gemm_l1_bytes(uint32_t M, uint32_t N, uint32_t K, const sh_gemm_cfg *cfg);
 
 /* ---- row-wise / elementwise ops on fp16 HBM tensors (rows x cols, leading dim ld) -------------
- * `cluster`: executing cluster id, or SH_ALL to split row blocks over all clusters. */
+ * `cluster`: executing cluster id, or SH_ALL to split row blocks over all clusters.
+ * cols % 4 == 0 takes the fp16 SIMD path (4 lanes); other widths fall back to scalar fp32.
+ * Parameter rows (gamma, beta, bias) are limited to 4096 columns. */
 void sh_layernorm(uint64_t y, uint64_t x, uint64_t gamma, uint64_t beta, uint32_t rows, uint32_t cols, uint32_t ld, float eps, uint32_t cluster);
 void sh_softmax_rows(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, float scale, uint32_t cluster); /* softmax(scale*x) per row */
 void sh_gelu(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t cluster);                    /* tanh approximation */

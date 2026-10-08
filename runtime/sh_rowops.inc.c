@@ -33,8 +33,6 @@ static inline void sh_share(uint32_t n, uint32_t q, uint32_t *lo, uint32_t *hi) 
     if (c >= nc) { *lo = *hi = n; return; }
     *lo = (nq * c / nc) * q; *hi = (nq * (c + 1) / nc) * q; if (*hi > n) *hi = n; if (*lo > n) *lo = n;
 }
-static inline float sh_fmaxf(float a, float b) { float r; __asm__ ("fmax.s %0, %1, %2" : "=f"(r) : "f"(a), "f"(b)); return r; }
-static inline float sh_fminf(float a, float b) { float r; __asm__ ("fmin.s %0, %1, %2" : "=f"(r) : "f"(a), "f"(b)); return r; }
 /* 2^t for t already clamped to [-126, 126]: 2^k * p(f), k = round(t), f = t - k in [-0.5, 0.5],
  * degree-4 p (rel err < 6e-6), 9 FPU ops. The rounding is done in pure FP (t + 1.5*2^23 - 1.5*2^23)
  * and 2^k is built from the bits of that sum: the obvious fcvt.w.s -> fcvt.s.w pair returns a stale
@@ -70,7 +68,8 @@ static inline float sh_gelu1(float x) {
 
 /* One staged block as seen by a kernel. p0/p1: the two broadcast parameter rows as fp32 (cols each). */
 typedef struct {
-    uint16_t *y; const uint16_t *x; const uint16_t *b; const float *p0; const float *p1;
+    uint16_t *y; const uint16_t *x; const uint16_t *b; const float *p0; const float *p1;   /* p0/p1: fp32 copies */
+    const uint16_t *ph0, *ph1;                                                              /* the same rows as fp16 */
     uint32_t nr, cols; const void *arg;
 } sh_blk;
 typedef void (*sh_rowfn_t)(const sh_blk *k);
@@ -122,8 +121,10 @@ static void sh_rowop(uint64_t y, uint64_t x, uint64_t b, uint64_t p0, uint64_t p
         ++next; while (next < nblk && !sh_my_block(next, cluster)) ++next;
         if (dm && next < nblk) SH_LOAD_BLK(next, set ^ 1);  /* stream the following block in during compute */
         sh_blk k = { (uint16_t *)local(SH_SET_Y(set)), (const uint16_t *)local(SH_SET_X(set)),
-                     b ? (const uint16_t *)local(SH_SET_B(set)) : 0, (const float *)local(pf0), (const float *)local(pf1), nr, cols, arg };
+                     b ? (const uint16_t *)local(SH_SET_B(set)) : 0, (const float *)local(pf0), (const float *)local(pf1),
+                     (const uint16_t *)local(ph0), (const uint16_t *)local(ph1), nr, cols, arg };
         fn(&k);
+        sh_fp_fence();                                       /* this core's fsd results are in TCDM before the DMA reads them */
         flex_intra_cluster_sync();
         if (dm) {                                            /* next block landed (and older stores drained); stream this one out */
             bare_dma_wait_all();
@@ -157,7 +158,7 @@ static inline float sh_row_sqdev(const uint16_t *xr, uint32_t cols, float mean) 
     for (; i < cols; ++i) { float d = sh_h2f(xr[i]) - mean; s0 += d * d; }
     return ((s0 + s1) + (s2 + s3)) + ((t0 + t1) + (t2 + t3));
 }
-static void sh_k_layernorm(const sh_blk *k) {
+static void sh_k_layernorm_s(const sh_blk *k) {
     const float eps = *(const float *)k->arg; const float *g = k->p0, *be = k->p1; const uint32_t cols = k->cols;
     uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
     for (uint32_t r = lo; r < hi; ++r) {
@@ -176,7 +177,7 @@ static void sh_k_layernorm(const sh_blk *k) {
         for (; i < cols; ++i) yr[i] = (uint16_t)sh_f2h((sh_h2f(xr[i]) - mean) * (rs * g[i]) + be[i]);
     }
 }
-static void sh_k_softmax(const sh_blk *k) {
+static void sh_k_softmax_s(const sh_blk *k) {
     const float s2 = *(const float *)k->arg * SH_LOG2E;   /* work in the log2 domain: exp(s x - m) = 2^(s2 x - m2) */
     const uint32_t cols = k->cols;
     uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
@@ -209,13 +210,13 @@ static void sh_k_softmax(const sh_blk *k) {
         for (; i < cols; ++i) yr[i] = (uint16_t)sh_f2h(sh_h2f(yr[i]) * inv);
     }
 }
-static void sh_k_gelu(const sh_blk *k) {
+static void sh_k_gelu_s(const sh_blk *k) {
     uint32_t lo, hi; sh_share(k->nr * k->cols, 8, &lo, &hi);
     const uint16_t *x = k->x; uint16_t *y = k->y; uint32_t i = lo;
     for (; i + 8 <= hi; i += 8) { SH_LOAD8(x, i); SH_APPLY8(sh_gelu1); SH_STORE8(y, i); }
     for (; i < hi; ++i) y[i] = (uint16_t)sh_f2h(sh_gelu1(sh_h2f(x[i])));
 }
-static void sh_k_add(const sh_blk *k) {          /* y = x + b, b per row */
+static void sh_k_add_s(const sh_blk *k) {          /* y = x + b, b per row */
     uint32_t lo, hi; sh_share(k->nr * k->cols, 8, &lo, &hi);
     const uint16_t *x = k->x, *b = k->b; uint16_t *y = k->y; uint32_t i = lo;
     for (; i + 8 <= hi; i += 8) {
@@ -225,7 +226,7 @@ static void sh_k_add(const sh_blk *k) {          /* y = x + b, b per row */
     }
     for (; i < hi; ++i) y[i] = (uint16_t)sh_f2h(sh_h2f(x[i]) + sh_h2f(b[i]));
 }
-static void sh_k_add_bias(const sh_blk *k) {     /* y = x + p0 (one row broadcast) */
+static void sh_k_add_bias_s(const sh_blk *k) {     /* y = x + p0 (one row broadcast) */
     const uint32_t cols = k->cols; const float *bias = k->p0;
     uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
     for (uint32_t r = lo; r < hi; ++r) {
@@ -238,12 +239,144 @@ static void sh_k_add_bias(const sh_blk *k) {     /* y = x + p0 (one row broadcas
         for (; i < cols; ++i) yr[i] = (uint16_t)sh_f2h(sh_h2f(xr[i]) + bias[i]);
     }
 }
-static void sh_k_scale(const sh_blk *k) {
+static void sh_k_scale_s(const sh_blk *k) {
     const float s = *(const float *)k->arg;
     uint32_t lo, hi; sh_share(k->nr * k->cols, 8, &lo, &hi);
     const uint16_t *x = k->x; uint16_t *y = k->y; uint32_t i = lo;
     for (; i + 8 <= hi; i += 8) { SH_LOAD8(x, i); a0 *= s; a1 *= s; a2 *= s; a3 *= s; b0 *= s; b1 *= s; b2 *= s; b3 *= s; SH_STORE8(y, i); }
     for (; i < hi; ++i) y[i] = (uint16_t)sh_f2h(sh_h2f(x[i]) * s);
+}
+
+
+/* ---- SIMD kernels (cols % 4 == 0, so every row is 8-byte aligned; otherwise the scalar *_s path) ----
+ * Rows shared by the three cores (bias, gamma, beta) are walked from a per-core start column so the
+ * cores do not hit the same TCDM bank in lock step. */
+#define SH_V4P(p) ((sh_v4h *)(p))
+#define SH_V4CP(p) ((const sh_v4h *)(p))
+#define SH_CM14 0xCB00u     /* fp16 -14.0 */
+#define SH_C15  0x4B80u     /* fp16  15.0 */
+static inline uint32_t sh_core_rot(uint32_t cv) { return (cv / ARCH_NUM_CORE_PER_CLUSTER) * flex_get_core_id(); }
+
+static void sh_k_scale(const sh_blk *k) {
+    if (k->cols & 3) { sh_k_scale_s(k); return; }
+    const sh_v4h s4 = sh_v4_splat(*(const float *)k->arg);
+    uint32_t lo, hi; sh_share(k->nr * k->cols, 8, &lo, &hi);
+    const sh_v4h *x = SH_V4CP(k->x); sh_v4h *y = SH_V4P(k->y);
+    for (uint32_t i = lo >> 2, e = hi >> 2; i < e; ++i) y[i] = sh_v4_mul_r(x[i], s4);
+}
+static void sh_k_add(const sh_blk *k) {
+    if (k->cols & 3) { sh_k_add_s(k); return; }
+    uint32_t lo, hi; sh_share(k->nr * k->cols, 8, &lo, &hi);
+    const sh_v4h *x = SH_V4CP(k->x), *b = SH_V4CP(k->b); sh_v4h *y = SH_V4P(k->y);
+    for (uint32_t i = lo >> 2, e = hi >> 2; i < e; ++i) y[i] = sh_v4_add(x[i], b[i]);
+}
+static void sh_k_add_bias(const sh_blk *k) {
+    if (k->cols & 3) { sh_k_add_bias_s(k); return; }
+    const uint32_t cv = k->cols >> 2, j0 = sh_core_rot(cv); const sh_v4h *bias = SH_V4CP(k->ph0);
+    uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
+    for (uint32_t r = lo; r < hi; ++r) {
+        const sh_v4h *x = SH_V4CP(k->x) + r * cv; sh_v4h *y = SH_V4P(k->y) + r * cv;
+        for (uint32_t j = j0; j < cv; ++j) y[j] = sh_v4_add(x[j], bias[j]);
+        for (uint32_t j = 0; j < j0; ++j) y[j] = sh_v4_add(x[j], bias[j]);
+    }
+}
+/* row reductions in fp16 SIMD: lanes hold sums of 4 elements (two roundings), folded into fp32
+ * every 16 elements; the mean is subtracted as an fp16 high + low pair */
+static inline float sh_v4_row_sum(const sh_v4h *x, uint32_t cv) {
+    float s = 0.f; uint32_t j = 0;
+    for (; j + 4 <= cv; j += 4) s += sh_v4_hsum(sh_v4_add(sh_v4_add(x[j], x[j + 1]), sh_v4_add(x[j + 2], x[j + 3])));
+    for (; j < cv; ++j) s += sh_v4_hsum(x[j]);
+    return s;
+}
+static inline float sh_v4_row_sqdev(const sh_v4h *x, uint32_t cv, sh_v4h mh4, sh_v4h ml4, sh_v4h q4) {   /* sum ((x - mean) q)^2 */
+    float s = 0.f; uint32_t j = 0;
+    for (; j + 4 <= cv; j += 4) {
+        const sh_v4h d0 = sh_v4_mul_r(sh_v4_sub_r(sh_v4_sub_r(x[j], mh4), ml4), q4), d1 = sh_v4_mul_r(sh_v4_sub_r(sh_v4_sub_r(x[j + 1], mh4), ml4), q4);
+        const sh_v4h d2 = sh_v4_mul_r(sh_v4_sub_r(sh_v4_sub_r(x[j + 2], mh4), ml4), q4), d3 = sh_v4_mul_r(sh_v4_sub_r(sh_v4_sub_r(x[j + 3], mh4), ml4), q4);
+        sh_v4h acc = sh_v4_mul(d0, d0); acc = sh_v4_mac(acc, d1, d1); acc = sh_v4_mac(acc, d2, d2); acc = sh_v4_mac(acc, d3, d3);
+        s += sh_v4_hsum(acc);
+    }
+    for (; j < cv; ++j) { const sh_v4h d = sh_v4_mul_r(sh_v4_sub_r(sh_v4_sub_r(x[j], mh4), ml4), q4); s += sh_v4_hsum(sh_v4_mul(d, d)); }
+    return s;
+}
+/* layernorm: mean and variance from fp16 SIMD partial sums (squared deviations prescaled by 1/16 so
+ * |x - mean| up to 4095 cannot overflow; an fp32 scalar recount when the variance is too small for
+ * that to be trustworthy), output pass in fp16 SIMD. */
+static void sh_k_layernorm(const sh_blk *k) {
+    if (k->cols & 3) { sh_k_layernorm_s(k); return; }
+    const float eps = *(const float *)k->arg; const uint32_t cols = k->cols, cv = cols >> 2, j0 = sh_core_rot(cv);
+    const sh_v4h *g = SH_V4CP(k->ph0), *be = SH_V4CP(k->ph1), q4 = sh_v4_splat(0.0625f);
+    uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
+    for (uint32_t r = lo; r < hi; ++r) {
+        const uint16_t *xr = k->x + r * cols; const sh_v4h *x = SH_V4CP(xr); sh_v4h *y = SH_V4P(k->y + r * cols);
+        const float mean = sh_v4_row_sum(x, cv) / (float)cols;
+        const uint32_t mh = sh_f2h(mean);
+        const sh_v4h mh4 = sh_v4_splat_h(mh), ml4 = sh_v4_splat(mean - sh_h2f(mh));
+        float var = sh_v4_row_sqdev(x, cv, mh4, ml4, q4) * (256.f / (float)cols);
+        if (var < 1e-3f) var = sh_row_sqdev(xr, cols, mean) / (float)cols;
+        const sh_v4h rs4 = sh_v4_splat(sh_rsqrtf(var + eps));
+        #define SH_LN_OUT(j) y[j] = sh_v4_mac(be[j], sh_v4_mul_r(sh_v4_sub_r(sh_v4_sub_r(x[j], mh4), ml4), rs4), g[j])
+        for (uint32_t j = j0; j < cv; ++j) SH_LN_OUT(j);
+        for (uint32_t j = 0; j < j0; ++j) SH_LN_OUT(j);
+        #undef SH_LN_OUT
+    }
+}
+/* softmax(scale x) per row: max in fp16 SIMD, exp(s x - m) = 2^(s2 x - m2) in fp16 SIMD (four
+ * vectors per exp2 batch) with the row sum folded into fp32 every 32 elements, then normalised. */
+static void sh_k_softmax(const sh_blk *k) {
+    if (k->cols & 3) { sh_k_softmax_s(k); return; }
+    const float scale = *(const float *)k->arg, s2 = scale * SH_LOG2E; const uint32_t cols = k->cols, cv = cols >> 2;
+    const sh_v4_exp2_consts ec = sh_v4_exp2_init();
+    const sh_v4h s24 = sh_v4_splat(s2), cm14 = sh_v4_splat_h(SH_CM14);
+    uint32_t lo, hi; sh_share(k->nr, 1, &lo, &hi);
+    for (uint32_t r = lo; r < hi; ++r) {
+        const sh_v4h *x = SH_V4CP(k->x + r * cols); sh_v4h *y = SH_V4P(k->y + r * cols);
+        float m2; uint32_t j;
+        if (scale >= 0.f) {
+            sh_v4h m0 = sh_v4_splat_h(0xFC00u), m1 = m0;
+            for (j = 0; j + 2 <= cv; j += 2) { m0 = sh_v4_max(m0, x[j]); m1 = sh_v4_max(m1, x[j + 1]); }
+            if (j < cv) m0 = sh_v4_max(m0, x[j]);
+            m2 = sh_v4_hmax(sh_v4_max(m0, m1)) * s2;
+        } else {
+            sh_v4h m0 = sh_v4_splat_h(0x7C00u), m1 = m0;
+            for (j = 0; j + 2 <= cv; j += 2) { m0 = sh_v4_min(m0, x[j]); m1 = sh_v4_min(m1, x[j + 1]); }
+            if (j < cv) m0 = sh_v4_min(m0, x[j]);
+            m2 = sh_v4_hmin(sh_v4_min(m0, m1)) * s2;
+        }
+        const sh_v4h m24 = sh_v4_splat(m2);
+        sh_v4h acc = sh_v4_splat_h(0); float sum = 0.f;
+        #define SH_SM_T(v) sh_v4_max_r(sh_v4_sub_r(sh_v4_mul_r(v, s24), m24), cm14)
+        for (j = 0; j + 4 <= cv; j += 4) {
+            sh_v4h t[4] = { SH_SM_T(x[j]), SH_SM_T(x[j + 1]), SH_SM_T(x[j + 2]), SH_SM_T(x[j + 3]) };
+            sh_v4_exp2x4(t, &ec);
+            y[j] = t[0]; y[j + 1] = t[1]; y[j + 2] = t[2]; y[j + 3] = t[3];
+            acc = sh_v4_add(sh_v4_add(acc, sh_v4_add(t[0], t[1])), sh_v4_add(t[2], t[3]));
+            if ((j & 4) == 4) { sum += sh_v4_hsum(acc); acc = sh_v4_splat_h(0); }
+        }
+        for (; j < cv; ++j) { sh_v4h e = sh_v4_exp2(SH_SM_T(x[j]), &ec); y[j] = e; acc = sh_v4_add(acc, e); }
+        #undef SH_SM_T
+        sum += sh_v4_hsum(acc);
+        const sh_v4h inv4 = sh_v4_splat(1.f / sum);
+        for (j = 0; j < cv; ++j) y[j] = sh_v4_mul_r(y[j], inv4);
+    }
+}
+/* gelu(x) = x / (1 + 2^(x (k0 + k1 x^2))) in fp16 SIMD (t clamped to the fp16 exponent range) */
+static void sh_k_gelu(const sh_blk *k) {
+    if (k->cols & 3) { sh_k_gelu_s(k); return; }
+    const sh_v4_exp2_consts ec = sh_v4_exp2_init();
+    const sh_v4h k04 = sh_v4_splat(SH_GELU_K0), k14 = sh_v4_splat(SH_GELU_K1), cm14 = sh_v4_splat_h(SH_CM14), c15 = sh_v4_splat_h(SH_C15);
+    uint32_t lo, hi; sh_share(k->nr * k->cols, 16, &lo, &hi);
+    const sh_v4h *x = SH_V4CP(k->x); sh_v4h *y = SH_V4P(k->y);
+    #define SH_GELU_T(v) sh_v4_min_r(sh_v4_max_r(sh_v4_mul(v, sh_v4_add_r(sh_v4_mul_r(sh_v4_mul(v, v), k14), k04)), cm14), c15)
+    uint32_t i = lo >> 2; const uint32_t e = hi >> 2;
+    for (; i + 4 <= e; i += 4) {
+        sh_v4h t[4] = { SH_GELU_T(x[i]), SH_GELU_T(x[i + 1]), SH_GELU_T(x[i + 2]), SH_GELU_T(x[i + 3]) };
+        sh_v4_exp2x4(t, &ec);
+        y[i] = sh_v4_div(x[i], sh_v4_add_r(t[0], ec.one));         y[i + 1] = sh_v4_div(x[i + 1], sh_v4_add_r(t[1], ec.one));
+        y[i + 2] = sh_v4_div(x[i + 2], sh_v4_add_r(t[2], ec.one)); y[i + 3] = sh_v4_div(x[i + 3], sh_v4_add_r(t[3], ec.one));
+    }
+    for (; i < e; ++i) y[i] = sh_v4_div(x[i], sh_v4_add_r(sh_v4_exp2(SH_GELU_T(x[i]), &ec), ec.one));
+    #undef SH_GELU_T
 }
 
 /* ---- public ops ---------------------------------------------------------------------------- */
@@ -290,6 +423,14 @@ void sh_transpose(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint
         const uint32_t nr = (rows - r0) < B ? rows - r0 : B, nc = (cols - c0) < B ? cols - c0 : B;
         ++next; while (next < nblk && !sh_my_block(next, cluster)) ++next;
         if (dm && next < nblk) SH_T_LOAD(next, set ^ 1);
+        if (dm) {   /* transpose inside TCDM with the iDMA: one 2-D gather of 2-byte elements per column */
+#ifndef SH_TRANSPOSE_CORES
+            bare_dma_wait_all();
+            for (uint32_t c = 0; c < nc; ++c)
+                bare_dma_start_2d(local(SH_T_D(set) + c * P * 2), local(SH_T_S(set) + c * 2), 2, 2, P * 2, nr);
+#endif
+        }
+#ifdef SH_TRANSPOSE_CORES
         {   /* each core: its share of the block's row pairs */
             const uint16_t *s = (const uint16_t *)local(SH_T_S(set)); uint16_t *d = (uint16_t *)local(SH_T_D(set));
             uint32_t lo, hi; sh_share(nr, 2, &lo, &hi);
@@ -307,6 +448,7 @@ void sh_transpose(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint
             }
             for (; r < hi; ++r) for (uint32_t c = 0; c < nc; ++c) d[c * P + r] = s[r * P + c];
         }
+#endif
         flex_intra_cluster_sync();
         if (dm) {
             bare_dma_wait_all();

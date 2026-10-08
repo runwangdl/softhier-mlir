@@ -156,71 +156,53 @@ int main(void) {
                 sh_timer_end();
             }
         }
-        /* 9. Xfvec fp16 SIMD (4 halves per 64-bit FP register, fld/fsd + .word encodings, pinned regs):
-         *    vfadd.h vfmul.h vfmul.r.h vfmac.h vfmax.h vfcpka.h.s vfcpkb.h.s, lane bits vs the scalar path;
-         *    then ROI #17: y = 0.3 x over 4096 halves with vfmul.r.h (compare with ROI #3, the scalar 8-wide). */
+        /* 9. Xfvec fp16 SIMD (4 halves per 64-bit FP register, fld/fsd + `.insn r` encodings with plain "f"
+         *    operands): vfadd.h vfmul.h vfmul.r.h vfmac.h vfmax.h vfcpka.h.s vfcpkb.h.s, lane bits vs the scalar
+         *    path; then ROI #17: y = 0.3 x over 4096 halves with vfmul.r.h (compare with ROI #3, scalar 8-wide). */
         {
-            #define XV(f7, rs2, rs1, f3, rd) (((f7) << 25) | ((rs2) << 20) | ((rs1) << 15) | ((f3) << 12) | ((rd) << 7) | 0x33)
-            typedef union { double d; uint16_t h[4]; float f[2]; } v4h;
+            typedef union { double d; uint16_t h[4]; } v4h;
+            #define V4OP(f3, f7, r, a, b) __asm__ (".insn r 0x33, " #f3 ", " #f7 ", %0, %1, %2" : "=f"(r) : "f"(a), "f"(b))
             uint32_t vb_add = 0, vb_mul = 0, vb_mulr = 0, vb_mac = 0, vb_mac1 = 0, vb_max = 0, vb_cpk = 0;
-            const uint16_t s_h = sh_f32_to_fp16(0.3f);
+            v4h sv; sv.h[0] = sh_f32_to_fp16(0.3f); sv.h[1] = sv.h[2] = sv.h[3] = 0;
             for (uint32_t i = 0; i < 4096; i += 4) {
-                v4h a, b, c, r;
+                v4h a, b, c, r; double t;
                 a.d = *(const double *)(const uint16_t *)(x + i); b.d = *(const double *)(const uint16_t *)(x + ((i + 4) & 4095));
                 c.d = *(const double *)(const uint16_t *)(x + ((i + 8) & 4095));
-                register double fa0 __asm__("fa0") = a.d; register double fa1 __asm__("fa1") = b.d; register double fa2 __asm__("fa2");
-                /* vfadd.h fa2, fa0, fa1 */
-                __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x41, 11, 10, 2, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                V4OP(2, 0x41, t, a.d, b.d); r.d = t;
                 for (int l = 0; l < 4; ++l) if (r.h[l] != sh_f32_to_fp16(sh_fp16_to_f32(a.h[l]) + sh_fp16_to_f32(b.h[l]))) vb_add++;
-                /* vfmul.h fa2, fa0, fa1 */
-                __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x43, 11, 10, 2, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                V4OP(2, 0x43, t, a.d, b.d); r.d = t;
                 for (int l = 0; l < 4; ++l) if (r.h[l] != sh_f32_to_fp16(sh_fp16_to_f32(a.h[l]) * sh_fp16_to_f32(b.h[l]))) vb_mul++;
-                /* vfmul.r.h fa2, fa0, fa1 (lane 0 of fa1 replicated) */
-                { v4h sv; sv.h[0] = s_h; sv.h[1] = 0; sv.h[2] = 0; sv.h[3] = 0; fa1 = sv.d; }
-                __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x43, 11, 10, 6, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
-                for (int l = 0; l < 4; ++l) if (r.h[l] != sh_f32_to_fp16(sh_fp16_to_f32(a.h[l]) * 0.3f)) vb_mulr++;
-                /* vfmac.h fa2, fa0, fa1 : fa2 += fa0 * fa1, fa2 preloaded with c */
-                fa1 = b.d; fa2 = c.d;
-                __asm__ volatile (".word %1" : "+f"(fa2) : "i"(XV(0x48, 11, 10, 2, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                V4OP(6, 0x43, t, a.d, sv.d); r.d = t;
+                for (int l = 0; l < 4; ++l) if (r.h[l] != sh_f32_to_fp16(sh_fp16_to_f32(a.h[l]) * sh_fp16_to_f32(sv.h[0]))) { if (vb_mulr < 3) sh_printf("mulr i=%u l=%d a=%04x s=%04x got=%04x want=%04x\n", i, l, a.h[l], sv.h[0], r.h[l], sh_f32_to_fp16(sh_fp16_to_f32(a.h[l]) * sh_fp16_to_f32(sv.h[0]))); vb_mulr++; }
+                t = c.d; __asm__ (".insn r 0x33, 2, 0x48, %0, %1, %2" : "+f"(t) : "f"(a.d), "f"(b.d)); r.d = t;   /* vfmac.h: c += a*b */
                 for (int l = 0; l < 4; ++l) {
                     uint16_t w = sh_f32_to_fp16(sh_fp16_to_f32(c.h[l]) + sh_fp16_to_f32(a.h[l]) * sh_fp16_to_f32(b.h[l]));
                     int d = (int)r.h[l] - (int)w; if (d < 0) d = -d; if (d > 1) vb_mac++; else if (d == 1) vb_mac1++;
                 }
-                /* vfmax.h fa2, fa0, fa1 */
-                __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x46, 11, 10, 2, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                V4OP(2, 0x46, t, a.d, b.d); r.d = t;
                 for (int l = 0; l < 4; ++l) { float p = sh_fp16_to_f32(a.h[l]), q = sh_fp16_to_f32(b.h[l]); if (r.h[l] != (p > q ? a.h[l] : b.h[l])) vb_max++; }
-                /* vfcpka.h.s fa2, fa0(f32), fa1(f32) -> lanes 0,1 ; vfcpkb.h.s -> lanes 2,3 */
                 {
                     float g0 = sh_fp16_to_f32(a.h[0]) * 1.5f + 0.25f, g1 = sh_fp16_to_f32(a.h[1]) * 1.5f + 0.25f;
                     float g2 = sh_fp16_to_f32(a.h[2]) * 1.5f + 0.25f, g3 = sh_fp16_to_f32(a.h[3]) * 1.5f + 0.25f;
-                    register float fa3 __asm__("fa3") = g0; register float fa4 __asm__("fa4") = g1;
-                    register double fa5 __asm__("fa5");
-                    __asm__ volatile (".word %1" : "=f"(fa5) : "i"(XV(0x58, 14, 13, 2, 15)), "f"(fa3), "f"(fa4));
-                    fa3 = g2; fa4 = g3;
-                    __asm__ volatile (".word %1" : "+f"(fa5) : "i"(XV(0x58, 14, 13, 6, 15)), "f"(fa3), "f"(fa4));
-                    r.d = fa5;
+                    __asm__ (".insn r 0x33, 2, 0x58, %0, %1, %2" : "=f"(t) : "f"(g0), "f"(g1));       /* vfcpka.h.s: lanes 0,1 */
+                    __asm__ (".insn r 0x33, 6, 0x58, %0, %1, %2" : "+f"(t) : "f"(g2), "f"(g3));       /* vfcpkb.h.s: lanes 2,3 */
+                    r.d = t;
                     if (r.h[0] != sh_f32_to_fp16(g0) || r.h[1] != sh_f32_to_fp16(g1) || r.h[2] != sh_f32_to_fp16(g2) || r.h[3] != sh_f32_to_fp16(g3)) vb_cpk++;
                 }
             }
             sh_printf("[fp16cvt] xfvec probe: add bad=%u mul bad=%u mul.r bad=%u mac bad=%u (1ulp %u) max bad=%u cpk bad=%u\n",
                       vb_add, vb_mul, vb_mulr, vb_mac, vb_mac1, vb_max, vb_cpk);
             bad += vb_add + vb_mul + vb_mulr + vb_mac + vb_max + vb_cpk;
-            /* timed: y = 0.3 x with vfmul.r.h, 4 elements per fld/.word/fsd */
-            { v4h sv; sv.h[0] = s_h; sv.h[1] = 0; sv.h[2] = 0; sv.h[3] = 0;
-              register double fa1 __asm__("fa1") = sv.d;
-              const double *xd = (const double *)(const uint16_t *)x; double *yd = (double *)(uint16_t *)y;
-              sh_timer_start();
-              for (uint32_t i = 0; i < 1024; ++i) {
-                  register double fa0 __asm__("fa0") = xd[i]; register double fa2 __asm__("fa2");
-                  __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x43, 11, 10, 6, 12)), "f"(fa0), "f"(fa1));
-                  yd[i] = fa2;
-              }
-              sh_timer_end();
-              uint32_t vb_t = 0;
-              for (uint32_t i = 0; i < 4096; ++i) if (y[i] != sh_f32_to_fp16(sh_fp16_to_f32(x[i]) * 0.3f)) vb_t++;
-              sh_printf("[fp16cvt] xfvec timed scale loop: bad=%u\n", vb_t); bad += vb_t;
+            {   /* timed: y = 0.3 x with vfmul.r.h, 4 elements per fld / .insn / fsd */
+                const double *xd = (const double *)(const uint16_t *)x; double *yd = (double *)(uint16_t *)y; const double s4 = sv.d;
+                sh_timer_start();
+                for (uint32_t i = 0; i < 1024; ++i) { double t; V4OP(6, 0x43, t, xd[i], s4); yd[i] = t; }
+                sh_timer_end();
+                uint32_t vb_t = 0;
+                for (uint32_t i = 0; i < 4096; ++i) if (y[i] != sh_f32_to_fp16(sh_fp16_to_f32(x[i]) * sh_fp16_to_f32(sv.h[0]))) vb_t++;
+                sh_printf("[fp16cvt] xfvec timed scale loop: bad=%u\n", vb_t); bad += vb_t;
             }
-            #undef XV
+            #undef V4OP
         }
         sh_printf("FP16CVT_%s\n", (bad_h2f | bad_f2h | bad) ? "FAIL" : "PASS");
     }

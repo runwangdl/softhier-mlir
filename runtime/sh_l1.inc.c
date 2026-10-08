@@ -29,6 +29,13 @@ void sh_l1_relu_fp16(uint32_t off, uint32_t n) {
 void sh_l1_add_fp16(uint32_t dst, uint32_t src, uint32_t n) {
     uint32_t lo, hi; sh_l1_share(n, &lo, &hi);
     uint16_t *d = (uint16_t *)local(dst); const uint16_t *s = (const uint16_t *)local(src);
+    if (((dst | src | n) & 7) == 0) {                /* fp16 SIMD: 4 lanes per vfadd.h */
+        sh_v4h *dv = (sh_v4h *)d; const sh_v4h *sv = (const sh_v4h *)s;
+        for (uint32_t j = lo >> 2, e = hi >> 2; j < e; ++j) dv[j] = sh_v4_add(dv[j], sv[j]);
+        sh_fp_fence();
+        flex_intra_cluster_sync();
+        return;
+    }
     uint32_t i = lo;
     for (; i + 4 <= hi; i += 4) {
         float a0 = sh_h2f(d[i]) + sh_h2f(s[i]), a1 = sh_h2f(d[i + 1]) + sh_h2f(s[i + 1]);

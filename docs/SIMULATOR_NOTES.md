@@ -14,6 +14,10 @@ removed from `gvsoc-pulp` in 2026-01 and the public SDK (2026-06) only ships the
 | 3 | 768-term fp16 dot products come out ~10 % low | `float_to_fp16` in `light_redmule.cpp` truncates the mantissa; every FMA of the accumulation rounds toward zero | patch `gvsoc_redmule_fp16_rne.patch`: IEEE round-to-nearest-even (real RedMulE rounds) |
 | 4 | gvsoc segfaults (no output) with two outstanding collective broadcasts from one DM core | NoC collective model | `sh_gemm_mesh` waits after every broadcast |
 | 5 | gvsoc segfaults at elaboration | DRAMSys ships as an x86-64 `.so` on an aarch64 host | `SOFTHIER_IDEAL_HBM=1` swaps HBM for gvsoc's ideal memory (HBM-bound numbers are optimistic) |
+| 6 | `fcvt.w.s` followed by `fcvt.s.w` on the same integer register (floor/round via int) returns a stale integer: 25 % wrong results when eight independent pairs are issued back to back (`tests/gvsoc/fp16cvt`) | the integer operand of an offloaded int->FP instruction is forwarded before the preceding FP->int result landed | never round through the integer file: `t + 1.5*2^23 - 1.5*2^23` in FP, exponent bits via `fmv.x.w` + integer ops + `fmv.w.x` (`sh_exp2_clamped`, `sh_v4_exp2`) |
+| 7 | three cores in a cluster are not faster than one on straight-line code; a 5-instruction loop runs 5.5x slower depending on its address | one `instr_router` (8 B/cycle) shared by the three cores, 32 B single-line prefetchers, no RVC: ~1 instruction/cycle for the whole cluster unless the loop fits one 32 B line | minimise instructions per element (fp16 SIMD `vfadd.h` ... = 4 lanes per instruction), `#pragma GCC optimize("align-loops=32")` in the library |
+| 8 | an `fsd` by the FP subsystem followed by an integer `lw`/`lhu` of the same address (and `sw` followed by `fld`) reads stale data; data stored with `fsd` was not yet in TCDM when the DMA read it after the barrier | the integer core and its FP subsystem are two masters; neither program order nor the barrier CSR orders their memory accesses | `sh_v4_after_fsd` / `sh_v4_after_sw` / `sh_fp_fence` (`runtime/sh_simd.inc.c`): an `fmv.x.w` whose result the loads depend on drains the subsystem; a read-back feeding the `fld` address orders the other direction |
+| 9 | core 0 hangs forever in a loop over a TCDM buffer at offset 0 | TCDM address 0 is `NULL` to GCC (and the SDK L1 allocator lives at 0x10) | the library never stages data below TCDM 0x1000 (`SH_ROWOPS_L1_BASE`) |
 
 Other facts the library relies on:
 - RedMulE convention: `flex_redmule_config(m, n, k)` computes `Y[m,k] += X[m,n] . W[n,k]`
@@ -23,6 +27,54 @@ Other facts the library relies on:
   for the whole library (`.text` ~20 KB).
 - Every core executes `main()`: never keep mutable program state in `.bss` (it is shared
   L3 memory); allocate HBM offsets on the stack or with constants.
+
+## Row-wise / elementwise fp16 ops: scalar conversions -> fp16 SIMD (2026-10-08)
+
+`sh_layernorm / sh_softmax_rows / sh_gelu / sh_add / sh_add_bias / sh_scale / sh_transpose`
+(`runtime/sh_rowops.inc.c`, `runtime/sh_simd.inc.c`) were rewritten; `tests/gvsoc/run.py rowops`
+(256 x 768 fp16, numpy reference, `--nsamples 1024`) and `run.py siglip --seq 256 --cluster 0`
+pass. Baseline = commit 8597b42 (software fp16<->fp32 on the first core only).
+
+What changed, in the order it mattered:
+1. **Hardware conversions.** `lhu` + `fmv.w.x` (NaN-boxed) + `fcvt.s.h`, and `fcvt.h.s` + `fmv.x.w` + `sh`
+   (`sh_h2f` / `sh_f2h` in `sh_ops.h`) are bit-exact against the software converters for all 65536
+   halves and 200k floats (`run.py fp16cvt`) and ~5x faster per element. Independent chains must be
+   interleaved by hand (`sh_h2f4` / `sh_f2h4`): the FPU model overlaps independent instructions
+   (~2 cycles each) but serialises dependent ones (~6).
+2. **All three cores, double-buffered DMA.** Each block is split over the cores (the DM core also
+   computes); block i+1 streams in and block i-1 streams out during compute. On this model the
+   three cores do *not* add throughput on straight-line code (#7): with everything on one core the
+   ops took the same time. The split still matters for the fetch-free inner loops (ADD/SCALE/BIAS).
+3. **fp16 SIMD (Xfvec).** `vfadd.h / vfmul.h / vfmac.h / vfmax.h / vfdiv.h / vfcpka.h.s ...` on four
+   fp16 lanes of a 64-bit FP register, loaded with a plain `fld` (the broken `flh` is not involved),
+   emitted with `.insn r` because the upstream assembler lacks the mnemonics. Softmax and GELU
+   evaluate `2^t` on four lanes (`sh_v4_exp2`: round via `t + 1536`, degree-3 polynomial, `2^k` from
+   the bits of the sum with two SWAR integer ops per lane pair); reductions keep fp16 partial sums
+   of <= 8 terms per lane and fold into fp32. LayerNorm subtracts the mean as an fp16 high+low pair.
+4. **32-byte loop alignment** (#7) and the **FP/integer ordering fences** (#8).
+5. **Transpose on the iDMA**: one 2-D gather of 2-byte elements per column inside TCDM instead
+   of a scalar loop (`SH_TRANSPOSE_CORES` restores the core loop).
+
+Simulated time of `run.py rowops --rows 256 --cols 768` (196 608 elements per op, gvsoc at 1 GHz):
+
+| op | cluster 0: before | after | speedup | all 16 clusters: before | after | speedup |
+|---|---|---|---|---|---|---|
+| layernorm | 49.16 ms | 2.02 ms | 24.3x | 3.727 ms | 0.149 ms | 25.1x |
+| softmax | 60.37 ms | 2.14 ms | 28.3x | 3.841 ms | 0.145 ms | 26.5x |
+| gelu | 28.73 ms | 1.81 ms | 15.9x | 1.816 ms | 0.123 ms | 14.8x |
+| add | 17.45 ms | 0.145 ms | 120x | 1.123 ms | 0.022 ms | 50.7x |
+| add_bias | 17.29 ms | 0.158 ms | 110x | 1.106 ms | 0.027 ms | 40.8x |
+| scale | 14.00 ms | 0.128 ms | 109x | 0.967 ms | 0.017 ms | 57.5x |
+| transpose | 3.27 ms | 0.231 ms | 14.2x | 0.208 ms | 0.025 ms | 8.2x |
+| **all 7** | **190.3 ms** | **6.63 ms** | **28.7x** | **12.79 ms** | **0.508 ms** | **25.2x** |
+
+Per element on one cluster the ops went from 71-307 cycles to 0.65-10.9 cycles. The SigLIP layer
+(`siglip --seq 256 --cluster 0`, GEMMs on RedMulE unchanged) went from 700.5 ms to 22.8 ms (30.7x)
+with every tensor within tolerance. Remaining cost is instruction fetch (#7): softmax/GELU are
+~8-11 instructions per element (the `2^k` assembly and the FP<->int fences), LayerNorm ~10.
+
+Open point (not needed by the library): why `flh` still reads 0 after the handler patch was not
+investigated further; the library avoids scalar fp16 loads entirely (`fld` of four halves).
 
 ## Host speed of the RedMulE functional model (patch `gvsoc_redmule_neon.patch`, 2026-10-08)
 
