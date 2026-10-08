@@ -1,0 +1,37 @@
+/* gvsoc test: sh_gemm on one cluster, data generated on device, sampled self-check.
+ * Shape/tiling come from shape.h (written by tests/gvsoc/run.py). */
+#include "sh_ops.h"
+#include "shape.h"      /* GEMM_M GEMM_N GEMM_K TILE_M TILE_N TILE_K PIPELINE ACCUMULATE NSAMPLES */
+
+int main(void) {
+    sh_init();
+    const uint32_t M = GEMM_M, N = GEMM_N, K = GEMM_K;
+    const uint64_t x = sh_hbm_addr(0x00000000), w = sh_hbm_addr(0x01000000), z = sh_hbm_addr(0x02000000);
+    uint32_t bad = 0;
+    if (sh_cluster_id() == 0 && sh_is_first_core()) {
+        sh_test_fill_int_fp16(x, M, K, K, 1, -1, 1);
+        sh_test_fill_int_fp16(w, K, N, N, 2, -2, 2);
+        sh_test_fill_int_fp16(z, M, N, N, 3, ACCUMULATE ? 3 : 0, ACCUMULATE ? 3 : 0);  /* Z0 = 3.0 or 0 */
+    }
+    sh_barrier_global();
+    sh_gemm_cfg cfg = { .tm = TILE_M, .tn = TILE_N, .tk = TILE_K, .pipeline = PIPELINE,
+                        .accumulate = ACCUMULATE, .fmt = SH_FP16, .l1_base = 0 };
+    if (sh_cluster_id() == 0 && sh_is_first_core()) {
+        sh_printf("[gemm] %ux%ux%u tile %ux%ux%u pipeline=%d acc=%d l1=%u B\n", M, N, K, TILE_M ? TILE_M : 256, TILE_N ? TILE_N : 256, TILE_K ? TILE_K : 256,
+                  PIPELINE, ACCUMULATE, sh_gemm_l1_bytes(M, N, K, &cfg));
+        sh_timer_start();
+    }
+    int rc = sh_gemm(x, w, z, M, N, K, K, N, N, &cfg, 0);
+    sh_barrier_global();
+    if (sh_cluster_id() == 0 && sh_is_first_core()) {
+        sh_timer_end();
+        if (rc) sh_printf("[gemm] rc=%d GEMM_FAIL\n", rc);
+        else {
+            bad = sh_test_check_gemm(x, w, z, M, N, K, K, N, N, NSAMPLES, 0.5f, ACCUMULATE ? 3.0f : 0.0f, "[gemm]");
+            sh_printf("[gemm] %s\n", bad ? "GEMM_FAIL" : "GEMM_PASS");
+        }
+    }
+    sh_barrier_global();
+    sh_eoc(0);
+    return 0;
+}

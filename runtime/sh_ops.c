@@ -1,0 +1,15 @@
+/* softhier-ops unity build. The SDK headers below define non-static functions and therefore
+ * may only be included once per program: here. Everything else goes through sh_ops.h. */
+#include "flex_runtime.h"
+#include "flex_redmule.h"
+#include "flex_cluster_arch.h"
+#include "flex_dma_pattern.h"
+#include "flex_group_barrier.h"
+#include "flex_alloc_api.h"
+#include "flex_printf.h"
+#include <stdarg.h>
+#include "sh_ops.h"
+
+#include "sh_rt.inc.c"
+#include "sh_gemm.inc.c"
+#include "sh_test.inc.c"

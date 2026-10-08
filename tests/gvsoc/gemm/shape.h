@@ -1,0 +1,9 @@
+#define GEMM_M 256
+#define GEMM_N 768
+#define GEMM_K 192
+#define TILE_M 256
+#define TILE_N 192
+#define TILE_K 192
+#define PIPELINE 1
+#define ACCUMULATE 0
+#define NSAMPLES 256
