@@ -26,3 +26,4 @@ tests/gvsoc/smolvla_vlm_app/
 tests/gvsoc/llmops/last_run.log
 tests/gvsoc/llmops/shape.h
 tests/gvsoc/expert_*app*/
+tests/gvsoc/ttt_app*/

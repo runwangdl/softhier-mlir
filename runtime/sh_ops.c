@@ -19,3 +19,4 @@
 #include "sh_expert.inc.c"
 #include "sh_test.inc.c"
 #include "sh_llm.inc.c"
+#include "sh_train.inc.c"
