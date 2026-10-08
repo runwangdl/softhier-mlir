@@ -14,6 +14,7 @@ Target: xDSL >= 0.69.
 from __future__ import annotations
 
 from xdsl.dialects.builtin import (
+    ArrayAttr,
     FloatAttr,
     IndexType,
     IntegerAttr,
@@ -23,6 +24,7 @@ from xdsl.dialects.builtin import (
 )
 from xdsl.ir import Dialect
 from xdsl.irdl import (
+    AttrSizedOperandSegments,
     IRDLOperation,
     ParsePropInAttrDict,
     irdl_op_definition,
@@ -216,9 +218,12 @@ class GemmOp(IRDLOperation):
     x = operand_def(MemRefType)
     w = operand_def(MemRefType)
     z = operand_def(MemRefType)
+    step = opt_operand_def(IndexType)       # optional: with ``fmt_steps``, the RedMulE format is fmt_steps[step]
     fmt = prop_def(StringAttr)
+    fmt_steps = opt_prop_def(ArrayAttr)     # per-step formats ["fp16", "fp8", ...] indexed by ``step`` (flow-matching
+                                            # steps of different precision, docs/SMOLVLA_EXPERT.md); ``fmt`` without it
     assembly_format = (
-        "$x `,` $w `into` $z attr-dict `:` type($x) `,` type($w) `,` type($z)"
+        "$x `,` $w `into` $z (`step` $step^)? attr-dict `:` type($x) `,` type($w) `,` type($z)"
     )
 
 
@@ -396,6 +401,90 @@ class AttentionOp(IRDLOperation):
 
 
 @irdl_op_definition
+class RmsNormOp(IRDLOperation):
+    """``y = x * rsqrt(mean(x^2) + eps) * gamma`` over the last dim (gamma is 1 x cols; Llama/SmolLM RMSNorm)."""
+    name = "softhier.rmsnorm"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    gamma = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    eps = prop_def(FloatAttr)
+    assembly_format = "$x `,` $gamma `->` $y attr-dict `:` type($x) `,` type($gamma) `->` type($y)"
+
+
+@irdl_op_definition
+class SiluMulOp(IRDLOperation):
+    """``y = silu(a) * b`` elementwise (the SwiGLU gate; ``b`` may be omitted: ``y = silu(a)``)."""
+    name = "softhier.silu_mul"
+    irdl_options = (ParsePropInAttrDict(),)
+    a = operand_def(MemRefType)
+    b = opt_operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    assembly_format = "$a (`,` $b^)? `->` $y attr-dict `:` type($a) (`,` type($b)^)? `->` type($y)"
+
+
+@irdl_op_definition
+class AxpyOp(IRDLOperation):
+    """``y = a + alpha * b`` elementwise (the flow-matching Euler update ``x_t + dt * v_t``)."""
+    name = "softhier.axpy"
+    irdl_options = (ParsePropInAttrDict(),)
+    a = operand_def(MemRefType)
+    b = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    alpha = prop_def(FloatAttr)
+    assembly_format = "$a `,` $b `->` $y attr-dict `:` type($a) `,` type($b) `->` type($y)"
+
+
+@irdl_op_definition
+class RopeOp(IRDLOperation):
+    """Rotary embedding in lerobot's ``apply_rope`` convention: every head of ``dh`` columns is rotated
+    half-split, ``y[i] = x1 cos - x2 sin``, ``y[i + dh/2] = x2 cos + x1 sin``, with the per-row table
+    ``tab`` (rows x cols, same column layout as ``x``: per head ``[cos(dh/2) | sin(dh/2)]`` of the row's
+    position) built on the host."""
+    name = "softhier.rope"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    tab = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    dh = prop_def(IntegerAttr)
+    assembly_format = "$x `,` $tab `->` $y attr-dict `:` type($x) `,` type($tab) `->` type($y)"
+
+
+@irdl_op_definition
+class CrossAttentionOp(IRDLOperation):
+    """GQA attention of ``Sq`` query tokens (``q``: Sq x heads*dh) over a stationary prefix KV (``kp`` /
+    ``vp``: Lp x kv_heads*dh, e.g. the VLM prefix of SmolVLA) plus, with ``own %ko, %vo`` (Sq x kv_heads*dh),
+    the tokens' own keys/values attended causally (query i sees own key j iff j <= i). ``valid %m``: a
+    1 x Lp fp16 row of 1.0 / 0.0 masking prefix keys (padding). Query head h uses kv head h / (heads /
+    kv_heads). Each head runs inside one cluster's TCDM; ``cluster = -1`` deals head h to cluster h % P."""
+    name = "softhier.cross_attention"
+    irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
+    q = operand_def(MemRefType)
+    kp = operand_def(MemRefType)
+    vp = operand_def(MemRefType)
+    ko = opt_operand_def(MemRefType)
+    vo = opt_operand_def(MemRefType)
+    valid = opt_operand_def(MemRefType)
+    o = operand_def(MemRefType)
+    scale = prop_def(FloatAttr)
+    heads = prop_def(IntegerAttr)
+    kv_heads = prop_def(IntegerAttr)
+    assembly_format = ("$q `,` $kp `,` $vp (`own` $ko^ `,` $vo)? (`valid` $valid^)? `->` $o attr-dict `:` "
+                       "type($q) `,` type($kp) `,` type($vp) (`own` type($ko)^ `,` type($vo))? (`valid` type($valid)^)? `->` type($o)")
+
+
+@irdl_op_definition
+class DumpAllOp(IRDLOperation):
+    """Test output: print every element as ``<tag> r c hex`` lines (small tensors, e.g. the 50 x 32 action chunk)."""
+    name = "softhier.dump_all"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
+    index = opt_operand_def(IndexType)      # optional: printed after the tag
+    tag = prop_def(StringAttr)
+    assembly_format = "$buf (`,` $index^)? attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
 class HbmFillLcgOp(IRDLOperation):
     """Test input: fill with ``scale * randint(lo, hi)`` from the runtime's LCG(seed); the host
     regenerates the same data with softhier_mlir.testing.lcg.fill_fp16."""
@@ -477,6 +566,12 @@ SoftHier = Dialect(
         AddOp,
         AddBiasOp,
         AttentionOp,
+        RmsNormOp,
+        SiluMulOp,
+        AxpyOp,
+        RopeOp,
+        CrossAttentionOp,
+        DumpAllOp,
         HbmFillLcgOp,
         DumpSamplesOp,
     ],

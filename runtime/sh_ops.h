@@ -95,6 +95,32 @@ uint32_t sh_attention_l1_bytes(uint32_t S, uint32_t dh);   /* TCDM bytes one hea
  * sh_attention_head run on the calling cluster (kept in its TCDM; first core's counter). */
 uint32_t sh_attention_profile(uint32_t S, uint32_t dh, uint32_t phase);
 
+/* ---- SmolVLA action-expert ops (runtime/sh_expert.inc.c, prefix sh_x_) --------------------------------
+ * Row ops on fp16 HBM tensors (same conventions / cluster argument as the row-wise ops above, but every operand has
+ * its own leading dimension: the operands are strided views, e.g. the gate | up halves of one buffer). */
+void sh_x_rmsnorm(uint64_t y, uint64_t x, uint64_t gamma, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t ldx, float eps, uint32_t cluster); /* y = x rsqrt(mean x^2 + eps) gamma */
+void sh_x_silu_mul(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, uint32_t cluster); /* y = silu(a) * b; b == 0: y = silu(a) */
+void sh_x_axpy(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, float alpha, uint32_t cluster); /* y = a + alpha b */
+/* RoPE, lerobot apply_rope convention (half-split rotation per head of dh): tab[rows, cols] (leading dim ldtab) holds per
+ * row and per head [cos(dh/2) | sin(dh/2)] for that row's position (host-built table). */
+void sh_x_rope(uint64_t y, uint64_t x, uint64_t tab, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t ldx, uint32_t ldtab, uint32_t dh, uint32_t cluster);
+/* GQA attention of Sq query tokens over a stationary prefix KV (Lp rows of kp / vp, Hkv heads of dh columns) plus,
+ * when ko != 0, So own keys/values attended causally (query i sees own key j iff j <= i). valid: fp16 row of Lp 1.0/0.0
+ * entries (0 = all valid). Query head h uses kv head h / (H / Hkv). Head h runs inside one cluster's TCDM; cluster ==
+ * SH_ALL deals head h to cluster h % P and ends with a global barrier. Returns 0, or <0 on a constraint violation. */
+int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t valid, uint64_t o,
+                   uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
+                   uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo,
+                   float scale, uint32_t cluster);
+int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t valid, uint64_t o,
+                        uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
+                        uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster);
+uint32_t sh_x_attention_l1_bytes(uint32_t Sq, uint32_t L, uint32_t dh);                        /* L = Lp + So */
+uint32_t sh_x_attention_profile(uint32_t Sq, uint32_t L, uint32_t dh, uint32_t phase);         /* mcycle stamps 0 entry, 1 staged, 2 scores, 3 softmax, 4 P.V, 5 stored */
+/* Print every element of a matrix ("<tag> r c hex"; tag<idx> variant). Calling core. */
+void sh_test_dump_all(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag);
+void sh_test_dump_all_idx(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag, uint32_t idx);
+
 /* ---- TCDM-resident ops (calling cluster only; intra-cluster sync inside) ------------------ */
 uint32_t sh_l1_addr(uint32_t off);                                   /* TCDM byte offset -> address */
 void     sh_l1_zero(uint32_t off, uint32_t bytes);                   /* via ZOMEM iDMA */
