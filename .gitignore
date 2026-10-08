@@ -17,3 +17,4 @@ tests/gvsoc/mlir_app/*.elf
 tests/gvsoc/mlir_app/*.mlir
 tests/gvsoc/mlir_app/*.npz
 tests/gvsoc/smolvla_app*/
+.claude/

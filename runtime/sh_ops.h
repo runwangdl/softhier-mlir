@@ -5,7 +5,8 @@
  *    headers define non-static functions, so they may be included by exactly one
  *    translation unit: that unit is sh_ops.c (a unity build of sh_*.inc.c).
  *  - Every operator is called by ALL cores of a cluster (SPMD); the operator dispatches
- *    the DM core (iDMA), the first core (RedMulE / scalar math) and syncs internally.
+ *    the DM core (iDMA), the first core (RedMulE) and syncs internally. The row-wise ops
+ *    split every staged block over all three cores (fp16 SIMD, see docs/SIMULATOR_NOTES.md).
  *  - Tensors are fp16 row-major in HBM, addressed by 64-bit byte addresses.
  *  - Operators take an explicit tiling/config struct so the compiler (decide) and the
  *    library (apply) stay separate; 0 means "library default".
@@ -28,6 +29,7 @@ void     sh_timer_start(void);          /* global timer: call from ONE core only
 void     sh_timer_end(void);
 uint32_t sh_cycles(void);               /* this core's mcycle (1 GHz: 1 cycle = 1 ns; wraps every 4.29 s) */
 void     sh_eoc(uint32_t val);
+uint32_t sh_cycles(void);               /* this core's cycle counter (mcycle CSR = the gvsoc clock) */
 void     sh_printf(const char *fmt, ...);
 uint64_t sh_hbm_addr(uint64_t byte_offset);   /* HBM base + offset */
 uint64_t sh_hbm_malloc(uint32_t bytes);       /* first core of each cluster only (SDK allocator) */
@@ -64,7 +66,9 @@ int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uin
 uint32_t sh_gemm_l1_bytes(uint32_t M, uint32_t N, uint32_t K, const sh_gemm_cfg *cfg);
 
 /* ---- row-wise / elementwise ops on fp16 HBM tensors (rows x cols, leading dim ld) -------------
- * `cluster`: executing cluster id, or SH_ALL to split row blocks over all clusters. */
+ * `cluster`: executing cluster id, or SH_ALL to split row blocks over all clusters.
+ * cols % 4 == 0 takes the fp16 SIMD path (4 lanes); other widths fall back to scalar fp32.
+ * Parameter rows (gamma, beta, bias) are limited to 4096 columns. */
 void sh_layernorm(uint64_t y, uint64_t x, uint64_t gamma, uint64_t beta, uint32_t rows, uint32_t cols, uint32_t ld, float eps, uint32_t cluster);
 void sh_softmax_rows(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, float scale, uint32_t cluster); /* softmax(scale*x) per row */
 void sh_gelu(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t cluster);                    /* tanh approximation */
@@ -80,6 +84,8 @@ void     sh_l1_fill_fp16(uint32_t off, uint32_t n, uint16_t bits);
 void     sh_l1_relu_fp16(uint32_t off, uint32_t n);
 void     sh_l1_add_fp16(uint32_t dst, uint32_t src, uint32_t n);     /* dst += src */
 void     sh_redmule(uint32_t x, uint32_t w, uint32_t y, uint32_t m, uint32_t n, uint32_t k, uint32_t fmt); /* y[m,n] += x[m,k].w[k,n] */
+void     sh_dma_load_2d(uint32_t l1_off, uint64_t hbm, uint32_t rows, uint32_t cols, uint32_t ld);   /* HBM sub-block -> packed TCDM (2-D iDMA), DM core, sync */
+void     sh_dma_store_rows(uint64_t hbm, uint32_t l1_off, uint32_t rows, uint32_t cols, uint32_t ld); /* packed TCDM -> HBM sub-block (per-row 1-D), DM core, sync */
 void     sh_dma_copy(uint64_t dst, uint64_t src, uint32_t bytes);    /* 1-D, DM core, sync */
 
 /* ---- test helpers (on-device data generation + self-check, no host round trip) --------- */
@@ -99,8 +105,43 @@ void     sh_test_fill_const_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint3
 void     sh_test_fill_colparity_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t even, uint32_t odd);
 uint32_t sh_test_check_const_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t bits, uint32_t tol, const char *tag);
 uint32_t sh_test_check_const_l1_fp16(uint32_t off, uint32_t n, uint32_t bits, uint32_t tol, const char *tag);
-/* fp16 <-> fp32 on the host-side convention (IEEE binary16). */
+/* fp16 <-> fp32 on the host-side convention (IEEE binary16), software (any core, any target). */
 float    sh_fp16_to_f32(uint16_t h);
 uint16_t sh_f32_to_fp16(float f);
+
+/* Hardware fp16 <-> fp32 (Zfh register conversions). The gvsoc Snitch model's scalar flh/fsh are
+ * broken (docs/SIMULATOR_NOTES.md #2) but fcvt.s.h / fcvt.h.s between registers work: load the half
+ * with an integer lhu, NaN-box it into an FP register with fmv.w.x, convert; and back with
+ * fcvt.h.s (RNE) + fmv.x.w + sh. ~1 FPU op each instead of ~60 integer ops. Verified bit-exact
+ * against the software pair by tests/gvsoc/fp16cvt (NaN payloads excepted).
+ * sh_f2h returns the half in the LOW 16 bits; the high 16 bits are the NaN-box (0xFFFF), so store
+ * it through a uint16_t (one `sh`) or mask it. */
+static inline float sh_h2f(uint32_t h) {
+    float f;
+    __asm__ ("fmv.w.x %0, %1\n\tfcvt.s.h %0, %0" : "=f"(f) : "r"(h | 0xFFFF0000u));
+    return f;
+}
+static inline uint32_t sh_f2h(float f) {
+    uint32_t h; float t;
+    __asm__ ("fcvt.h.s %1, %2, rne\n\tfmv.x.w %0, %1" : "=r"(h), "=&f"(t) : "f"(f));
+    return h;
+}
+/* 4-wide variants: one asm block each, so the four independent fmv/fcvt chains are issued
+ * interleaved (the Snitch FPU model overlaps independent instructions but GCC schedules the
+ * dependent pairs back to back). p must hold 4 halves. */
+static inline void sh_h2f4(const uint16_t *p, float *a0, float *a1, float *a2, float *a3) {
+    const uint32_t h0 = p[0] | 0xFFFF0000u, h1 = p[1] | 0xFFFF0000u, h2 = p[2] | 0xFFFF0000u, h3 = p[3] | 0xFFFF0000u;
+    __asm__ ("fmv.w.x %0, %4\n\tfmv.w.x %1, %5\n\tfmv.w.x %2, %6\n\tfmv.w.x %3, %7\n\t"
+             "fcvt.s.h %0, %0\n\tfcvt.s.h %1, %1\n\tfcvt.s.h %2, %2\n\tfcvt.s.h %3, %3"
+             : "=&f"(*a0), "=&f"(*a1), "=&f"(*a2), "=&f"(*a3) : "r"(h0), "r"(h1), "r"(h2), "r"(h3));
+}
+static inline void sh_f2h4(uint16_t *p, float a0, float a1, float a2, float a3) {
+    uint32_t h0, h1, h2, h3; float t0, t1, t2, t3;
+    __asm__ ("fcvt.h.s %4, %8, rne\n\tfcvt.h.s %5, %9, rne\n\tfcvt.h.s %6, %10, rne\n\tfcvt.h.s %7, %11, rne\n\t"
+             "fmv.x.w %0, %4\n\tfmv.x.w %1, %5\n\tfmv.x.w %2, %6\n\tfmv.x.w %3, %7"
+             : "=&r"(h0), "=&r"(h1), "=&r"(h2), "=&r"(h3), "=&f"(t0), "=&f"(t1), "=&f"(t2), "=&f"(t3)
+             : "f"(a0), "f"(a1), "f"(a2), "f"(a3));
+    p[0] = (uint16_t)h0; p[1] = (uint16_t)h1; p[2] = (uint16_t)h2; p[3] = (uint16_t)h3;
+}
 
 #endif /* SH_OPS_H */

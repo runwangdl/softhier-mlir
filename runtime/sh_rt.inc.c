@@ -58,3 +58,5 @@ uint16_t sh_f32_to_fp16(float f) {
     if (rem > 0x1000 || (rem == 0x1000 && (r & 1))) r++;
     return s | r;
 }
+/* Core-local cycle counter: the mcycle CSR reads the gvsoc clock, so several regions can be timed in one run. */
+uint32_t sh_cycles(void) { uint32_t c; asm volatile("csrr %0, mcycle" : "=r"(c)); return c; }

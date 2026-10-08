@@ -21,11 +21,23 @@ import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-SH = Path(os.environ.get("SOFTHIER_HOME", "/app/install/softhier"))
+SHARED_HOME = Path("/app/install/softhier")   # the machine-wide install every other simulation reads
+SH = Path(os.environ.get("SOFTHIER_HOME", str(SHARED_HOME)))
 CHROOT = os.environ.get("SOFTHIER_CHROOT", "/opt/x86-ort/run")
 SRC_GEN = SH / "soft_hier" / "flex_cluster"
 PULP_GEN = SH / "pulp" / "pulp" / "chips" / "flex_cluster"
 INST_GEN = SH / "install" / "generators" / "pulp" / "chips" / "flex_cluster"
+
+
+def set_home(path: str | Path) -> Path:
+    """Switch the SoftHier checkout used by build_sw/run_sim/apply_arch (same as SOFTHIER_HOME,
+    but at run time). Architecture sweeps must point this at a private copy of the install."""
+    global SH, SRC_GEN, PULP_GEN, INST_GEN
+    SH = Path(path).resolve()
+    SRC_GEN = SH / "soft_hier" / "flex_cluster"
+    PULP_GEN = SH / "pulp" / "pulp" / "chips" / "flex_cluster"
+    INST_GEN = SH / "install" / "generators" / "pulp" / "chips" / "flex_cluster"
+    return SH
 
 PERF_RE = re.compile(r"\[Performance Counter\]: Execution period is (\d+) ns")
 
@@ -94,7 +106,13 @@ class Arch:
 
 def apply_arch(arch: Arch, verbose: bool = False) -> None:
     """Write the arch into the three generator copies + regenerate the C header.
-    GVSoC imports install/generators/..., the SDK includes the generated header."""
+    GVSoC imports install/generators/..., the SDK includes the generated header.
+
+    Refuses to touch the shared install (every simulation on the machine reads it at launch)
+    unless SOFTHIER_ALLOW_SHARED_APPLY=1: use set_home() / SOFTHIER_HOME on a private copy."""
+    if SH.resolve() == SHARED_HOME.resolve() and os.environ.get("SOFTHIER_ALLOW_SHARED_APPLY") != "1":
+        raise RuntimeError(f"apply_arch on the shared install {SH} would change the architecture under every "
+                           "running simulation; point SOFTHIER_HOME / set_home() at a private copy")
     (SRC_GEN / "flex_cluster_arch.py").write_text(arch.to_py())
     for dst in (PULP_GEN, INST_GEN):
         dst.mkdir(parents=True, exist_ok=True)
@@ -150,21 +168,38 @@ def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
     env["PYTHONPATH"] = f"{SH}/install/python:{SH}/soft_hier/flex_cluster_utilities:" + env.get("PYTHONPATH", "")
     if ideal_hbm:
         env["SOFTHIER_IDEAL_HBM"] = "1"
-    cmd = [str(SH / "install" / "bin" / "gvsoc"), "--target=pulp.chips.flex_cluster.flex_cluster",
-           f"--binary={elf}", "run"] + [f"--trace={t}" for t in traces]
+    # --work-dir: gapy writes gvsoc_config.json (which names the binary) into the work dir and runs
+    # from there. Without it every run shares $SOFTHIER_HOME/gvsoc_config.json and two concurrent
+    # simulations (several agents, or threads) silently run each other's ELF.
+    work = Path(elf).resolve().parent
+    # SOFTHIER_MODEL_DIR: an extra model directory searched BEFORE install/models (the engine takes
+    # the first include dir that has the .so), so a run can pin e.g. one RedMulE model build while
+    # the shared install is being rebuilt by someone else. This replicates install/bin/gvsoc.
+    inst = SH / "install"
+    env["LD_LIBRARY_PATH"] = f"{inst}/lib:" + env["LD_LIBRARY_PATH"]
+    env["PATH"] = f"{inst}/bin:" + env.get("PATH", "")
+    model_dirs = [d for d in os.environ.get("SOFTHIER_MODEL_DIR", "").split(":") if d]
+    # Fixed Snitch integer-core model (fp->int `nseq` tags, see docs/SIMULATOR_NOTES.md #10) built next to
+    # the stock models: used by default when present. SOFTHIER_STOCK_MODELS=1 forces the stock model.
+    if (inst / "models_fix").is_dir() and not os.environ.get("SOFTHIER_STOCK_MODELS"):
+        model_dirs.append(str(inst / "models_fix"))
+    model_dirs.append(str(inst / "models"))
+    cmd = [str(inst / "bin" / "gapy"), "--platform=gvsoc", f"--target-dir={inst}/generators"] + \
+          [f"--model-dir={d}" for d in model_dirs] + ["--target=pulp.chips.flex_cluster.flex_cluster",
+           f"--binary={elf}", f"--work-dir={work}", "run"] + [f"--trace={t}" for t in traces]
     if preload is not None:
         cmd += ["--preload", str(Path(preload).resolve())]
     t0 = time.time()
     if log is None:
-        r = subprocess.run(cmd, cwd=SH, env=env, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, cwd=Path(elf).parent, env=env, capture_output=True, text=True, timeout=timeout)
         out = r.stdout + r.stderr
     else:
         with open(log, "w") as lf:
-            r = subprocess.run(cmd, cwd=SH, env=env, stdout=lf, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+            r = subprocess.run(cmd, cwd=Path(elf).parent, env=env, stdout=lf, stderr=subprocess.STDOUT, text=True, timeout=timeout)
         out = Path(log).read_text()
-    m = PERF_RE.search(out)
-    return {"ok": r.returncode == 0 and m is not None, "returncode": r.returncode,
-            "roi_ns": int(m.group(1)) if m else None, "wall_s": round(time.time() - t0, 1), "stdout": out}
+    rois = [int(v) for v in PERF_RE.findall(out)]   # one entry per sh_timer_end()
+    return {"ok": r.returncode == 0 and bool(rois), "returncode": r.returncode,
+            "roi_ns": rois[0] if rois else None, "rois": rois, "wall_s": round(time.time() - t0, 1), "stdout": out}
 
 
 def measure(app_dir: str | Path, arch: Arch | None = None, apply: bool = False, **run_kw) -> dict:

@@ -16,17 +16,18 @@ int main(void) {
         sh_test_fill_fp16(be, 1, C, C, 14, -4, 4, 0.25f);
     }
     sh_barrier_global();
-    if (sh_cluster_id() == 0 && sh_is_first_core()) sh_timer_start();
-    sh_layernorm(ln, x, g, be, R, C, C, 1e-5f, CLUSTER);
-    sh_softmax_rows(sm, x, R, C, C, 0.5f, CLUSTER);
-    sh_gelu(ge, x, R, C, C, CLUSTER);
-    sh_add(ad, x, b, R, C, C, CLUSTER);
-    sh_add_bias(bi, x, be, R, C, C, CLUSTER);
-    sh_scale(sc, x, R, C, C, 0.3f, CLUSTER);
-    sh_transpose(tr, x, R, C, C, R, CLUSTER);
+    const int lead = (sh_cluster_id() == 0 && sh_is_first_core());
+    /* one ROI per op: every sh_timer_end() prints a period and restarts the timer */
+    if (lead) sh_timer_start();
+    sh_layernorm(ln, x, g, be, R, C, C, 1e-5f, CLUSTER);      if (lead) sh_timer_end();
+    sh_softmax_rows(sm, x, R, C, C, 0.5f, CLUSTER);           if (lead) sh_timer_end();
+    sh_gelu(ge, x, R, C, C, CLUSTER);                         if (lead) sh_timer_end();
+    sh_add(ad, x, b, R, C, C, CLUSTER);                       if (lead) sh_timer_end();
+    sh_add_bias(bi, x, be, R, C, C, CLUSTER);                 if (lead) sh_timer_end();
+    sh_scale(sc, x, R, C, C, 0.3f, CLUSTER);                  if (lead) sh_timer_end();
+    sh_transpose(tr, x, R, C, C, R, CLUSTER);                 if (lead) sh_timer_end();
     sh_barrier_global();
-    if (sh_cluster_id() == 0 && sh_is_first_core()) {
-        sh_timer_end();
+    if (lead) {
         sh_test_dump_samples(ln, R, C, C, 101, NSAMPLES, "LN");
         sh_test_dump_samples(sm, R, C, C, 102, NSAMPLES, "SM");
         sh_test_dump_samples(ge, R, C, C, 103, NSAMPLES, "GELU");
