@@ -122,6 +122,33 @@ def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: in
     return ok
 
 
+def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers: int = 1, nsamples: int = 64) -> bool:
+    """Frontend -> softhier-translate -> gvsoc, compared against the same numpy reference as `siglip`."""
+    from softhier_mlir.frontend import siglip
+    from softhier_mlir.testing import lcg, siglip_ref
+    app = HERE / "mlir_app"
+    mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples)
+    (app / "siglip.mlir").write_text(mlir)
+    (app / "main.c").write_text(lower_and_translate(app / "siglip.mlir", None))
+    build_sw(app)
+    r = run_sim(timeout=7200)
+    ref = siglip_ref.layer_reference(seq, d, ff, heads)
+    got = lcg.parse_samples(r["stdout"])
+    ok = r["ok"]
+    print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[sh_"):
+            print("     " + ln)
+    for tag, arr in ref.items():
+        if tag not in got:
+            continue
+        bad, maxerr = lcg.compare_samples(got[tag], arr, atol=0.05, rtol=0.05, show=2)
+        print(f"     {tag:<4} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
+        ok &= bad == 0
+    (app / "last_run.log").write_text(r["stdout"])
+    return ok
+
+
 # passes each example needs (none = already in the softhier dialect)
 EXAMPLE_PASSES = {
     "gemm512_linalg.mlir": "linalg-to-softhier",
@@ -167,7 +194,8 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip"])
+    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip", "siglip-mlir"])
+    ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--d", type=int, default=768)
     ap.add_argument("--ff", type=int, default=3072)
@@ -187,6 +215,8 @@ if __name__ == "__main__":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0")
     elif a.test == "siglip":
         ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0")
+    elif a.test == "siglip-mlir":
+        ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers)
     else:
         ok = run_mlir(a.files, a.passes)
     sys.exit(0 if ok else 1)

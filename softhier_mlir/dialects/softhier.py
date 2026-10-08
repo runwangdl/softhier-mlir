@@ -14,6 +14,7 @@ Target: xDSL >= 0.69.
 from __future__ import annotations
 
 from xdsl.dialects.builtin import (
+    FloatAttr,
     IndexType,
     IntegerAttr,
     MemRefType,
@@ -296,6 +297,102 @@ class L1BufferOp(IRDLOperation):
     assembly_format = "attr-dict `:` type($result)"
 
 
+
+# --------------------------------------------------------------------------- #
+# HBM tensor ops (fp16, row-major, strided views allowed). These lower 1:1 to the
+# softhier-ops library (runtime/sh_ops.h). Optional attribute on every one of them:
+#   cluster = <i32>   executing cluster, -1 = split over all clusters (SH_ALL); default 0
+# --------------------------------------------------------------------------- #
+@irdl_op_definition
+class ViewOp(IRDLOperation):
+    """A strided sub-view of an HBM buffer. The result type carries the layout:
+    ``memref<rows x cols x f16, strided<[ld, 1], offset: elems>, "hbm_*">`` where the
+    offset is in elements from the source buffer's base."""
+    name = "softhier.view"
+    src = operand_def(MemRefType)
+    result = result_def(MemRefType)
+    assembly_format = "$src attr-dict `:` type($src) `->` type($result)"
+
+
+@irdl_op_definition
+class LayerNormOp(IRDLOperation):
+    """``y = layernorm(x) * gamma + beta`` over the last dim (gamma/beta are 1 x cols)."""
+    name = "softhier.layernorm"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    gamma = operand_def(MemRefType)
+    beta = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    eps = prop_def(FloatAttr)
+    assembly_format = "$x `,` $gamma `,` $beta `->` $y attr-dict `:` type($x) `,` type($gamma) `,` type($beta) `->` type($y)"
+
+
+@irdl_op_definition
+class SoftmaxOp(IRDLOperation):
+    """``y = softmax(scale * x)`` per row (in place allowed)."""
+    name = "softhier.softmax"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    scale = prop_def(FloatAttr)
+    assembly_format = "$x `->` $y attr-dict `:` type($x) `->` type($y)"
+
+
+@irdl_op_definition
+class GeluOp(IRDLOperation):
+    """``y = gelu(x)`` (tanh approximation)."""
+    name = "softhier.gelu"
+    x = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    assembly_format = "$x `->` $y attr-dict `:` type($x) `->` type($y)"
+
+
+@irdl_op_definition
+class AddOp(IRDLOperation):
+    """``y = a + b`` elementwise."""
+    name = "softhier.add"
+    a = operand_def(MemRefType)
+    b = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    assembly_format = "$a `,` $b `->` $y attr-dict `:` type($a) `,` type($b) `->` type($y)"
+
+
+@irdl_op_definition
+class AddBiasOp(IRDLOperation):
+    """``y = x + bias`` with ``bias`` a 1 x cols row broadcast over rows."""
+    name = "softhier.add_bias"
+    x = operand_def(MemRefType)
+    bias = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    assembly_format = "$x `,` $bias `->` $y attr-dict `:` type($x) `,` type($bias) `->` type($y)"
+
+
+@irdl_op_definition
+class HbmFillLcgOp(IRDLOperation):
+    """Test input: fill with ``scale * randint(lo, hi)`` from the runtime's LCG(seed); the host
+    regenerates the same data with softhier_mlir.testing.lcg.fill_fp16."""
+    name = "softhier.hbm_fill_lcg"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
+    seed = prop_def(IntegerAttr)
+    lo = prop_def(IntegerAttr)
+    hi = prop_def(IntegerAttr)
+    scale = prop_def(FloatAttr)
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
+@irdl_op_definition
+class DumpSamplesOp(IRDLOperation):
+    """Test output: print ``n`` fp16 codes at LCG(seed) positions as ``<tag> r c hex`` lines."""
+    name = "softhier.dump_samples"
+    irdl_options = (ParsePropInAttrDict(),)
+    buf = operand_def(MemRefType)
+    seed = prop_def(IntegerAttr)
+    n = prop_def(IntegerAttr)
+    tag = prop_def(StringAttr)
+    assembly_format = "$buf attr-dict `:` type($buf)"
+
+
 SoftHier = Dialect(
     "softhier",
     [
@@ -318,6 +415,14 @@ SoftHier = Dialect(
         HbmFillOp,
         HbmFillColParityOp,
         HbmCheckConstOp,
+        ViewOp,
+        LayerNormOp,
+        SoftmaxOp,
+        GeluOp,
+        AddOp,
+        AddBiasOp,
+        HbmFillLcgOp,
+        DumpSamplesOp,
     ],
     [],
 )

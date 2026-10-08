@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -105,27 +106,40 @@ def apply_arch(arch: Arch, verbose: bool = False) -> None:
                    cwd=SH, check=True, capture_output=not verbose)
 
 
-def build_sw(app_dir: str | Path, arch: Arch | None = None, verbose: bool = False) -> Path:
-    """Compile an SDK app dir (CMakeLists.txt + sources) into sw_build/softhier.elf."""
+def build_sw(app_dir: str | Path, arch: Arch | None = None, verbose: bool = False,
+             build_dir: str | Path | None = None) -> Path:
+    """Compile an SDK app dir (CMakeLists.txt + sources) into <build_dir>/softhier.elf.
+
+    Replicates the SDK's `make sw` but in a private build directory, so several builds and
+    simulations can run concurrently (default: $SOFTHIER_BUILD_DIR, else a per-process dir
+    under the scratch root). The RISC-V toolchain is x86-64 only: it runs inside the chroot."""
     arch = arch or Arch()
     march = "rv32imafdv_zfh" if arch.spatz_attaced_core_list else "rv32imafd_zfh"
+    bdir = Path(build_dir or os.environ.get("SOFTHIER_BUILD_DIR") or
+                Path(tempfile.gettempdir()) / f"shbuild_{os.getpid()}").resolve()
+    shutil.rmtree(bdir, ignore_errors=True)
+    bdir.mkdir(parents=True)
     inner = (f"export PATH={SH}/third_party/toolchain/install/bin:/usr/local/bin:$PATH; "
-             f"cd {SH} && CMAKE=cmake make sw app={Path(app_dir).resolve()} "
-             f"arch_cmake_arg=-DRISCV_ARCH={march}")
+             f"cd {bdir} && cmake -DSRC_DIR={Path(app_dir).resolve()} -DRISCV_ARCH={march} "
+             f"{SH}/soft_hier/flex_cluster_sdk/ && make")
     cmd = [CHROOT, "bash", "-c", inner] if CHROOT else ["bash", "-c", inner]
     r = subprocess.run(cmd, capture_output=True, text=True)
-    elf = SH / "sw_build" / "softhier.elf"
+    elf = bdir / "softhier.elf"
     if r.returncode != 0 or not elf.exists():
         raise RuntimeError("SW build failed:\n" + r.stdout[-3000:] + r.stderr[-3000:])
     if verbose:
         print(r.stdout[-500:])
+    build_sw.last_elf = elf
     return elf
+
+
+build_sw.last_elf = None
 
 
 def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
             ideal_hbm: bool = True) -> dict:
     """Run gvsoc; returns ok/roi_ns/wall_s/stdout. ok = exited 0 and printed a ROI."""
-    elf = elf or (SH / "sw_build" / "softhier.elf")
+    elf = elf or build_sw.last_elf or (SH / "sw_build" / "softhier.elf")
     env = dict(os.environ)
     env["SYSTEMC_HOME"] = str(SH / "third_party" / "systemc_install")
     env["LD_LIBRARY_PATH"] = f"{SH}/third_party/systemc_install/lib64:" + env.get("LD_LIBRARY_PATH", "")

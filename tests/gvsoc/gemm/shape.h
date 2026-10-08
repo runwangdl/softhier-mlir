@@ -8,4 +8,3 @@
 #define ACCUMULATE 0
 #define CLUSTER 0
 #define NSAMPLES 256
-#define REAL_DATA 1
