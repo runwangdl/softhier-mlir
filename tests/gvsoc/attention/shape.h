@@ -3,4 +3,4 @@
 #define N_HEADS 12
 #define CLUSTER SH_ALL
 #define NSAMPLES 256
-#define COMPOSED 0
+#define COMPOSED 1

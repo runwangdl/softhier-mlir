@@ -155,15 +155,16 @@ def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: in
 
 
 def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers: int = 1, nsamples: int = 64, fused: bool = False,
-                    trace: Path | None = None, tiles: str = "model") -> bool:
+                    trace: Path | None = None, tiles: str = "model", hbm_split: bool = False) -> bool:
     """Frontend -> softhier-translate -> gvsoc, compared against the same numpy reference as `siglip`.
     trace: also record the RedMulE / iDMA / barrier activity (gvsoc --trace) into this log, for
-    `python -m softhier_mlir.sim.trace <log> --png ...`. tiles: the frontend's GEMM tile policy."""
+    `python -m softhier_mlir.sim.trace <log> --png ...`. tiles: the frontend's GEMM tile policy.
+    hbm_split: parameters in HBM node 1, activations in node 0."""
     from softhier_mlir.frontend import siglip
     from softhier_mlir.testing import lcg, siglip_ref
     app = HERE / "mlir_app"
     mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples,
-                       fused_attention=fused, tiles=tiles)
+                       fused_attention=fused, tiles=tiles, hbm_split=hbm_split)
     (app / "siglip.mlir").write_text(mlir)
     (app / "main.c").write_text(lower_and_translate(app / "siglip.mlir", None))
     build_sw(app)
@@ -171,7 +172,8 @@ def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers:
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"]
-    print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} attention={'fused' if fused else 'per-head'} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    print(f"{'PASS' if ok else 'FAIL'} siglip-mlir S={seq} D={d} F={ff} H={heads} L={layers} cluster={cluster} attention={'fused' if fused else 'per-head'} "
+          f"tiles={tiles} hbm_split={hbm_split} roi={r['roi_ns']} ns (the ROI includes the sample dumps; see the marks) wall={r['wall_s']}s")
     for ln in r["stdout"].splitlines():
         if ln.startswith("[sh_") or ln.startswith("[mark]"):
             print("     " + ln)
@@ -250,8 +252,10 @@ def parse_marks(stdout: str) -> dict[str, int]:
     out, prev, acc = {}, None, 0
     for ln in stdout.splitlines():
         if ln.startswith("[mark] "):
-            _, tag, c = ln.split()
-            c = int(c)
+            m = re.match(r"\[mark\] (\w+) (\d+)$", ln)   # a gvsoc trace line can be glued to the mark (--trace runs)
+            if not m:
+                continue
+            tag, c = m.group(1), int(m.group(2))
             if prev is not None:
                 acc += (c - prev) % (1 << 32)
             prev = c
@@ -507,6 +511,7 @@ if __name__ == "__main__":
     ap.add_argument("--fused", action="store_true", help="siglip-mlir: use the fused softhier.attention op")
     ap.add_argument("--trace", help="siglip-mlir: record the RedMulE/iDMA/barrier activity into this log (softhier_mlir.sim.trace)")
     ap.add_argument("--tiles", default="model", help="siglip-mlir: GEMM tile policy, 'model' (softhier_mlir.dse.tiling) or 'tm,tn,tk'")
+    ap.add_argument("--hbm-split", action="store_true", help="siglip-mlir: parameters in HBM node 1, activations in node 0")
     a = ap.parse_args()
     if a.cluster is None:
         a.cluster = "all" if a.test == "smolvla" else "0"
@@ -527,7 +532,7 @@ if __name__ == "__main__":
                            extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "siglip-mlir":
         ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused,
-                             trace=Path(a.trace) if a.trace else None, tiles=a.tiles)
+                             trace=Path(a.trace) if a.trace else None, tiles=a.tiles, hbm_split=a.hbm_split)
     elif a.test == "preload":
         ok = run_preload(wait=not a.no_wait)
     elif a.test == "smolvla":

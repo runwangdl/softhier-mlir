@@ -9,8 +9,9 @@
  *   q [sq,dh] | k [S,dh] | kT [dh,S] | s [sq,S] | v [S,dh] | o [sq,dh] | sum [sq] fp32 | profile stamps
  *
  *   DM core   : 2-D DMA loads of k_h, v_h (once per head), k_h -> k_h^T in L1 as dh element-granular 2-D
- *               DMA transfers (one per kT row, ~1 cycle/element; the in-core loop is 3x slower because the
- *               cluster is instruction-fetch bound), q block load, ZOMEM clear of the two RedMulE outputs
+ *               DMA transfers (one per kT row, ~1 cycle/element: the staging phase of a 256 x 64 head is
+ *               18.4 k cycles, 30.9 k with the in-core loop of SH_ATTN_KT_DMA=0, because the cluster is
+ *               instruction-fetch bound), q block load, ZOMEM clear of the two RedMulE outputs
  *   first core: RedMulE  s[sq,S]  += q[sq,dh] . kT[dh,S]       config(sq, dh, S)
  *   all cores : rows dealt round-robin: s_i <- 2^(s2 s_i - m_i) in fp16 SIMD (m_i = s2 max_j s_ij,
  *               s2 = scale log2 e), sum_i in fp32; the normalisation is deferred to the sq x dh output

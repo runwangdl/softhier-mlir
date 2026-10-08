@@ -14,13 +14,24 @@ import sys
 
 
 class _Emitter:
-    def __init__(self, space: str = "hbm_west") -> None:
+    HBM_NODE = 0x04000000   # bytes per HBM node (ARCH_HBM_NODE_ADDR_SPACE): offset // HBM_NODE selects the node / edge port
+
+    def __init__(self, space: str = "hbm_west", param_base: int | None = None) -> None:
+        """param_base: HBM offset where parameters are allocated (None: together with the activations).
+        Each HBM node has its own NoC edge port, so weights in another node than the activations double
+        the HBM->TCDM bandwidth the HBM-bound GEMMs see (docs/DSE.md, attention and tiling section)."""
         self.lines: list[str] = []
         self.next_off = 0
+        self.param_off = param_base
         self.n = 0
         self.space = space
 
-    def buf(self, name: str, rows: int, cols: int) -> str:
+    def buf(self, name: str, rows: int, cols: int, param: bool = False) -> str:
+        if param and self.param_off is not None:
+            off = self.param_off
+            self.param_off += (rows * cols * 2 + 4095) & ~4095
+            self.lines.append(f'    %{name} = softhier.hbm_buffer {{offset = {off} : i32}} : memref<{rows}x{cols}xf16, "{self.space}">')
+            return f"memref<{rows}x{cols}xf16, \"{self.space}\">"
         off = self.next_off
         self.next_off += (rows * cols * 2 + 4095) & ~4095
         self.lines.append(f'    %{name} = softhier.hbm_buffer {{offset = {off} : i32}} : memref<{rows}x{cols}xf16, "{self.space}">')
@@ -58,14 +69,16 @@ def attention_q_block(seq: int, dh: int, heads: int, cluster: int) -> int:
 
 def emit(seq: int, d: int, ff: int, heads: int, layers: int = 1, cluster: int = -1,
          test: bool = True, dumps: tuple[str, ...] = ("X", "LN1", "Q", "K", "KT", "P0", "V", "O", "H", "G", "OUT"),
-         nsamples: int = 64, fused_attention: bool = False, tiles: str | None = "model", marks: bool = True) -> str:
+         nsamples: int = 64, fused_attention: bool = False, tiles: str | None = "model", marks: bool = True,
+         hbm_split: bool = False) -> str:
     """`fused_attention=True` emits one `softhier.attention` op (work items of q_block rows per head inside one
     cluster's TCDM, see attention_q_block) instead of the K transpose + per-head gemm / softmax / gemm through
     HBM; the kT / sc buffers and the KT / P0 dumps then do not exist. `tiles` is the GEMM tile policy
     (gemm_tile_attrs). `marks` adds `softhier.mark` stamps start / attn<L> / layer<L> (cluster 0 prints them;
-    tests/gvsoc/run.py turns them into per-segment ms)."""
+    tests/gvsoc/run.py turns them into per-segment ms). `hbm_split` puts the parameters in HBM node 1 (offset 64 MB)
+    and the activations in node 0, so a GEMM streams X and W through two edge ports."""
     dh = d // heads
-    e = _Emitter()
+    e = _Emitter(param_base=_Emitter.HBM_NODE if hbm_split else None)
     T: dict[str, str] = {}
     cl = f"cluster = {cluster} : i32"
     if fused_attention:
@@ -75,8 +88,8 @@ def emit(seq: int, d: int, ff: int, heads: int, layers: int = 1, cluster: int = 
         if marks:
             e.op(f'softhier.mark {{tag = "{tag}"}}')
 
-    def B(name, rows, cols):
-        T[name] = e.buf(name, rows, cols)
+    def B(name, rows, cols, param=False):
+        T[name] = e.buf(name, rows, cols, param)
         return name
 
     def fill(name, seed, lo, hi, scale):
@@ -103,7 +116,7 @@ def emit(seq: int, d: int, ff: int, heads: int, layers: int = 1, cluster: int = 
             (f"b1{L}", 1, ff, 12 + s0, -4, 4, 0.0625), (f"b2{L}", 1, d, 13 + s0, -4, 4, 0.0625),
             (f"g1{L}", 1, d, 14 + s0, 2, 6, 0.25), (f"be1{L}", 1, d, 15 + s0, -4, 4, 0.125),
             (f"g2{L}", 1, d, 16 + s0, 2, 6, 0.25), (f"be2{L}", 1, d, 17 + s0, -4, 4, 0.125)]:
-            B(nm, r, c)
+            B(nm, r, c, param=True)
             fill(nm, seed, lo, hi, scale)
 
     gem = lambda tm, tn, tk: f"tile_m = {tm} : i32, tile_n = {tn} : i32, tile_k = {tk} : i32, pipeline"  # noqa: E731
@@ -175,9 +188,10 @@ def main() -> None:
     ap.add_argument("--fused", action="store_true", help="fused softhier.attention instead of per-head gemm/softmax/gemm")
     ap.add_argument("--tiles", default="model", help="GEMM tile policy: 'model' (dse.tiling), 'tm,tn,tk', or 'default' (256^3)")
     ap.add_argument("--no-marks", action="store_true", help="no softhier.mark timing stamps")
+    ap.add_argument("--hbm-split", action="store_true", help="parameters in HBM node 1 (offset 64 MB), activations in node 0: two edge ports")
     a = ap.parse_args()
     sys.stdout.write(emit(a.seq, a.d, a.ff, a.heads, a.layers, a.cluster, not a.no_test, fused_attention=a.fused,
-                          tiles=None if a.tiles == "default" else a.tiles, marks=not a.no_marks))
+                          tiles=None if a.tiles == "default" else a.tiles, marks=not a.no_marks, hbm_split=a.hbm_split))
 
 
 if __name__ == "__main__":
