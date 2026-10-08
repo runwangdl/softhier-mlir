@@ -393,9 +393,21 @@ class DumpSamplesOp(IRDLOperation):
     assembly_format = "$buf attr-dict `:` type($buf)"
 
 
+@irdl_op_definition
+class MarkOp(IRDLOperation):
+    """Timing probe: cluster 0 prints ``[mark] <tag> <mcycle>`` (the global clock is 1 GHz, so the
+    difference between two marks is the simulated time in ns; the host unwraps the 32-bit counter).
+    Place it after an op that ends with a global barrier."""
+    name = "softhier.mark"
+    irdl_options = (ParsePropInAttrDict(),)
+    tag = prop_def(StringAttr)
+    assembly_format = "attr-dict"
+
+
 SoftHier = Dialect(
     "softhier",
     [
+        MarkOp,
         HbmBufferOp,
         L1BufferOp,
         RedmuleOp,

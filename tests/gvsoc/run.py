@@ -149,6 +149,43 @@ def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers:
     return ok
 
 
+def run_preload(offsets=(0x1000, 70 << 20, 200 << 20), rows: int = 64, cols: int = 96, nsamples: int = 64) -> bool:
+    """HBM preload: three fp16 matrices at the given HBM byte offsets (spanning several HBM nodes)
+    go in through `--preload`; the program only dumps samples of them, the host compares."""
+    from softhier_mlir.sim.preload import make_preload_elf
+    from softhier_mlir.testing import lcg
+    app = HERE / "mlir_app"
+    rng = np.random.default_rng(7)
+    arrays = {off: (rng.standard_normal((rows, cols)) * 2).astype(np.float16) for off in offsets}
+    elf = make_preload_elf(app / "preload.elf", arrays)
+    lines, dumps = [], []
+    for i, off in enumerate(offsets):
+        t = f'memref<{rows}x{cols}xf16, "hbm_west">'
+        lines.append(f"    %b{i} = softhier.hbm_buffer {{offset = {off} : i32}} : {t}")
+        dumps.append(f'    softhier.dump_samples %b{i} {{seed = {300 + i} : i32, n = {nsamples} : i32, tag = "P{i}"}} : {t}')
+    body = "\n".join(lines + ['    softhier.mark {tag = "t0"}'] + dumps + ['    softhier.mark {tag = "t1"}'])
+    mlir = f"builtin.module {{\n  func.func @preload_test() {{\n{body}\n    func.return\n  }}\n}}\n"
+    (app / "preload.mlir").write_text(mlir)
+    (app / "main.c").write_text(lower_and_translate(app / "preload.mlir", None))
+    build_sw(app)
+    r = run_sim(preload=elf)
+    got = lcg.parse_samples(r["stdout"])
+    marks = [ln for ln in r["stdout"].splitlines() if ln.startswith("[mark]")]
+    ok = r["ok"]
+    print(f"{'PASS' if ok else 'FAIL'} preload {len(offsets)} arrays ({elf.stat().st_size} B elf) roi={r['roi_ns']} ns wall={r['wall_s']}s marks={marks}")
+    for i, off in enumerate(offsets):
+        tag = f"P{i}"
+        if tag not in got:
+            print(f"     {tag} @0x{off:x} MISSING"); ok = False; continue
+        bad, maxerr = lcg.compare_samples(got[tag], arrays[off].astype(np.float32), atol=0, rtol=0, show=3)
+        print(f"     {tag} @0x{off:08x} samples={len(got[tag])} bad={bad} maxerr={maxerr} {'PASS' if bad == 0 else 'FAIL'}")
+        ok &= bad == 0
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    (app / "last_run.log").write_text(r["stdout"])
+    return ok
+
+
 # passes each example needs (none = already in the softhier dialect)
 EXAMPLE_PASSES = {
     "gemm512_linalg.mlir": "linalg-to-softhier",
@@ -194,7 +231,7 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip", "siglip-mlir"])
+    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip", "siglip-mlir", "preload"])
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--d", type=int, default=768)
@@ -217,6 +254,8 @@ if __name__ == "__main__":
         ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0")
     elif a.test == "siglip-mlir":
         ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers)
+    elif a.test == "preload":
+        ok = run_preload()
     else:
         ok = run_mlir(a.files, a.passes)
     sys.exit(0 if ok else 1)

@@ -26,6 +26,7 @@ int      sh_is_dm_core(void);           /* data-mover core: all iDMA */
 uint32_t sh_num_clusters(void);
 void     sh_timer_start(void);          /* global timer: call from ONE core only */
 void     sh_timer_end(void);
+uint32_t sh_cycles(void);               /* this core's mcycle (1 GHz: 1 cycle = 1 ns; wraps every 4.29 s) */
 void     sh_eoc(uint32_t val);
 void     sh_printf(const char *fmt, ...);
 uint64_t sh_hbm_addr(uint64_t byte_offset);   /* HBM base + offset */

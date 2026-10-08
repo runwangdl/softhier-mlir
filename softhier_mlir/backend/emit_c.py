@@ -23,6 +23,7 @@ from softhier_mlir.dialects.softhier import (
     GeluOp,
     HbmFillLcgOp,
     LayerNormOp,
+    MarkOp,
     SoftmaxOp,
     TransposeOp,
     ViewOp,
@@ -265,6 +266,9 @@ def emit_kernel(fn: func.FuncOp, bufs: _Buffers) -> str:
 
         elif isinstance(op, GroupBarrierOp):
             b("    sh_barrier_global();")
+
+        elif isinstance(op, MarkOp):
+            b(f"    if (sh_cluster_id() == 0 && sh_is_first_core()) sh_printf(\"[mark] %s %u\\n\", \"{op.tag.data}\", sh_cycles());")
 
         else:
             b(f"    // (unhandled op: {op.name})")

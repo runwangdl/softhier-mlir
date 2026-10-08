@@ -15,6 +15,7 @@ int      sh_is_dm_core(void)      { return flex_is_dm_core() != 0; }
 uint32_t sh_num_clusters(void)    { return ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y; }
 void     sh_timer_start(void)     { flex_timer_start(); }
 void     sh_timer_end(void)       { flex_timer_end(); }
+uint32_t sh_cycles(void)          { uint32_t c; __asm__ volatile("csrr %0, mcycle" : "=r"(c)); return c; }
 void     sh_eoc(uint32_t v)       { flex_eoc(v); }
 uint64_t sh_hbm_addr(uint64_t o)  { return hbm_addr(o); }
 uint64_t sh_hbm_malloc(uint32_t b){ return (uint64_t)(uintptr_t)flex_hbm_malloc(b); }
