@@ -133,10 +133,133 @@ int main(void) {
                 if (k0 != fy[i] || r0 != fz[i]) badC++; if (k1 != fy[i + 1] || r1 != fz[i + 1]) badC++; if (k2 != fy[i + 2] || r2 != fz[i + 2]) badC++; if (k3 != fy[i + 3] || r3 != fz[i + 3]) badC++;
                 if (k4 != fy[i + 4] || r4 != fz[i + 4]) badC++; if (k5 != fy[i + 5] || r5 != fz[i + 5]) badC++; if (k6 != fy[i + 6] || r6 != fz[i + 6]) badC++; if (k7 != fy[i + 7] || r7 != fz[i + 7]) badC++;
             }
-            sh_printf("[fp16cvt] fp->int hazard probe (8 independent chains): floor bad=%u exp2i bad=%u pure-fp-round bad=%u\n", badA, badB, badC);
-            bad += badA + badB + badC;
+            sh_printf("[fp16cvt] fp->int hazard probe (8 independent chains): floor bad=%u (known gvsoc hazard, SIMULATOR_NOTES #6) exp2i bad=%u pure-fp-round bad=%u\n", badA, badB, badC);
+            bad += badB + badC;   /* the fcvt.w.s -> fcvt.s.w pair is known-broken in the model; the library avoids it */
+            /* 7. TCDM access cost (ROI #8..#10): word copy; 2x2 transpose micro-tiles with 256 B and 260 B pitch */
+            volatile uint32_t *wx = (volatile uint32_t *)sh_l1_addr(0x10000), *wy = (volatile uint32_t *)sh_l1_addr(0x20000);
+            sh_timer_start();
+            for (uint32_t i = 0; i < 4096; ++i) wy[i] = wx[i];
+            sh_timer_end();
+            {
+                const uint16_t *ts = (const uint16_t *)sh_l1_addr(0x10000); uint16_t *td = (uint16_t *)sh_l1_addr(0x30000);
+                sh_timer_start();
+                for (uint32_t r = 0; r < 64; r += 2) {
+                    const uint32_t *s0 = (const uint32_t *)(ts + r * 128), *s1 = (const uint32_t *)(ts + (r + 1) * 128); uint32_t *d0 = (uint32_t *)(td + r);
+                    for (uint32_t c = 0; c < 128; c += 2) { const uint32_t w0 = s0[c >> 1], w1 = s1[c >> 1]; d0[(c * 128) >> 1] = (w0 & 0xFFFFu) | (w1 << 16); d0[((c + 1) * 128) >> 1] = (w0 >> 16) | (w1 & 0xFFFF0000u); }
+                }
+                sh_timer_end();
+                sh_timer_start();
+                for (uint32_t r = 0; r < 64; r += 2) {
+                    const uint32_t *s0 = (const uint32_t *)(ts + r * 130), *s1 = (const uint32_t *)(ts + (r + 1) * 130); uint32_t *d0 = (uint32_t *)(td + r);
+                    for (uint32_t c = 0; c < 128; c += 2) { const uint32_t w0 = s0[c >> 1], w1 = s1[c >> 1]; d0[(c * 130) >> 1] = (w0 & 0xFFFFu) | (w1 << 16); d0[((c + 1) * 130) >> 1] = (w0 >> 16) | (w1 & 0xFFFF0000u); }
+                }
+                sh_timer_end();
+            }
+        }
+        /* 9. Xfvec fp16 SIMD (4 halves per 64-bit FP register, fld/fsd + .word encodings, pinned regs):
+         *    vfadd.h vfmul.h vfmul.r.h vfmac.h vfmax.h vfcpka.h.s vfcpkb.h.s, lane bits vs the scalar path;
+         *    then ROI #17: y = 0.3 x over 4096 halves with vfmul.r.h (compare with ROI #3, the scalar 8-wide). */
+        {
+            #define XV(f7, rs2, rs1, f3, rd) (((f7) << 25) | ((rs2) << 20) | ((rs1) << 15) | ((f3) << 12) | ((rd) << 7) | 0x33)
+            typedef union { double d; uint16_t h[4]; float f[2]; } v4h;
+            uint32_t vb_add = 0, vb_mul = 0, vb_mulr = 0, vb_mac = 0, vb_mac1 = 0, vb_max = 0, vb_cpk = 0;
+            const uint16_t s_h = sh_f32_to_fp16(0.3f);
+            for (uint32_t i = 0; i < 4096; i += 4) {
+                v4h a, b, c, r;
+                a.d = *(const double *)(const uint16_t *)(x + i); b.d = *(const double *)(const uint16_t *)(x + ((i + 4) & 4095));
+                c.d = *(const double *)(const uint16_t *)(x + ((i + 8) & 4095));
+                register double fa0 __asm__("fa0") = a.d; register double fa1 __asm__("fa1") = b.d; register double fa2 __asm__("fa2");
+                /* vfadd.h fa2, fa0, fa1 */
+                __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x41, 11, 10, 2, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                for (int l = 0; l < 4; ++l) if (r.h[l] != sh_f32_to_fp16(sh_fp16_to_f32(a.h[l]) + sh_fp16_to_f32(b.h[l]))) vb_add++;
+                /* vfmul.h fa2, fa0, fa1 */
+                __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x43, 11, 10, 2, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                for (int l = 0; l < 4; ++l) if (r.h[l] != sh_f32_to_fp16(sh_fp16_to_f32(a.h[l]) * sh_fp16_to_f32(b.h[l]))) vb_mul++;
+                /* vfmul.r.h fa2, fa0, fa1 (lane 0 of fa1 replicated) */
+                { v4h sv; sv.h[0] = s_h; sv.h[1] = 0; sv.h[2] = 0; sv.h[3] = 0; fa1 = sv.d; }
+                __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x43, 11, 10, 6, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                for (int l = 0; l < 4; ++l) if (r.h[l] != sh_f32_to_fp16(sh_fp16_to_f32(a.h[l]) * 0.3f)) vb_mulr++;
+                /* vfmac.h fa2, fa0, fa1 : fa2 += fa0 * fa1, fa2 preloaded with c */
+                fa1 = b.d; fa2 = c.d;
+                __asm__ volatile (".word %1" : "+f"(fa2) : "i"(XV(0x48, 11, 10, 2, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                for (int l = 0; l < 4; ++l) {
+                    uint16_t w = sh_f32_to_fp16(sh_fp16_to_f32(c.h[l]) + sh_fp16_to_f32(a.h[l]) * sh_fp16_to_f32(b.h[l]));
+                    int d = (int)r.h[l] - (int)w; if (d < 0) d = -d; if (d > 1) vb_mac++; else if (d == 1) vb_mac1++;
+                }
+                /* vfmax.h fa2, fa0, fa1 */
+                __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x46, 11, 10, 2, 12)), "f"(fa0), "f"(fa1)); r.d = fa2;
+                for (int l = 0; l < 4; ++l) { float p = sh_fp16_to_f32(a.h[l]), q = sh_fp16_to_f32(b.h[l]); if (r.h[l] != (p > q ? a.h[l] : b.h[l])) vb_max++; }
+                /* vfcpka.h.s fa2, fa0(f32), fa1(f32) -> lanes 0,1 ; vfcpkb.h.s -> lanes 2,3 */
+                {
+                    float g0 = sh_fp16_to_f32(a.h[0]) * 1.5f + 0.25f, g1 = sh_fp16_to_f32(a.h[1]) * 1.5f + 0.25f;
+                    float g2 = sh_fp16_to_f32(a.h[2]) * 1.5f + 0.25f, g3 = sh_fp16_to_f32(a.h[3]) * 1.5f + 0.25f;
+                    register float fa3 __asm__("fa3") = g0; register float fa4 __asm__("fa4") = g1;
+                    register double fa5 __asm__("fa5");
+                    __asm__ volatile (".word %1" : "=f"(fa5) : "i"(XV(0x58, 14, 13, 2, 15)), "f"(fa3), "f"(fa4));
+                    fa3 = g2; fa4 = g3;
+                    __asm__ volatile (".word %1" : "+f"(fa5) : "i"(XV(0x58, 14, 13, 6, 15)), "f"(fa3), "f"(fa4));
+                    r.d = fa5;
+                    if (r.h[0] != sh_f32_to_fp16(g0) || r.h[1] != sh_f32_to_fp16(g1) || r.h[2] != sh_f32_to_fp16(g2) || r.h[3] != sh_f32_to_fp16(g3)) vb_cpk++;
+                }
+            }
+            sh_printf("[fp16cvt] xfvec probe: add bad=%u mul bad=%u mul.r bad=%u mac bad=%u (1ulp %u) max bad=%u cpk bad=%u\n",
+                      vb_add, vb_mul, vb_mulr, vb_mac, vb_mac1, vb_max, vb_cpk);
+            bad += vb_add + vb_mul + vb_mulr + vb_mac + vb_max + vb_cpk;
+            /* timed: y = 0.3 x with vfmul.r.h, 4 elements per fld/.word/fsd */
+            { v4h sv; sv.h[0] = s_h; sv.h[1] = 0; sv.h[2] = 0; sv.h[3] = 0;
+              register double fa1 __asm__("fa1") = sv.d;
+              const double *xd = (const double *)(const uint16_t *)x; double *yd = (double *)(uint16_t *)y;
+              sh_timer_start();
+              for (uint32_t i = 0; i < 1024; ++i) {
+                  register double fa0 __asm__("fa0") = xd[i]; register double fa2 __asm__("fa2");
+                  __asm__ volatile (".word %1" : "=f"(fa2) : "i"(XV(0x43, 11, 10, 6, 12)), "f"(fa0), "f"(fa1));
+                  yd[i] = fa2;
+              }
+              sh_timer_end();
+              uint32_t vb_t = 0;
+              for (uint32_t i = 0; i < 4096; ++i) if (y[i] != sh_f32_to_fp16(sh_fp16_to_f32(x[i]) * 0.3f)) vb_t++;
+              sh_printf("[fp16cvt] xfvec timed scale loop: bad=%u\n", vb_t); bad += vb_t;
+            }
+            #undef XV
         }
         sh_printf("FP16CVT_%s\n", (bad_h2f | bad_f2h | bad) ? "FAIL" : "PASS");
+    }
+    sh_barrier_global();
+    /* 8. core scaling on cluster 0 (ROI #11..#16): each loop timed with 1 core running, then with all
+     *    3 cores running it concurrently (core 0 times, barriers around). Loops: tight (fits the 32 B
+     *    fetch line), straight-line integer (64 adds), 8-wide fp16 scale kernel over 4096 elements. */
+    if (sh_cluster_id() == 0) {
+        const uint32_t cid = sh_core_id();
+        volatile uint32_t *sink = (volatile uint32_t *)sh_l1_addr(0x40000 + cid * 64);
+        volatile uint16_t *px = (volatile uint16_t *)sh_l1_addr(0x50000 + cid * 0x4000), *py = (volatile uint16_t *)sh_l1_addr(0x60000 + cid * 0x4000);
+        for (uint32_t i = 0; i < 4096; ++i) px[i] = 0x3c00 + (uint16_t)i;
+        for (int ncores = 1; ncores <= 3; ncores += 2) {
+            const int run = cid < (uint32_t)ncores;
+            sh_barrier_cluster(); if (cid == 0) sh_timer_start();
+            if (run) { uint32_t acc = 0; for (uint32_t i = 0; i < 16384; ++i) acc += i ^ (acc << 1); *sink = acc; }
+            sh_barrier_cluster(); if (cid == 0) sh_timer_end();
+            sh_barrier_cluster(); if (cid == 0) sh_timer_start();
+            if (run) {
+                uint32_t a0 = 1, a1 = 2, a2 = 3, a3 = 4;
+                for (uint32_t i = 0; i < 1024; ++i) {
+                    #define S4 a0 += a1 ^ i; a1 += a2 ^ i; a2 += a3 ^ i; a3 += a0 ^ i;
+                    S4 S4 S4 S4 S4 S4 S4 S4 S4 S4 S4 S4 S4 S4 S4 S4
+                    #undef S4
+                }
+                *sink = a0 + a1 + a2 + a3;
+            }
+            sh_barrier_cluster(); if (cid == 0) sh_timer_end();
+            sh_barrier_cluster(); if (cid == 0) sh_timer_start();
+            if (run) {
+                for (uint32_t i = 0; i < 4096; i += 8) {
+                    float a0, a1, a2, a3, b0, b1, b2, b3;
+                    sh_h2f4((const uint16_t *)px + i, &a0, &a1, &a2, &a3); sh_h2f4((const uint16_t *)px + i + 4, &b0, &b1, &b2, &b3);
+                    a0 *= 0.3f; a1 *= 0.3f; a2 *= 0.3f; a3 *= 0.3f; b0 *= 0.3f; b1 *= 0.3f; b2 *= 0.3f; b3 *= 0.3f;
+                    sh_f2h4((uint16_t *)py + i, a0, a1, a2, a3); sh_f2h4((uint16_t *)py + i + 4, b0, b1, b2, b3);
+                }
+            }
+            sh_barrier_cluster(); if (cid == 0) sh_timer_end();
+        }
     }
     sh_barrier_global();
     sh_eoc(0);
