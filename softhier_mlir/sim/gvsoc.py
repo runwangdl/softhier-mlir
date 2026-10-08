@@ -157,7 +157,7 @@ build_sw.last_elf = None
 
 
 def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
-            ideal_hbm: bool = True, preload: Path | None = None, log: Path | None = None) -> dict:
+            ideal_hbm: bool = True, preload: Path | None = None, log: Path | None = None, program_output_only: bool = False) -> dict:
     """Run gvsoc; returns ok/roi_ns/wall_s/stdout. ok = exited 0 and printed a ROI.
 
     preload: an HBM preload ELF (softhier_mlir.sim.preload.make_preload_elf); the chip's
@@ -203,7 +203,11 @@ def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
     else:
         with open(log, "w") as lf:
             r = subprocess.run(cmd, cwd=Path(elf).parent, env=env, stdout=lf, stderr=subprocess.STDOUT, text=True, timeout=timeout)
-        out = Path(log).read_text()
+        if program_output_only:     # traced runs: the log can be GBs; keep the program's own lines (trace lines cut out)
+            from softhier_mlir.sim.trace import program_lines
+            out = "".join(program_lines(log))
+        else:
+            out = Path(log).read_text()
     rois = [int(v) for v in PERF_RE.findall(out)]   # one entry per sh_timer_end()
     return {"ok": r.returncode == 0 and bool(rois), "returncode": r.returncode,
             "roi_ns": rois[0] if rois else None, "rois": rois, "wall_s": round(time.time() - t0, 1), "stdout": out}

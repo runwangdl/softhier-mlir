@@ -359,7 +359,8 @@ def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_step
     m("down")
 
 
-def _activations(P: _Prog):
+def _activations(P: _Prog, S: int = S):
+    """activation buffers of S action rows (the chunk; 50 by default)"""
     for nm, r, c in [("x", S, AD), ("e", S, D), ("e1", S, D), ("h", S, D), ("xn", S, D), ("qkv", S, DQ + 2 * DKV), ("o", S, DQ),
                      ("ao", S, D), ("gu", S, 2 * FF), ("f2", S, D), ("fin", S, D), ("vt", S, AD)]:
         P.B(nm, r, c)
@@ -501,7 +502,8 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
 
 def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, fmt_steps: list[str] | None = None,
               profile: bool = False, dumps: tuple[str, ...] = ("X",), nsamples: int = 64, tiles=TILES,
-              kv_base: int | None = None, kv_stride: int = KV_STRIDE, s_pad: int = S_PAD, num_steps: int = STEPS) -> tuple[str, dict]:
+              kv_base: int | None = None, kv_stride: int = KV_STRIDE, s_pad: int = S_PAD, num_steps: int = STEPS,
+              chunk: int | None = None) -> tuple[str, dict]:
     """Step 2/3: the flow loop: the first `steps` steps of the `num_steps` Euler schedule (dt = -1/num_steps, time table
     row s). Returns (mlir, preload). layers must be even (self/cross pairs).
     Prefix KV: read in the VLM prefix program's layout (frontend.smolvla emit_vlm): layer L keys at
@@ -511,34 +513,47 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     dumps: X (x_t after every step, all 1600 elements), A (final actions), EMB / H / O (step-loop intermediates, sampled,
     tagged with step*16+layer so the host can pick step 0). fmt_steps: per-step RedMulE format of every weight GEMM
     inside the step loop (R4's experiment hook; fp8 steps are plumbing only, the operands stay fp16 in memory).
-    profile: a mark after every op group of every layer (per-op timing breakdown)."""
+    profile: a mark after every op group of every layer (per-op timing breakdown).
+    The prefix length is the token-class row's (p_tok [1, Lp]): 241 for the 3-camera 512 x 512 prefix, any other
+    (e.g. 65 / 97 for 1 / 3 cameras at 256 x 256, frontend.smolvla_e2e) reads the first Lp rows of each KV block."""
     data = np.load(npz) if isinstance(npz, (str, Path)) else npz
     W = {k[2:]: data[k] for k in data if k.startswith("p_")}
+    lp = int(W["tok"].shape[1])
+    rows = int(W["x0"].shape[0])           # the action chunk: chunk_size 50, or fewer rows (x0 / RoPE tables cut to `chunk`)
+    if chunk is not None and chunk != rows:
+        assert chunk < rows, (chunk, rows)
+        for k in ("x0", "rq_self", "rq_cross"):
+            W[k] = np.ascontiguousarray(W[k][:chunk])
+        rows = chunk
+    if rows != S:      # tm of every chunk-row GEMM follows the chunk (the self layers' own keys are causal, so a chunk of
+        tiles = {k: ((rows,) + tuple(v[1:])) if v[0] == S else v for k, v in tiles.items()}   # c rows == the first c rows of 50)
+    if lp != LP and tiles.get("kv", (LP,))[0] == LP:
+        tiles = {**tiles, "kv": (lp,) + tuple(tiles["kv"][1:])}
     assert layers % 2 == 0 and layers <= LAYERS      # layers == 0: the step tail only (debugging)
     assert steps <= num_steps
     if fmt_steps is not None:
         assert len(fmt_steps) == steps, (len(fmt_steps), steps)
     P = _Prog(cluster, nsamples)
     T, op = P.T, P.op
-    _activations(P)
+    _activations(P, rows)
     for nm in ("x0", "wa", "ba", "wti", "tb", "wto", "bto", "gf", "wout", "bout", "rq_self", "rq_cross"):
         P.B(nm, *W[nm].shape, W[nm])
-    P.B("tok", 1, LP, W["tok"].astype(np.uint16), elem="i16")
-    P.B("zero", S, AD, np.zeros((S, AD), np.float16))
+    P.B("tok", 1, lp, W["tok"].astype(np.uint16), elem="i16")
+    P.B("zero", rows, AD, np.zeros((rows, AD), np.float16))
     # the prefix KV region (VLM layout)
     if kv_base is None:
         kv_base = P.e.next_off
         for L in range(LAYERS):
-            kpad = np.zeros((s_pad, DKV), np.float16); kpad[:LP] = W[f"kp{L}"]
-            vpad = np.zeros((s_pad, DKV), np.float16); vpad[:LP] = W[f"vp{L}"]
+            kpad = np.zeros((s_pad, DKV), np.float16); kpad[:lp] = W[f"kp{L}"]
+            vpad = np.zeros((s_pad, DKV), np.float16); vpad[:lp] = W[f"vp{L}"]
             P.pre[kv_base + L * kv_stride] = kpad
             P.pre[kv_base + L * kv_stride + s_pad * DKV * 2] = vpad
         P.e.next_off = kv_base + LAYERS * kv_stride
-    T["kp_s"] = T["kp_c"] = T["vp_s"] = T["vp_c"] = f'memref<{LP}x{DKV}xf16, "{P.sp}">'
+    T["kp_s"] = T["kp_c"] = T["vp_s"] = T["vp_c"] = f'memref<{lp}x{DKV}xf16, "{P.sp}">'
     # parameter slabs: one per (self, cross) pair at a constant stride; the cross layer's projected KV lives in the slab too
     SELF = [("wqkv", D, DQ + 2 * DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D)]
     CROSS = [("wq", D, DQ), ("wkx", DKV, DKV), ("wvx", DKV, DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D),
-             ("kx", LP, DKV), ("vx", LP, DKV)]
+             ("kx", lp, DKV), ("vx", lp, DKV)]
     pair0, stride = {}, 0
     for p in range(layers // 2):
         begin = P.e.next_off
