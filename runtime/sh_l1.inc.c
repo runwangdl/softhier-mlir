@@ -38,3 +38,12 @@ void sh_dma_copy(uint64_t dst, uint64_t src, uint32_t bytes) {
     if (flex_is_dm_core()) { bare_dma_start_1d(dst, src, bytes); bare_dma_wait_all(); }
     flex_intra_cluster_sync();
 }
+/* Raw iDMA entry points for micro-benchmarks and hand-written kernels (DM core, synchronous). */
+void sh_dma_load_2d(uint32_t l1_off, uint64_t hbm, uint32_t rows, uint32_t cols, uint32_t ld) {
+    if (flex_is_dm_core()) { sh_load_block_async(l1_off, hbm, rows, cols, ld); bare_dma_wait_all(); }
+    flex_intra_cluster_sync();
+}
+void sh_dma_store_rows(uint64_t hbm, uint32_t l1_off, uint32_t rows, uint32_t cols, uint32_t ld) {
+    if (flex_is_dm_core()) sh_store_block_sync(hbm, l1_off, rows, cols, ld);
+    flex_intra_cluster_sync();
+}

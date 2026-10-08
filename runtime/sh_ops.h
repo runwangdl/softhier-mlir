@@ -27,6 +27,7 @@ uint32_t sh_num_clusters(void);
 void     sh_timer_start(void);          /* global timer: call from ONE core only */
 void     sh_timer_end(void);
 void     sh_eoc(uint32_t val);
+uint32_t sh_cycles(void);               /* this core's cycle counter (mcycle CSR = the gvsoc clock) */
 void     sh_printf(const char *fmt, ...);
 uint64_t sh_hbm_addr(uint64_t byte_offset);   /* HBM base + offset */
 uint64_t sh_hbm_malloc(uint32_t bytes);       /* first core of each cluster only (SDK allocator) */
@@ -79,6 +80,8 @@ void     sh_l1_fill_fp16(uint32_t off, uint32_t n, uint16_t bits);
 void     sh_l1_relu_fp16(uint32_t off, uint32_t n);
 void     sh_l1_add_fp16(uint32_t dst, uint32_t src, uint32_t n);     /* dst += src */
 void     sh_redmule(uint32_t x, uint32_t w, uint32_t y, uint32_t m, uint32_t n, uint32_t k, uint32_t fmt); /* y[m,n] += x[m,k].w[k,n] */
+void     sh_dma_load_2d(uint32_t l1_off, uint64_t hbm, uint32_t rows, uint32_t cols, uint32_t ld);   /* HBM sub-block -> packed TCDM (2-D iDMA), DM core, sync */
+void     sh_dma_store_rows(uint64_t hbm, uint32_t l1_off, uint32_t rows, uint32_t cols, uint32_t ld); /* packed TCDM -> HBM sub-block (per-row 1-D), DM core, sync */
 void     sh_dma_copy(uint64_t dst, uint64_t src, uint32_t bytes);    /* 1-D, DM core, sync */
 
 /* ---- test helpers (on-device data generation + self-check, no host round trip) --------- */

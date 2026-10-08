@@ -24,8 +24,12 @@ int main(void) {
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
         sh_printf("[gemm] %ux%ux%u tile %ux%ux%u pipeline=%d acc=%d cluster=%s l1=%u B\n", M, N, K, TILE_M ? TILE_M : 256, TILE_N ? TILE_N : 256, TILE_K ? TILE_K : 256,
                   PIPELINE, ACCUMULATE, CLUSTER == SH_ALL ? "all" : "0", sh_gemm_l1_bytes(M, N, K, &cfg));
-        sh_timer_start();
     }
+    /* The printf and the timer register share the slow virtual interconnect: starting the timer
+     * right after a printf lands the start stamp late and shortens the ROI (256^3: 9.9 us instead
+     * of 14.7 us). Drain with a barrier first. */
+    sh_barrier_global();
+    if (sh_cluster_id() == 0 && sh_is_first_core()) sh_timer_start();
     int rc = sh_gemm(x, w, z, M, N, K, K, N, N, &cfg, CLUSTER);
     sh_barrier_global();
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
