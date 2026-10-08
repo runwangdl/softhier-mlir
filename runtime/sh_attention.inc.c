@@ -34,16 +34,7 @@
 #endif
 #define SH_ATTN_NPROF 8u   /* phase cycle stamps (first core, mcycle) kept in TCDM behind the row sums */
 
-static inline float sh_h2f(uint16_t h) {                       /* fp16 bits -> fp32 */
-    float f; uint32_t box = 0xFFFF0000u | h;                   /* NaN-boxed half */
-    asm volatile("fmv.w.x %0, %1\n\tfcvt.s.h %0, %0" : "=f"(f) : "r"(box));
-    return f;
-}
-static inline uint32_t sh_f2h(float f) {                       /* fp32 -> fp16 bits (RNE), upper 16 bits undefined */
-    uint32_t r; float t;
-    asm volatile("fcvt.h.s %0, %2, rne\n\tfmv.x.w %1, %0" : "=&f"(t), "=r"(r) : "f"(f));
-    return r;
-}
+/* sh_h2f / sh_f2h: the hardware Zfh register conversions from sh_ops.h */
 static inline float sh_fbits(uint32_t bits) { float f; asm volatile("fmv.w.x %0, %1" : "=f"(f) : "r"(bits)); return f; }
 static inline uint32_t sh_bitsf(float f) { uint32_t b; asm volatile("fmv.x.w %0, %1" : "=r"(b) : "f"(f)); return b; }
 static inline float sh_fmax(float a, float b) { float r; asm("fmax.s %0, %1, %2" : "=f"(r) : "f"(a), "f"(b)); return r; }
