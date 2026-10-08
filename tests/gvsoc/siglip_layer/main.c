@@ -2,7 +2,8 @@
  * sampled outputs compared on the host against numpy (softhier_mlir/testing/siglip_ref.py).
  *   h   = x + Wo(attn(LN1(x)))      attn: per head softmax(q k^T / sqrt(dh)) v
  *   out = h + W2(gelu(W1(LN2(h))))
- * Weights are [in, out] (X . W convention), biases are rows. shape.h: SEQ D_MODEL D_FF N_HEADS CLUSTER NSAMPLES */
+ * Weights are [in, out] (X . W convention), biases are rows. shape.h: SEQ D_MODEL D_FF N_HEADS CLUSTER NSAMPLES HBM_START
+ * [SH_PRELOAD]: the LCG inputs are preloaded by the host (run.py mirrors the ALLOC layout below) or generated here. */
 #include "sh_ops.h"
 #include "shape.h"
 
@@ -31,7 +32,7 @@ static void scan_p0(uint64_t p, uint32_t rows, uint32_t cols, const char *when) 
 int main(void) {
     sh_init();
     const uint32_t S = SEQ, D = D_MODEL, F = D_FF, H = N_HEADS;
-    uint64_t next_buf = sh_hbm_addr(0);
+    uint64_t next_buf = sh_hbm_addr(HBM_START);
     /* activations */
     const uint64_t x = ALLOC(S * D * 2), ln1 = ALLOC(S * D * 2), q = ALLOC(S * D * 2), k = ALLOC(S * D * 2), v = ALLOC(S * D * 2);
     const uint64_t kT = ALLOC(D * S * 2), sc = ALLOC(H * S * S * 2), o = ALLOC(S * D * 2), ao = ALLOC(S * D * 2), h = ALLOC(S * D * 2);
@@ -42,6 +43,9 @@ int main(void) {
     const uint64_t bq = ALLOC(D * 2), bk = ALLOC(D * 2), bv = ALLOC(D * 2), bo = ALLOC(D * 2), b1 = ALLOC(F * 2), b2 = ALLOC(D * 2);
     const uint64_t g1 = ALLOC(D * 2), be1 = ALLOC(D * 2), g2 = ALLOC(D * 2), be2 = ALLOC(D * 2);
     const int lead = (sh_cluster_id() == 0 && sh_is_first_core());
+#ifdef SH_PRELOAD
+    sh_preload_wait(sh_hbm_addr(SH_PRELOAD));
+#else
     if (lead) {
         sh_test_fill_fp16(x, S, D, D, 1, -16, 16, 0.125f);
         sh_test_fill_fp16(wq, D, D, D, 2, -8, 8, 1.0f / 128); sh_test_fill_fp16(wk, D, D, D, 3, -8, 8, 1.0f / 128);
@@ -54,6 +58,7 @@ int main(void) {
         sh_test_fill_fp16(g2, 1, D, D, 16, 2, 6, 0.25f); sh_test_fill_fp16(be2, 1, D, D, 17, -4, 4, 0.125f);
     }
     sh_barrier_global();
+#endif
     if (lead) sh_timer_start();
 
     sh_gemm_cfg big = { .tm = 256, .tn = 256, .tk = 256, .pipeline = 1, .accumulate = 0, .fmt = SH_FP16, .l1_base = 0 };
