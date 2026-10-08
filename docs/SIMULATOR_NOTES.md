@@ -64,6 +64,12 @@ parameters are allocated at a constant stride) and one over the heads, which kee
 program at ~50 KB for any depth or sequence length. `tests/gvsoc/run.py smolvla` prints the
 program size; `--unroll` is for 1-2 layers of debugging with the layer-1 intermediate dumps.
 
+Host memory: `gvsoc_launcher` holds ~850 MB RSS for the full SmolVLA run (166 MB image, 16
+clusters, seq 1024) and this host has 7 GB for every agent's simulations together; when the
+kernel OOM-kills it the streamed log simply stops mid-line, `run_sim` returns `ok=False` with
+`roi=None` and no error text (`dmesg | grep oom-kill` shows it). `run.py smolvla --from-log`
+still evaluates every tensor the run got to.
+
 Timing probe: `softhier.mark {tag}` prints `[mark] tag <mcycle>` from cluster 0 (clock 1 GHz,
 so cycle deltas are ns; the counter is 32-bit and wraps every 4.29 s, `tests/gvsoc/run.py`
 unwraps it). The ROI timer (`[Performance Counter]`) starts after `sh_init`, i.e. after the preload.
