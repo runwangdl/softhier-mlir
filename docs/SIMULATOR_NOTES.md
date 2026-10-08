@@ -253,3 +253,66 @@ see slightly different fp16 GEMM outputs (siglip accuracy: OUT maxerr 0.0283 -> 
 Host load from other jobs was 7-9 (10 cores) during all measurements. The remaining wall time is
 the rest of the platform (Snitch ISS, iDMA/NoC/TCDM models), not RedMulE arithmetic: with
 `REDMULE_NO_NEON=1` the 512x768x768 run takes 13.2 s, with NEON 10.4 s.
+
+## Host speed of the Snitch ISS (patch `gvsoc_iss_host_speed.patch`, `install/models_fast/`, 2026-10-08)
+
+With RedMulE vectorised, gdb sampling of `gvsoc_launcher` (60 stacks of the engine thread during
+`siglip-mlir --cluster all`) put the host time of the platform in the Snitch core model, on the
+path every offloaded FP instruction takes (integer core -> FPU sequencer -> FP subsystem -> response):
+
+| share | where | why |
+|---|---|---|
+| 37 % | `iss_insn_s::operator=`, `std::string::_M_assign`, `OffloadReq::operator=` | `iss_insn_t` (~900 B, eight `std::string` arg names + a vector) copied by value up to 12x per FP instruction: `Iss::handle_req` 3x, `sequencer::req/gen_entry/write_entry/read_entry/offload_event` 6x, `snitch_fp_ss.cpp` `handle_notif/get_latency/handle_event/acc_rsp` 5x |
+| 32 % | `sprintf`, `__vfprintf_internal`, `iss_trace_dump_insn` | `snitch_fp_ss.cpp` formatted the full instruction trace (`iss_trace_save_args` + `iss_trace_dump`) for every instruction and then dropped the string because `insn_trace` is inactive (in the optim build it cannot even be activated) |
+| 5 % | `strstr` | up to 26 `strstr(label, ...)` per instruction: `int_offload_exec` on *every* integer instruction, `fp_offload_exec`, `handle_result`, `get_latency` |
+| 26 % | `Exec::exec_instr`, `ClockEngine`, sequencer logic, FPU emulation | the model itself |
+
+The patch (header lists every change; all marked `[SoftHier-fast]`) is behaviour-neutral: the arg
+name becomes an interned `const char *` (only `csr_decode` sets it, only the trace reads it), the
+label predicates are evaluated once per decoded instruction and cached in the instruction
+(`iss_insn_label_class`), the instruction is copied once per stage (core -> request, request ->
+ring buffer, ring buffer -> sequencer output, -> FP subsystem; the response carries a pointer), and
+the FP-subsystem trace work is guarded by `trace.insn_trace.get_active()` exactly like the integer
+core's `iss_exec_insn_with_trace`. After the patch the engine thread spends its time in the model
+proper (`Exec::exec_instr`/prefetcher 25 %, sequencer 22 %, the four remaining `memcpy`s 21 %,
+FP-subsystem offload 17 %, engine/NoC 10 %).
+
+Build / install: the three libraries (`gen_isa_snitch_rv32imfdva_cpp_60335333`, `gen_isa_snitch_fp_ss_rv32imfdva_cpp_61161152`, `pulp/snitch/sequencer`) share the `iss_insn_t` / `OffloadReq` /
+`OffloadRsp` layout and must come from one build. `tools/iss_fast/gen_makefile.py` writes a Makefile
+that compiles a private copy of `core/models/cpu/iss` + `sequencer.cpp` (`/app/iss_fast`, patched with
+the pending / zfh / nseq fixes and this patch, generated ISA tables from `install/models_fix` and
+`build/core`) with the exact flags and object lists of the shared build tree, optim and debug, and
+installs them under `install/models_fast/` (+ `debug/`). `softhier_mlir/sim/gvsoc.py` searches
+`models_fast`, then `models_fix`, then `models`; `SOFTHIER_STOCK_MODELS=1` skips both patched
+directories, `SOFTHIER_MODEL_DIR` still goes first.
+
+Verification (`tests/gvsoc/run.py`, same ELFs, before = `models_fix` + `models`, after = `models_fast`;
+host shared with other agents' simulations, load average 5-12 during "before" and 18-23 during "after",
+so the wall times understate the gain; the CPU time of build+simulation is listed too):
+
+| run (`tests/gvsoc/run.py`) | ROI ns before = after | wall before (load 5-12) | wall before, rerun (load 18-22) | wall after (load 19-23) | CPU s before / after (rerun, build+sim) |
+|---|---|---|---|---|---|
+| `gemm --shapes 256x256x256` | 14739 | 2.5 | 4.5 | 3.6 | 56.7 / 33.6 (both shapes) |
+| `gemm 1024x3072x768:256,256,256,1,0,all` | 520521 | 30.0 | 47.6 | 14.0 | " |
+| `rowops --rows 256 --cols 768 --cluster all` | 508504 | 17.4 | 16.8 | 10.2 | 25.4 / 17.4 |
+| `siglip-mlir --seq 256 --cluster all` | 4782253 | 170.1 | 106.9 | 28.1 | 112.1 / 42.6 |
+| `attention --cluster 0` | 26819562 | 43.5 | 56.7 | 8.1 | 58.0 / 20.2 |
+| `mlir examples/*.mlir`: 8 small examples | all identical | 17.3 (sum) | 20.7 | 22.9 | 458.8 / 214.0 (all 9) |
+| `mlir examples/siglip_encoder_layer.mlir` | 17851422 | 447.5 | 424.7 | 174.5 | " |
+
+Every ROI (and every sampled tensor / checksum) is identical; the Snitch-bound runs are 2.4-7x
+faster in wall time and 1.7-2.9x in CPU time (the CPU time includes the unchanged ELF build in the
+x86 chroot, ~10-15 s per case, and the RedMulE/NoC/memory models). The GEMM runs profit from the
+integer-core part of the change (`int_offload_exec` ran four `strstr` per integer instruction).
+
+Traced debug run (`gemm 256x256x256` with `--trace=cluster_0/pe0/insn --trace=cluster_0/fp_ss0/insn`,
+i.e. the debug libraries, previous set vs `models_fast/debug`): the first 300 MB of simulator output
+are byte-identical (1 448 009 lines, 105 516 FP-subsystem instruction dumps with register values,
+CSR names such as `misa`/`mhartid` in the integer-core dumps). Do not ask the wrapper for more traces
+than that on this host: `fpu_sequencer0/trace` is LEVEL_TRACE spam and a five-trace run of the same
+ELF wrote 45 GB before it was stopped.
+
+Two caveats for anyone measuring the host speed again: a `gdb -p` sampling loop stops the simulator
+for ~1 s per attach (a sampled `attention` run took 41 s, unsampled 8 s), and the host was at times
+out of memory (OOM kills of other agents' `gvsoc_launcher`s in `dmesg`); one sampled `siglip-mlir`
+run under those conditions ended without a ROI and passed on every unsampled repeat.
