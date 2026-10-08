@@ -82,13 +82,33 @@ def run_rowops(rows: int, cols: int, cluster: str, nsamples: int = 64) -> bool:
     }
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"] and "ROWOPS_DONE" in r["stdout"]
-    print(f"{'PASS' if ok else 'FAIL'} rowops {rows}x{cols} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    per_op = dict(zip(["LN", "SM", "GELU", "ADD", "BIAS", "SCALE", "T"], r["rois"]))   # one timer_end per op
+    total = sum(r["rois"])
+    print(f"{'PASS' if ok else 'FAIL'} rowops {rows}x{cols} cluster={cluster} roi={total} ns wall={r['wall_s']}s")
+    print("     per-op ns: " + "  ".join(f"{k}={v}" for k, v in per_op.items()))
     for tag, arr in ref.items():
         if tag not in got:
             print(f"     {tag:<6} MISSING"); ok = False; continue
         bad, maxerr = lcg.compare_samples(got[tag], arr, atol=2e-2, rtol=2e-2)
         print(f"     {tag:<6} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
         ok &= bad == 0
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
+
+
+def run_fp16cvt() -> bool:
+    """Hardware (Zfh register) fp16<->fp32 conversion vs the software converters, plus a timing of both."""
+    app = HERE / "fp16cvt"
+    build_sw(app)
+    r = run_sim()
+    ok = r["ok"] and "FP16CVT_PASS" in r["stdout"]
+    print(f"{'PASS' if ok else 'FAIL'} fp16cvt wall={r['wall_s']}s")
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[fp16cvt]") or ln.startswith("h2f") or ln.startswith("f2h"):
+            print("     " + ln)
+    if len(r["rois"]) >= 2:
+        print(f"     timed loop: software {r['rois'][0]} ns, hardware {r['rois'][1]} ns ({r['rois'][0] / max(r['rois'][1], 1):.1f}x)")
     if not r["ok"]:
         print(r["stdout"][-1500:])
     return ok
@@ -194,7 +214,7 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip", "siglip-mlir"])
+    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir"])
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--d", type=int, default=768)
@@ -213,6 +233,8 @@ if __name__ == "__main__":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
     elif a.test == "rowops":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0")
+    elif a.test == "fp16cvt":
+        ok = run_fp16cvt()
     elif a.test == "siglip":
         ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0")
     elif a.test == "siglip-mlir":

@@ -98,8 +98,24 @@ void     sh_test_fill_const_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint3
 void     sh_test_fill_colparity_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t even, uint32_t odd);
 uint32_t sh_test_check_const_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t bits, uint32_t tol, const char *tag);
 uint32_t sh_test_check_const_l1_fp16(uint32_t off, uint32_t n, uint32_t bits, uint32_t tol, const char *tag);
-/* fp16 <-> fp32 on the host-side convention (IEEE binary16). */
+/* fp16 <-> fp32 on the host-side convention (IEEE binary16), software (any core, any target). */
 float    sh_fp16_to_f32(uint16_t h);
 uint16_t sh_f32_to_fp16(float f);
+
+/* Hardware fp16 <-> fp32 (Zfh register conversions). The gvsoc Snitch model's scalar flh/fsh are
+ * broken (docs/SIMULATOR_NOTES.md #2) but fcvt.s.h / fcvt.h.s between registers work: load the half
+ * with an integer lhu, NaN-box it into an FP register with fmv.w.x, convert; and back with
+ * fcvt.h.s (RNE) + fmv.x.w + sh. ~1 FPU op each instead of ~60 integer ops. Verified bit-exact
+ * against the software pair by tests/gvsoc/fp16cvt (NaN payloads excepted). */
+static inline float sh_h2f(uint32_t h) {
+    float f;
+    __asm__ ("fmv.w.x %0, %1\n\tfcvt.s.h %0, %0" : "=f"(f) : "r"(h | 0xFFFF0000u));
+    return f;
+}
+static inline uint32_t sh_f2h(float f) {
+    uint32_t h; float t;
+    __asm__ ("fcvt.h.s %1, %2, rne\n\tfmv.x.w %0, %1" : "=r"(h), "=&f"(t) : "f"(f));
+    return h & 0xFFFFu;
+}
 
 #endif /* SH_OPS_H */

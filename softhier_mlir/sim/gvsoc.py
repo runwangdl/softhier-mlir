@@ -151,9 +151,9 @@ def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
     t0 = time.time()
     r = subprocess.run(cmd, cwd=SH, env=env, capture_output=True, text=True, timeout=timeout)
     out = r.stdout + r.stderr
-    m = PERF_RE.search(out)
-    return {"ok": r.returncode == 0 and m is not None, "returncode": r.returncode,
-            "roi_ns": int(m.group(1)) if m else None, "wall_s": round(time.time() - t0, 1), "stdout": out}
+    rois = [int(v) for v in PERF_RE.findall(out)]   # one entry per sh_timer_end()
+    return {"ok": r.returncode == 0 and bool(rois), "returncode": r.returncode,
+            "roi_ns": rois[0] if rois else None, "rois": rois, "wall_s": round(time.time() - t0, 1), "stdout": out}
 
 
 def measure(app_dir: str | Path, arch: Arch | None = None, apply: bool = False, **run_kw) -> dict:
