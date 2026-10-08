@@ -122,6 +122,16 @@ program is one `scf.for` over the layers and one over the heads (the cluster ins
 fires before the data has crossed the NoC) and prints `[mark]` stamps per layer; `--unroll` gives the
 spelled-out form with the layer-1 intermediate dumps, `--from-log` re-evaluates a finished run.
 
+Results (16 clusters, ideal HBM, gvsoc at 1 GHz; 256 sampled elements per tensor against the fp32
+HF `SiglipVisionModel`):
+
+| run | per layer (simulated) | total | wall | embeddings | layer 1 | layer 12 | post-LN |
+|---|---|---|---|---|---|---|---|
+| seq 256, 12 layers | 2.29 ms (attention 1.21, proj+MLP 1.07) | 38.8 ms compute + 2.7 ms preload | 502 s | max abs 0.0067 (max 1.23) | 0.039 (max 3.6) | 0.19 (max 359) | 0.21 (max 24.7, median 0.01) |
+
+Everything is at the fp16 floor (fp16 operands and RedMulE accumulation): the device agrees with
+the fp16-rounded numpy model of the same program as closely as with HF.
+
 ## Design-space exploration
 
 `softhier_mlir/dse/` turns a module into a shape-level workload (`workload.py`), estimates it
