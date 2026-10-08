@@ -9,8 +9,13 @@ int main(void) {
     const uint64_t x = sh_hbm_addr(0x00000000), w = sh_hbm_addr(0x01000000), z = sh_hbm_addr(0x02000000);
     uint32_t bad = 0;
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
+#ifdef REAL_DATA   /* probabilities-like X, small real W: exercises fp16 rounding paths */
+        sh_test_fill_fp16(x, M, K, K, 1, 0, 64, 1.0f / 4096);
+        sh_test_fill_fp16(w, K, N, N, 2, -16, 16, 0.125f);
+#else
         sh_test_fill_int_fp16(x, M, K, K, 1, -1, 1);
         sh_test_fill_int_fp16(w, K, N, N, 2, -2, 2);
+#endif
         sh_test_fill_int_fp16(z, M, N, N, 3, ACCUMULATE ? 3 : 0, ACCUMULATE ? 3 : 0);  /* Z0 = 3.0 or 0 */
     }
     sh_barrier_global();

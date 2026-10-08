@@ -40,7 +40,7 @@ def parse_shape(s: str) -> dict:
     return dict(M=m, N=n, K=k, tm=tm, tn=tn, tk=tk, pipeline=pipe, accumulate=acc, cluster=cluster)
 
 
-def run_gemm(shapes: list[str], nsamples: int = 256) -> bool:
+def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False) -> bool:
     app = HERE / "gemm"
     all_ok = True
     for s in shapes:
@@ -49,7 +49,7 @@ def run_gemm(shapes: list[str], nsamples: int = 256) -> bool:
             f"#define GEMM_M {c['M']}\n#define GEMM_N {c['N']}\n#define GEMM_K {c['K']}\n"
             f"#define TILE_M {c['tm']}\n#define TILE_N {c['tn']}\n#define TILE_K {c['tk']}\n"
             f"#define PIPELINE {c['pipeline']}\n#define ACCUMULATE {c['accumulate']}\n"
-            f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n")
+            f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n" + ("#define REAL_DATA 1\n" if real else ""))
         build_sw(app)
         r = run_sim()
         lines = [ln for ln in r["stdout"].splitlines() if ln.startswith("[gemm]") or "mismatch" in ln]
@@ -104,13 +104,17 @@ def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: in
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"] and "SIGLIP_LAYER_DONE" in r["stdout"]
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[sh_") or ln.startswith("[head"):
+            print("     " + ln)
+    (HERE / "siglip_layer" / "last_run.log").write_text(r["stdout"])
     macs = 4 * seq * d * d + 2 * seq * d * ff + 2 * seq * seq * d
     print(f"{'PASS' if ok else 'FAIL'} siglip_layer S={seq} D={d} F={ff} H={heads} cluster={cluster} "
           f"roi={r['roi_ns']} ns ({macs / 1e6:.0f} MMAC, {macs / r['roi_ns'] if r['roi_ns'] else 0:.0f} MAC/ns) wall={r['wall_s']}s")
     for tag, arr in ref.items():
         if tag not in got:
             print(f"     {tag:<4} MISSING"); ok = False; continue
-        bad, maxerr = lcg.compare_samples(got[tag], arr, atol=0.05, rtol=0.05)
+        bad, maxerr = lcg.compare_samples(got[tag], arr, atol=0.05, rtol=0.05, show=3)
         print(f"     {tag:<4} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
         ok &= bad == 0
     if not r["ok"]:
@@ -175,9 +179,10 @@ if __name__ == "__main__":
     ap.add_argument("-p", "--passes", help="mlir: pass pipeline for softhier-opt (default: per-example table)")
     ap.add_argument("--shapes", nargs="*")
     ap.add_argument("--nsamples", type=int, default=256)
+    ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
     a = ap.parse_args()
     if a.test == "gemm":
-        ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples)
+        ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
     elif a.test == "rowops":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0")
     elif a.test == "siglip":

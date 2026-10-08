@@ -27,10 +27,13 @@ def layer_reference(S: int, D: int, F: int, H: int) -> dict[str, np.ndarray]:
     ln1 = r16(ln(x, g1, be1))
     q = r16(r16(ln1 @ wq) + bq); k = r16(r16(ln1 @ wk) + bk); v = r16(r16(ln1 @ wv) + bv)
     o = np.zeros((S, D), np.float32)
+    p0 = None
     for hd in range(H):
         sl = slice(hd * dh, (hd + 1) * dh)
         s = r16(q[:, sl] @ k[:, sl].T) * 0.125
         p = np.exp(s - s.max(1, keepdims=True)); p = r16(p / p.sum(1, keepdims=True))
+        if hd == 0:
+            p0 = p
         o[:, sl] = r16(p @ v[:, sl])
     ao = r16(r16(o @ wo) + bo)
     h = r16(x + ao)
@@ -39,4 +42,4 @@ def layer_reference(S: int, D: int, F: int, H: int) -> dict[str, np.ndarray]:
     g = r16(0.5 * f1 * (1 + np.tanh(0.7978845608 * (f1 + 0.044715 * f1 ** 3))))
     f2 = r16(r16(g @ w2) + b2)
     out = r16(h + f2)
-    return {"Q": q, "O": o, "H": h, "G": g, "OUT": out}
+    return {"X": x, "LN1": ln1, "Q": q, "K": k, "KT": k.T, "P0": p0, "V": v, "O0": o[:, :dh], "O6": o[:, 6 * dh:7 * dh], "O": o, "H": h, "G": g, "OUT": out}

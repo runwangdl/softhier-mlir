@@ -7,22 +7,24 @@
 #include "shape.h"
 
 #define DH (D_MODEL / N_HEADS)
-static uint64_t next_buf;
-static uint64_t alloc(uint32_t bytes) { uint64_t a = next_buf; next_buf += (bytes + 4095) & ~4095u; return a; }
+/* Bump allocator on the CALLER'S STACK: every core runs main(), and a global in .bss would be
+ * incremented 48 times concurrently (each core would see different addresses). */
+static uint64_t alloc(uint64_t *next, uint32_t bytes) { uint64_t a = *next; *next += (bytes + 4095) & ~4095u; return a; }
+#define ALLOC(bytes) alloc(&next_buf, (bytes))
 
 int main(void) {
     sh_init();
     const uint32_t S = SEQ, D = D_MODEL, F = D_FF, H = N_HEADS;
-    next_buf = sh_hbm_addr(0);
+    uint64_t next_buf = sh_hbm_addr(0);
     /* activations */
-    const uint64_t x = alloc(S * D * 2), ln1 = alloc(S * D * 2), q = alloc(S * D * 2), k = alloc(S * D * 2), v = alloc(S * D * 2);
-    const uint64_t kT = alloc(D * S * 2), sc = alloc(H * S * S * 2), o = alloc(S * D * 2), ao = alloc(S * D * 2), h = alloc(S * D * 2);
-    const uint64_t ln2 = alloc(S * D * 2), f1 = alloc(S * F * 2), g = alloc(S * F * 2), f2 = alloc(S * D * 2), out = alloc(S * D * 2);
+    const uint64_t x = ALLOC(S * D * 2), ln1 = ALLOC(S * D * 2), q = ALLOC(S * D * 2), k = ALLOC(S * D * 2), v = ALLOC(S * D * 2);
+    const uint64_t kT = ALLOC(D * S * 2), sc = ALLOC(H * S * S * 2), o = ALLOC(S * D * 2), ao = ALLOC(S * D * 2), h = ALLOC(S * D * 2);
+    const uint64_t ln2 = ALLOC(S * D * 2), f1 = ALLOC(S * F * 2), g = ALLOC(S * F * 2), f2 = ALLOC(S * D * 2), out = ALLOC(S * D * 2);
     /* parameters */
-    const uint64_t wq = alloc(D * D * 2), wk = alloc(D * D * 2), wv = alloc(D * D * 2), wo = alloc(D * D * 2);
-    const uint64_t w1 = alloc(D * F * 2), w2 = alloc(F * D * 2);
-    const uint64_t bq = alloc(D * 2), bk = alloc(D * 2), bv = alloc(D * 2), bo = alloc(D * 2), b1 = alloc(F * 2), b2 = alloc(D * 2);
-    const uint64_t g1 = alloc(D * 2), be1 = alloc(D * 2), g2 = alloc(D * 2), be2 = alloc(D * 2);
+    const uint64_t wq = ALLOC(D * D * 2), wk = ALLOC(D * D * 2), wv = ALLOC(D * D * 2), wo = ALLOC(D * D * 2);
+    const uint64_t w1 = ALLOC(D * F * 2), w2 = ALLOC(F * D * 2);
+    const uint64_t bq = ALLOC(D * 2), bk = ALLOC(D * 2), bv = ALLOC(D * 2), bo = ALLOC(D * 2), b1 = ALLOC(F * 2), b2 = ALLOC(D * 2);
+    const uint64_t g1 = ALLOC(D * 2), be1 = ALLOC(D * 2), g2 = ALLOC(D * 2), be2 = ALLOC(D * 2);
     const int lead = (sh_cluster_id() == 0 && sh_is_first_core());
     if (lead) {
         sh_test_fill_fp16(x, S, D, D, 1, -16, 16, 0.125f);
@@ -52,9 +54,10 @@ int main(void) {
     for (uint32_t hd = 0; hd < H; ++hd) {
         const uint32_t cl = (CLUSTER == SH_ALL) ? hd % P : CLUSTER;
         const uint64_t s_h = sc + (uint64_t)hd * S * S * 2;
-        sh_gemm(q + hd * DH * 2, kT + (uint64_t)hd * DH * S * 2, s_h, S, S, DH, D, S, S, &qk, cl);
+        int r1 = sh_gemm(q + hd * DH * 2, kT + (uint64_t)hd * DH * S * 2, s_h, S, S, DH, D, S, S, &qk, cl);
         sh_softmax_rows(s_h, s_h, S, S, S, 0.125f, cl);
-        sh_gemm(s_h, v + hd * DH * 2, o + hd * DH * 2, S, DH, S, S, D, D, &pv, cl);
+        int r2 = sh_gemm(s_h, v + hd * DH * 2, o + hd * DH * 2, S, DH, S, S, D, D, &pv, cl);
+        if ((r1 || r2) && sh_cluster_id() == cl && sh_is_first_core()) sh_printf("[head %u] rc %d %d\n", hd, r1, r2);
     }
     sh_barrier_global();
     sh_gemm(o, wo, ao, S, D, D, D, D, D, &big, CLUSTER); sh_add_bias(ao, ao, bo, S, D, D, CLUSTER);
@@ -68,7 +71,15 @@ int main(void) {
     sh_barrier_global();
     if (lead) {
         sh_timer_end();
+        sh_test_dump_samples(x, S, D, D, 200, NSAMPLES, "X");
+        sh_test_dump_samples(ln1, S, D, D, 206, NSAMPLES, "LN1");
         sh_test_dump_samples(q, S, D, D, 201, NSAMPLES, "Q");
+        sh_test_dump_samples(k, S, D, D, 207, NSAMPLES, "K");
+        sh_test_dump_samples(kT, D, S, S, 208, NSAMPLES, "KT");
+        sh_test_dump_samples(sc, S, S, S, 209, NSAMPLES, "P0");
+        sh_test_dump_samples(v, S, D, D, 211, NSAMPLES, "V");
+        sh_test_dump_samples(o, S, DH, D, 210, NSAMPLES, "O0");
+        sh_test_dump_samples(o + 6 * DH * 2, S, DH, D, 212, NSAMPLES, "O6");
         sh_test_dump_samples(o, S, D, D, 202, NSAMPLES, "O");
         sh_test_dump_samples(h, S, D, D, 203, NSAMPLES, "H");
         sh_test_dump_samples(g, S, F, F, 204, NSAMPLES, "G");

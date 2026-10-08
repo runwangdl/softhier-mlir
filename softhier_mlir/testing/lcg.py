@@ -49,13 +49,17 @@ def parse_samples(stdout: str) -> dict[str, list[tuple[int, int, float]]]:
     return out
 
 
-def compare_samples(samples: list[tuple[int, int, float]], ref: np.ndarray, atol: float, rtol: float) -> tuple[int, float]:
-    """Return (mismatches, max abs error) of device samples against the reference array."""
+def compare_samples(samples: list[tuple[int, int, float]], ref: np.ndarray, atol: float, rtol: float,
+                    show: int = 0) -> tuple[int, float]:
+    """Return (mismatches, max abs error) of device samples against the reference array;
+    print the first `show` mismatches."""
     bad, maxerr = 0, 0.0
     for r, c, got in samples:
         want = float(ref[r, c])
         err = abs(got - want)
         maxerr = max(maxerr, err)
         if err > atol + rtol * abs(want):
+            if bad < show:
+                print(f"       mismatch [{r},{c}] got {got:.4f} want {want:.4f}")
             bad += 1
     return bad, maxerr
