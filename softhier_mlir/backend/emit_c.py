@@ -24,6 +24,7 @@ from xdsl.dialects.builtin import FloatAttr, IntegerAttr, MemRefType, ModuleOp, 
 from xdsl.ir import Block, BlockArgument, Operation, SSAValue
 
 from softhier_mlir.dialects.softhier import (
+    AttentionOp,
     AddBiasOp,
     AddOp,
     CheckConstOp,
@@ -326,6 +327,14 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             rows, cols, ld, _ = bufs.geom(op.x)
             b(f"{ind}sh_add_bias({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.bias)}, {rows}, {cols}, {ld}, {_cluster(op)});")
 
+        elif isinstance(op, AttentionOp):
+            S, D, ldq, _ = bufs.geom(op.q)
+            _, _, ldk, _ = bufs.geom(op.k)
+            _, _, ldv, _ = bufs.geom(op.v)
+            _, _, ldo, _ = bufs.geom(op.o)
+            b(f"{ind}sh_attention({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
+              f"{S}, {D}, {op.heads.value.data}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
+
         elif isinstance(op, TransposeOp) and bufs.space(op.src) != "tcdm":
             rows, cols, lds, _ = bufs.geom(op.src)
             _, _, ldd, _ = bufs.geom(op.dst)
@@ -363,7 +372,8 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
 
 
 _PROLOGUE_OPS = (HbmFillOp, HbmFillColParityOp, HbmFillLcgOp, PreloadWaitOp)   # test inputs / preload: before the timer
-_EPILOGUE_OPS = (DumpSamplesOp, HbmCheckConstOp)                                 # test outputs: after the timer
+_EPILOGUE_OPS = (HbmCheckConstOp,)   # whole-buffer checks: after the timer. Sample dumps stay IN PLACE: a
+                                     # buffer may be reused later in the program (residual stream across layers)
 _STRUCTURAL_OPS = (HbmBufferOp, L1BufferOp, ViewOp, arith.ConstantOp, arith.AddiOp, arith.SubiOp, arith.MuliOp, func.ReturnOp)
 
 

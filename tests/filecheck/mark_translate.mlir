@@ -13,8 +13,9 @@ builtin.module {
     func.return
   }
 }
-// CHECK: static void timed(void)
+// CHECK: static void timed_inputs(void)
 // CHECK: sh_preload_wait(hb3);
-// CHECK-NEXT: sh_printf("[mark] %s %u\n", "start", sh_cycles());
+// CHECK: static void timed(void)
+// CHECK: sh_printf("[mark] %s %u\n", "start", sh_cycles());
 // CHECK-NEXT: sh_layernorm(hb1, hb1, hb2, hb2, 256, 768, 768, {{.*}}, SH_ALL);
 // CHECK-NEXT: sh_printf("[mark] %s %u\n", "ln", sh_cycles());
