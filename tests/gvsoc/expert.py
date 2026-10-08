@@ -131,18 +131,33 @@ def run_op(which: str, seed: int, cluster: int, nsamples: int, app_dir=None, col
     return ok
 
 
+def cand_seeds(n_cand: int, seeds=None) -> list:
+    """Noise seed per candidate: None = the npz (lerobot) noise. Default: candidate 0 lerobot's, candidate c seed c."""
+    if seeds is None:
+        return [None] + list(range(1, n_cand))
+    out = [None if str(v).lower() in ("none", "ref", "-1") else int(v) for v in seeds]
+    assert len(out) == n_cand, (out, n_cand)
+    return out
+
+
 def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile: bool, dumps, nsamples: int = 64,
-             app_dir=None, log: Path | None = None, from_log: Path | None = None, timeout: int = 48 * 3600, tiles=None) -> bool:
+             app_dir=None, log: Path | None = None, from_log: Path | None = None, timeout: int = 48 * 3600, tiles=None,
+             n_cand: int = 1, seeds=None, save_x: Path | None = None) -> bool:
     from softhier_mlir.frontend import smolvla_expert as E
     data = dict(np.load(npz))
     P = {k[2:]: data[k] for k in data if k.startswith("p_")}
     ref_xt = data["ref_xt"]
+    seeds = cand_seeds(n_cand, seeds)
+    x0 = E.cand_noise(P["x0"], seeds)
+    if n_cand > 1:
+        print(f"[expert] {n_cand} candidates, noise seeds {seeds}, tiles {E.batch_tiles(n_cand, tiles or E.TILES)}")
     if from_log is None:
         app = _app(app_dir)
-        mlir, pre = E.emit_flow(data, steps, layers, cluster, fmt_steps, profile, tuple(dumps), nsamples, tiles=tiles or E.TILES)
+        mlir, pre = E.emit_flow(data, steps, layers, cluster, fmt_steps, profile, tuple(dumps), nsamples, tiles=tiles or E.TILES,
+                                n_cand=n_cand, x0=x0)
         r = _build_and_run(app, mlir, pre, timeout, log)
         stdout, ok = r["stdout"], r["ok"]
-        print(f"{'PASS' if ok else 'FAIL'} expert flow steps={steps} layers={layers} cluster={cluster} fmt={fmt_steps} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+        print(f"{'PASS' if ok else 'FAIL'} expert flow steps={steps} layers={layers} cand={n_cand} cluster={cluster} fmt={fmt_steps} roi={r['roi_ns']} ns wall={r['wall_s']}s")
     else:
         stdout = Path(from_log).read_text()
         rois = [int(v) for v in PERF_RE.findall(stdout)]
@@ -175,7 +190,11 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
             print(f"       {k:<8} {t / 1e6:9.3f} ms  {100 * t / tot:5.1f} %   {n:4d} x {t / n / 1e3:8.1f} us")
     # ---- accuracy: device x_t per step vs lerobot and vs the fp16-floor numpy model
     got = lcg.parse_samples(stdout)
+    if n_cand > 1:
+        return _check_cands(E, P, ref_xt, got, steps, layers, n_cand, seeds, x0, ok, save_x)
     floor_xt, floor_inter = E.np_flow(P, steps, layers, record=("H" in dumps or "O" in dumps))
+    if save_x is not None:
+        np.savez(save_x, x=np.stack([_full(got.get(f"X{s}", []), 50, 32) for s in range(steps)]), seeds=np.array([-1 if v is None else v for v in seeds]))
     for s in range(steps):
         tag = f"X{s}"
         if tag not in got:
@@ -207,6 +226,38 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
     return ok
 
 
+def _full(samples, rows: int, cols: int) -> np.ndarray:
+    a = np.full((rows, cols), np.nan, np.float32)
+    for r_, c, v in samples:
+        a[r_, c] = v
+    return a
+
+
+def _check_cands(E, P, ref_xt, got, steps, layers, n_cand, seeds, x0, ok, save_x) -> bool:
+    """n_cand candidates: x_t of candidate c = rows [50c, 50c + 50) of the X dumps, compared with the fp16-floor twin
+    run on that candidate's noise alone (and with lerobot for the lerobot-noise candidate of the full model)."""
+    S = E.S
+    xs = np.stack([_full(got.get(f"X{s}", []), S * n_cand, E.AD) for s in range(steps)])
+    if save_x is not None:
+        np.savez(save_x, x=xs, seeds=np.array([-1 if v is None else v for v in seeds]))
+    for c, sd in enumerate(seeds):
+        Pc = dict(P); Pc["x0"] = x0[c * S:(c + 1) * S]
+        floor_xt, _ = E.np_flow(Pc, steps, layers)
+        lero = sd is None and layers == E.LAYERS
+        errs, ferrs = [], []
+        for s in range(steps):
+            dev = xs[s, c * S:(c + 1) * S]
+            if np.isnan(dev).any():
+                print(f"     cand {c} X{s} MISSING"); ok = False; continue
+            want = ref_xt[s + 1] if lero else floor_xt[s + 1]
+            errs.append(float(np.abs(dev - want).max())); ferrs.append(float(np.abs(dev - floor_xt[s + 1]).max()))
+        good = bool(errs) and max(errs) < 0.05
+        ok &= good
+        print(f"     cand {c} (noise {'lerobot' if sd is None else f'seed {sd}'}): x_t max abs vs {'lerobot' if lero else 'fp16 twin'} per step "
+              + " ".join(f"{e:.4f}" for e in errs) + f"; vs fp16 twin max {max(ferrs) if ferrs else float('nan'):.4f} {'PASS' if good else 'FAIL'}")
+    return ok
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("test", choices=["layer", "flow", "op"])
@@ -225,6 +276,9 @@ if __name__ == "__main__":
     ap.add_argument("--log")
     ap.add_argument("--from-log")
     ap.add_argument("--tiles", help="flow: override tile shapes, e.g. qkv=50,240,720;o=50,240,960")
+    ap.add_argument("--cands", type=int, default=1, help="flow: candidate chunks denoised at once (S_q = 50 N)")
+    ap.add_argument("--seeds", nargs="*", help="flow: noise seed per candidate (none = the npz/lerobot noise); default none,1,2,...")
+    ap.add_argument("--save-x", help="flow: write the device x_t per step to this .npz")
     a = ap.parse_args()
     if a.test == "layer":
         ok = run_layer(a.seed, a.cluster, a.nsamples, a.app_dir)
@@ -240,5 +294,6 @@ if __name__ == "__main__":
                 k, v = item.split("=")
                 tiles[k] = tuple(int(x) for x in v.split(","))
         ok = run_flow(a.npz, a.steps, a.layers, a.cluster, fmt, a.profile, a.dumps, a.nsamples, a.app_dir,
-                      Path(a.log) if a.log else None, Path(a.from_log) if a.from_log else None, tiles=tiles)
+                      Path(a.log) if a.log else None, Path(a.from_log) if a.from_log else None, tiles=tiles,
+                      n_cand=a.cands, seeds=a.seeds, save_x=Path(a.save_x) if a.save_x else None)
     sys.exit(0 if ok else 1)
