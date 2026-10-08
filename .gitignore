@@ -18,3 +18,7 @@ tests/gvsoc/mlir_app/*.mlir
 tests/gvsoc/mlir_app/*.npz
 tests/gvsoc/smolvla_app*/
 .claude/
+tests/gvsoc/*/preload.elf
+tests/gvsoc/gemm_seq/shape.h
+tests/gvsoc/attention/shape.h
+tests/gvsoc/attention/last_run.log

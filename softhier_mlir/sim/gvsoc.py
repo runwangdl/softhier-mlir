@@ -8,6 +8,8 @@ Environment
   SOFTHIER_CHROOT  wrapper that runs the x86-64 RISC-V toolchain on an aarch64 host
                    (default /opt/x86-ort/run; set to "" when the toolchain runs natively)
   SOFTHIER_IDEAL_HBM=1 is set for the run unless ideal_hbm=False (DRAMSys is x86-only).
+  SOFTHIER_MODEL_DIR  extra gvsoc model directories (colon separated) searched first
+  SOFTHIER_STOCK_MODELS=1  ignore install/models_fast and install/models_fix (stock models only)
 """
 from __future__ import annotations
 
@@ -179,10 +181,15 @@ def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
     env["LD_LIBRARY_PATH"] = f"{inst}/lib:" + env["LD_LIBRARY_PATH"]
     env["PATH"] = f"{inst}/bin:" + env.get("PATH", "")
     model_dirs = [d for d in os.environ.get("SOFTHIER_MODEL_DIR", "").split(":") if d]
-    # Fixed Snitch integer-core model (fp->int `nseq` tags, see docs/SIMULATOR_NOTES.md #10) built next to
-    # the stock models: used by default when present. SOFTHIER_STOCK_MODELS=1 forces the stock model.
-    if (inst / "models_fix").is_dir() and not os.environ.get("SOFTHIER_STOCK_MODELS"):
-        model_dirs.append(str(inst / "models_fix"))
+    # Patched Snitch models built next to the stock ones, used by default when present
+    # (SOFTHIER_STOCK_MODELS=1 forces the stock models):
+    #   models_fast  integer core + FP subsystem + FPU sequencer rebuilt for host speed (same simulated
+    #                cycles; includes every fix below; docs/SIMULATOR_NOTES.md "Host speed of the Snitch ISS")
+    #   models_fix   integer core with the fp->int `nseq` tags (docs/SIMULATOR_NOTES.md #10)
+    if not os.environ.get("SOFTHIER_STOCK_MODELS"):
+        for d in ("models_fast", "models_fix"):
+            if (inst / d).is_dir():
+                model_dirs.append(str(inst / d))
     model_dirs.append(str(inst / "models"))
     cmd = [str(inst / "bin" / "gapy"), "--platform=gvsoc", f"--target-dir={inst}/generators"] + \
           [f"--model-dir={d}" for d in model_dirs] + ["--target=pulp.chips.flex_cluster.flex_cluster",
