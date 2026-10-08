@@ -63,6 +63,50 @@ which does not scale past a few MB). Constraints: offsets >= 4 KB (the SDK's `fl
 keeps the HBM allocator state at `0xC0000000` and the first block header at `+0x400`), 64 B
 aligned, non-overlapping. `run_sim(preload=path)` passes the flag.
 
+## Test inputs come from the host, through the same preload path (2026-10-08)
+
+Every gvsoc test starts from LCG matrices (`sh_test_fill_fp16`, host twin `softhier_mlir/testing/lcg.py`).
+Generated on the device they are a scalar loop on one core: one SigLIP layer is ~7 M elements, ~200 ms
+of simulated time and ~70 s of wall time for a 2.3 ms kernel. `tests/gvsoc/run.py` now generates the
+same bytes on the host and puts them in HBM through the preload image (`--data preload`, the default;
+`--data device` is the old path). Two mechanisms, one convention:
+
+* Generated programs: `softhier-translate --preload-elf <file>` (`softhier_mlir/sim/testdata.py`) collects
+  every top-level `softhier.hbm_fill_lcg` / `hbm_fill` / `hbm_fill_col_parity` into `{offset: array}`,
+  writes the image (sentinel at the first 4 KB boundary above every declared buffer) and replaces the
+  fills with `softhier.preload_wait` on the sentinel. Both are prologue ops (before the timer), so the
+  ROI is untouched. A fill that cannot be preloaded (buffer below 0x1000, unaligned, indexed, through a
+  view) leaves the whole module on the device path with a note on stderr: the `examples/*.mlir` all
+  start at offset 0 and stay on the device (their constant fills are DMA-based and cheap anyway).
+* Hand-written C tests (`gemm`, `gemm_seq`, `rowops`, `attention`, `siglip_layer`): `run.py` mirrors
+  each test's HBM layout and fills in Python, writes `preload.elf` and `#define SH_PRELOAD <sentinel
+  offset>` into `shape.h`; `main.c` then does `sh_preload_wait(sh_hbm_addr(SH_PRELOAD))` instead of its
+  `#else` fill block. All layouts now start at `HBM_START = 0x1000` (the SDK allocator's region).
+
+Wall time per run (`run_sim` wall, i.e. gvsoc only; machine shared with other simulations, load ~6-7),
+same PASS/FAIL and the same max errors in every case:
+
+| run | wall, inputs on the device | wall, inputs preloaded | ROI device -> preloaded | image |
+|---|---|---|---|---|
+| `gemm 1024x3072x768 ... all` | 32.3 s | **4.2 s** | 520521 -> 520539 ns | 12 MiB, 4 segments |
+| `rowops 256x768 --cluster all` | 17.2 s | 15.9 s | 508504 -> 508473 ns (sum of 7 ROIs) | 0.8 MiB, 5 |
+| `siglip-mlir --seq 256 --cluster all` | 94.4 s | **48.4 s** | 4782253 -> 4782093 ns | 13.9 MiB, 18 |
+| `siglip --seq 256 --cluster all` | 90.4 s | **44.5 s** | 2276565 -> 2276815 ns | 13.9 MiB, 18 |
+| `smolvla --layers 1` | 48.3 s | unchanged (it already preloads everything; nothing is generated on the device) | 5355905 ns, bit-identical | 15.4 MiB, 23 |
+
+The ROI deltas (<= 250 ns on ms-scale ROIs, <= 0.01 %) are the run-to-run jitter of the timer start,
+not the data path: the device path itself moves by ~40 ns between two runs of `rowops` or `attention`,
+and `gemm --data device` with the new layout reproduces the old 520521 ns exactly (so the 18 ns in the
+preload run is the loader's tail). `rowops` gains little because its inputs are small (0.4 M elements);
+its wall time is the row ops and the sample printing. What remains in the SigLIP runs is the kernel
+itself (4.8 ms / 2.3 ms simulated on 48 cores) plus gvsoc start-up and the dumps.
+
+The host LCG is a leapfrog (4096 lanes advanced by the composed affine map in wrapping uint32), bit-equal
+to the scalar loop (`tests/test_testdata.py`): 7 M elements in ~0.1 s instead of ~2 s. Limits seen so far:
+none. Images are one `PT_LOAD` per array (18 segments, 14 MiB for a SigLIP layer; the 12-layer SmolVLA
+image is ~200 segments, 166 MB), the loader streams them in ~0.2-2.7 ms of simulated time, and the first global
+barrier + sentinel wait absorb that before the timer starts.
+
 ## Program size: 64 KB of instruction memory
 
 `ARCH_INSTRUCTION_MEM_SIZE` is 0x10000. The program ELF is loaded from 0x80000000 and anything
