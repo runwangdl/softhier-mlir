@@ -95,7 +95,7 @@ int main(void) {
     if (lead) {
         sh_timer_end();
         uint32_t bad = 0;
-#if MODE >= 6 && !defined(NO_Z2CHECK)
+#if MODE >= 6 && !defined(NO_Z2CHECK) && !defined(NO_GEMM2)
         bad += sh_test_check_gemm(z, w2, z2, S, D, D, D, D, D, 128, MODE == 8 ? 0.5f : 2.0f, 0.f, "[z2]");
 #endif
         for (uint32_t h = 0; h < NH; ++h) {
