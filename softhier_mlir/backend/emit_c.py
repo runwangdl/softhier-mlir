@@ -50,6 +50,11 @@ from softhier_mlir.dialects.softhier import (
     L1ZeroOp,
     RedmuleOp,
     ReluOp,
+    RmsNormOp,
+    RopeOp,
+    SiluMulOp,
+    ScaleOp,
+    PixelShuffleOp,
 )
 
 _ELEM_BYTES = {"f16": 2, "bf16": 2, "f32": 4, "f64": 8, "i8": 1, "i16": 2, "i32": 4}
@@ -125,6 +130,10 @@ class _Index:
             return f"({self.expr(op.lhs)} - {self.expr(op.rhs)})"
         if isinstance(op, arith.MuliOp):
             return f"({self.expr(op.lhs)} * {self.expr(op.rhs)})"
+        if isinstance(op, arith.DivUIOp):
+            return f"({self.expr(op.lhs)} / {self.expr(op.rhs)})"
+        if isinstance(op, arith.RemUIOp):
+            return f"({self.expr(op.lhs)} % {self.expr(op.rhs)})"
         raise NotImplementedError(f"index expression from {op.name if isinstance(op, Operation) else op}")
 
     def is_const(self, v: SSAValue) -> bool:
@@ -235,7 +244,8 @@ def _tagged(idx: _Index, tag: str, index) -> tuple[str, str]:
 
 def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
     for op in ops:
-        if isinstance(op, (L1BufferOp, func.ReturnOp, arith.ConstantOp, arith.AddiOp, arith.SubiOp, arith.MuliOp, scf.YieldOp)):
+        if isinstance(op, (L1BufferOp, func.ReturnOp, arith.ConstantOp, arith.AddiOp, arith.SubiOp, arith.MuliOp, arith.DivUIOp,
+                           arith.RemUIOp, scf.YieldOp)):
             continue
 
         if isinstance(op, HbmBufferOp):
@@ -313,7 +323,34 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
 
         elif isinstance(op, SoftmaxOp):
             rows, cols, ld, _ = bufs.geom(op.x)
-            b(f"{ind}sh_softmax_rows({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {rows}, {cols}, {ld}, {_f(op.scale)}, {_cluster(op)});")
+            if op.mask is not None:
+                m = bufs.haddr(op.mask)
+                b(f"{ind}sh_softmax_masked({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {rows}, {cols}, {ld}, {_f(op.scale)}, {m}, {m}, {_cluster(op)});")
+            else:
+                b(f"{ind}sh_softmax_rows({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {rows}, {cols}, {ld}, {_f(op.scale)}, {_cluster(op)});")
+
+        elif isinstance(op, RmsNormOp):
+            rows, cols, ld, _ = bufs.geom(op.x)
+            b(f"{ind}sh_rmsnorm({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.gamma)}, {rows}, {cols}, {ld}, {_f(op.eps)}, {_cluster(op)});")
+
+        elif isinstance(op, RopeOp):
+            rows, cols, ld, _ = bufs.geom(op.x)
+            _, _, ldt, _ = bufs.geom(op.cos_sin)
+            b(f"{ind}sh_rope({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.cos_sin)}, {rows}, {cols}, {ld}, {ldt}, "
+              f"{op.head_dim.value.data}, {_cluster(op)});")
+
+        elif isinstance(op, SiluMulOp):
+            rows, cols, ld, _ = bufs.geom(op.a)
+            b(f"{ind}sh_silu_mul({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {ld}, {_cluster(op)});")
+
+        elif isinstance(op, ScaleOp):
+            rows, cols, ld, _ = bufs.geom(op.x)
+            b(f"{ind}sh_scale({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {rows}, {cols}, {ld}, {_f(op.scale)}, {_cluster(op)});")
+
+        elif isinstance(op, PixelShuffleOp):
+            rows, cols, _, _ = bufs.geom(op.src)
+            grid = int(round(rows ** 0.5))
+            b(f"{ind}sh_pixel_shuffle({bufs.haddr(op.dst)}, {bufs.haddr(op.src)}, {grid}, {cols}, {op.scale.value.data}, {_cluster(op)});")
 
         elif isinstance(op, GeluOp):
             rows, cols, ld, _ = bufs.geom(op.x)
@@ -332,8 +369,15 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             _, _, ldk, _ = bufs.geom(op.k)
             _, _, ldv, _ = bufs.geom(op.v)
             _, _, ldo, _ = bufs.geom(op.o)
-            b(f"{ind}sh_attention({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
-              f"{S}, {D}, {op.heads.value.data}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
+            H = op.heads.value.data
+            if op.mask is not None or op.kv_heads is not None:
+                Hkv = op.kv_heads.value.data if op.kv_heads is not None else H
+                m = bufs.haddr(op.mask) if op.mask is not None else "0"
+                b(f"{ind}sh_attention_gqa({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
+                  f"{S}, {D}, {H}, {Hkv}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {m}, {_cluster(op)});")
+            else:
+                b(f"{ind}sh_attention({bufs.haddr(op.q)}, {bufs.haddr(op.k)}, {bufs.haddr(op.v)}, {bufs.haddr(op.o)}, "
+                  f"{S}, {D}, {H}, {ldq}, {ldk}, {ldv}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
 
         elif isinstance(op, TransposeOp) and bufs.space(op.src) != "tcdm":
             rows, cols, lds, _ = bufs.geom(op.src)

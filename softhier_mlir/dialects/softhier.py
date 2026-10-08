@@ -340,13 +340,17 @@ class LayerNormOp(IRDLOperation):
 
 @irdl_op_definition
 class SoftmaxOp(IRDLOperation):
-    """``y = softmax(scale * x)`` per row (in place allowed)."""
+    """``y = softmax(scale * x)`` per row (in place allowed). With the optional ``mask`` operand (a
+    ``memref<S x i16>`` of token classes, see ``sh_softmax_masked``: query i attends key j iff
+    ``mask[j] <= mask[i]`` unsigned, 0xFFFF = padding) the rows are queries and the columns keys of
+    the same sequence."""
     name = "softhier.softmax"
     irdl_options = (ParsePropInAttrDict(),)
     x = operand_def(MemRefType)
+    mask = opt_operand_def(MemRefType)
     y = operand_def(MemRefType)
     scale = prop_def(FloatAttr)
-    assembly_format = "$x `->` $y attr-dict `:` type($x) `->` type($y)"
+    assembly_format = "$x (`,` $mask^)? `->` $y attr-dict `:` type($x) (`,` type($mask)^)? `->` type($y)"
 
 
 @irdl_op_definition
@@ -389,10 +393,72 @@ class AttentionOp(IRDLOperation):
     q = operand_def(MemRefType)
     k = operand_def(MemRefType)
     v = operand_def(MemRefType)
+    mask = opt_operand_def(MemRefType)      # optional token-class mask (memref<S x i16>, see SoftmaxOp) -> sh_attention_gqa
     o = operand_def(MemRefType)
     scale = prop_def(FloatAttr)
     heads = prop_def(IntegerAttr)
-    assembly_format = "$q `,` $k `,` $v `->` $o attr-dict `:` type($q) `,` type($k) `,` type($v) `->` type($o)"
+    kv_heads = opt_prop_def(IntegerAttr)    # grouped-query attention: k / v are S x (kv_heads * dh); query head h uses kv head h // (heads / kv_heads)
+    assembly_format = "$q `,` $k `,` $v (`,` $mask^)? `->` $o attr-dict `:` type($q) `,` type($k) `,` type($v) (`,` type($mask)^)? `->` type($o)"
+
+
+@irdl_op_definition
+class RmsNormOp(IRDLOperation):
+    """``y = x * rsqrt(mean(x^2) + eps) * gamma`` over the last dim (HF LlamaRMSNorm; gamma is 1 x cols)."""
+    name = "softhier.rmsnorm"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    gamma = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    eps = prop_def(FloatAttr)
+    assembly_format = "$x `,` $gamma `->` $y attr-dict `:` type($x) `,` type($gamma) `->` type($y)"
+
+
+@irdl_op_definition
+class RopeOp(IRDLOperation):
+    """Rotary position embedding, HF Llama rotate-half convention, on every head of ``head_dim`` columns of
+    each row: ``y1 = x1 cos - x2 sin, y2 = x2 cos + x1 sin`` with ``cos_sin`` a ``rows x head_dim`` table
+    (cos[head_dim/2] then sin[head_dim/2] per row, precomputed by the host for the row's position id)."""
+    name = "softhier.rope"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    cos_sin = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    head_dim = prop_def(IntegerAttr)
+    assembly_format = "$x `,` $cos_sin `->` $y attr-dict `:` type($x) `,` type($cos_sin) `->` type($y)"
+
+
+@irdl_op_definition
+class SiluMulOp(IRDLOperation):
+    """``y = silu(a) * b`` elementwise (the SiLU-gated MLP activation)."""
+    name = "softhier.silu_mul"
+    a = operand_def(MemRefType)
+    b = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    assembly_format = "$a `,` $b `->` $y attr-dict `:` type($a) `,` type($b) `->` type($y)"
+
+
+@irdl_op_definition
+class ScaleOp(IRDLOperation):
+    """``y = scale * x`` elementwise (``sh_scale``)."""
+    name = "softhier.scale"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    scale = prop_def(FloatAttr)
+    assembly_format = "$x `->` $y attr-dict `:` type($x) `->` type($y)"
+
+
+@irdl_op_definition
+class PixelShuffleOp(IRDLOperation):
+    """SmolVLM connector pixel shuffle: ``src`` = ``grid*grid x D`` raster patch tokens ->
+    ``dst`` = ``(grid/scale)^2 x D*scale^2`` (output token (gr, gb) = its scale x scale patch block,
+    row-major). ``sh_pixel_shuffle``; data movement only."""
+    name = "softhier.pixel_shuffle"
+    irdl_options = (ParsePropInAttrDict(),)
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    scale = prop_def(IntegerAttr)
+    assembly_format = "$src `->` $dst attr-dict `:` type($src) `->` type($dst)"
 
 
 @irdl_op_definition
@@ -479,6 +545,11 @@ SoftHier = Dialect(
         AttentionOp,
         HbmFillLcgOp,
         DumpSamplesOp,
+        RmsNormOp,
+        RopeOp,
+        SiluMulOp,
+        ScaleOp,
+        PixelShuffleOp,
     ],
     [],
 )

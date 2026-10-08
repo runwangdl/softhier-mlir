@@ -17,3 +17,4 @@
 #include "sh_rowops.inc.c"
 #include "sh_attention.inc.c"
 #include "sh_test.inc.c"
+#include "sh_llm.inc.c"

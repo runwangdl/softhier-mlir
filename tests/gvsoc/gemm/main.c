@@ -6,7 +6,8 @@
 int main(void) {
     sh_init();
     const uint32_t M = GEMM_M, N = GEMM_N, K = GEMM_K;
-    const uint64_t x = sh_hbm_addr(0x00000000), w = sh_hbm_addr(0x01000000), z = sh_hbm_addr(0x02000000);
+    /* z behind w (a 12288 x 960 W is 23.6 MB: a fixed z at 32 MB overlapped it, 2026-10-08) */
+    const uint64_t x = sh_hbm_addr(0x00000000), w = sh_hbm_addr(0x01000000), z = sh_hbm_addr(0x01000000 + (((uint64_t)K * N * 2 + 0xFFFFFu) & ~0xFFFFFull));
     uint32_t bad = 0;
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
 #ifdef REAL_DATA   /* probabilities-like X, small real W: exercises fp16 rounding paths */
