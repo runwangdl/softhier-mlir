@@ -64,6 +64,9 @@ GEMM 2 k, **softmax 628 k** (the cluster is instruction-fetch bound, docs/SIMULA
 score element even in 4-lane SIMD), P.V 2.6 k, normalise + store 23 k. The causal softmax is 2x the prefix one
 because every row is its own mask class (keep/-inf rows rebuilt per row).
 
+After merging main's fast Snitch ISS libraries (`install/models_fast`) the same run gives identical cycles (ROI
+2 010 782 ns) in 17 s instead of 63 s of wall time.
+
 GEMM shapes of the tower on RedMulE (`run.py gemm`, fp16, tiles tm x tn x tk): 256x960x960 and 128x960x960 with
 320 x 320 tiles, 256x320x960, and the connector 64x960x12288 / 192x960x12288 with 320 x 256 tiles all PASS
 (`--real` data: K = 12288 accumulated in fp16 gives max abs 0.09-0.10 on sums of ~2; this is the RedMulE fp16
