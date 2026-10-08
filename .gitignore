@@ -13,3 +13,4 @@ tests/gvsoc/siglip_layer/shape.h
 tests/gvsoc/siglip_layer/last_run.log
 tests/gvsoc/mlir_app/siglip.mlir
 tests/gvsoc/mlir_app/last_run.log
+.claude/
