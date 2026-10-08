@@ -350,8 +350,8 @@ is the knob to fit next).
 | 256 | **fused SIMD attention, cost-model tiles** | 0.325 | 0.551 | 1.044 | **1.920** |
 | 256 | fused SIMD attention, cost-model tiles, HBM split | SPLIT256 |
 | 1024 | per-head attention, 256^3 tiles (before) | BEFORE1024 |
-| 1024 | per-head attention, cost-model tiles | PH1024 |
-| 1024 | **fused SIMD attention, cost-model tiles** | FUSED1024 |
+| 1024 | per-head attention, cost-model tiles | 1.020 | 11.775 | 3.876 | 16.67 |
+| 1024 | **fused SIMD attention, cost-model tiles** | 1.024 | 7.770 | 3.932 | **12.73** |
 | 1024 | fused SIMD attention, cost-model tiles, HBM split | SPLIT1024 |
 
 RedMulE busy (mean over the 16 clusters of the trace window, `softhier_mlir.sim.trace`): before

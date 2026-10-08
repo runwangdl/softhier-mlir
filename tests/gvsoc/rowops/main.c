@@ -1,14 +1,19 @@
-/* gvsoc test: row-wise ops of the library vs a host numpy reference (sampled dump). */
+/* gvsoc test: row-wise ops of the library vs a host numpy reference (sampled dump). Inputs: LCG matrices,
+ * preloaded by the host (SH_PRELOAD = the image's sentinel offset) or generated here (--data device). */
 #include "sh_ops.h"
-#include "shape.h"   /* ROWS COLS CLUSTER NSAMPLES */
+#include "shape.h"   /* ROWS COLS CLUSTER NSAMPLES HBM_START [SH_PRELOAD] */
 
 int main(void) {
     sh_init();
     const uint32_t R = ROWS, C = COLS;
     const uint32_t mb = R * C * 2;
-    const uint64_t x = sh_hbm_addr(0), b = sh_hbm_addr(mb), g = sh_hbm_addr(2 * mb), be = sh_hbm_addr(2 * mb + 4096);
-    const uint64_t ln = sh_hbm_addr(3 * mb), sm = sh_hbm_addr(4 * mb), ge = sh_hbm_addr(5 * mb), ad = sh_hbm_addr(6 * mb),
-                   bi = sh_hbm_addr(7 * mb), sc = sh_hbm_addr(8 * mb), tr = sh_hbm_addr(9 * mb);
+    const uint64_t h0 = sh_hbm_addr(HBM_START);   /* layout mirrored in run.py run_rowops */
+    const uint64_t x = h0, b = h0 + mb, g = h0 + 2 * mb, be = h0 + 2 * mb + 4096;
+    const uint64_t ln = h0 + 3 * mb, sm = h0 + 4 * mb, ge = h0 + 5 * mb, ad = h0 + 6 * mb,
+                   bi = h0 + 7 * mb, sc = h0 + 8 * mb, tr = h0 + 9 * mb;
+#ifdef SH_PRELOAD
+    sh_preload_wait(sh_hbm_addr(SH_PRELOAD));
+#else
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
         sh_test_fill_fp16(x, R, C, C, 11, -16, 16, 0.125f);
         sh_test_fill_fp16(b, R, C, C, 12, -16, 16, 0.125f);
@@ -16,6 +21,7 @@ int main(void) {
         sh_test_fill_fp16(be, 1, C, C, 14, -4, 4, 0.25f);
     }
     sh_barrier_global();
+#endif
     const int lead = (sh_cluster_id() == 0 && sh_is_first_core());
     /* one ROI per op: every sh_timer_end() prints a period and restarts the timer */
     if (lead) sh_timer_start();

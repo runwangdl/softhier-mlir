@@ -1,8 +1,9 @@
 """Emit a SigLIP / ViT encoder (N layers) in the softhier dialect.
 
 The emitted module declares every activation and parameter as an HBM buffer, fills the
-parameters (and the input) from the runtime LCG when `test=True`, and dumps samples of the
-tensors listed in `dumps` so the host can compare against softhier_mlir.testing.siglip_ref.
+parameters (and the input) from the LCG when `test=True` (`softhier.hbm_fill_lcg`: generated on the
+device, or on the host into a preload image by `softhier-translate --preload-elf`), and dumps samples
+of the tensors listed in `dumps` so the host can compare against softhier_mlir.testing.siglip_ref.
 Weights are [in, out] (X . W convention), biases/gamma/beta are 1 x cols rows.
 
     python -m softhier_mlir.frontend.siglip --seq 256 --layers 1 > siglip1.mlir
@@ -13,6 +14,9 @@ import argparse
 import sys
 
 
+HBM_DATA_START = 0x1000   # the SDK's HBM allocator keeps its state in the first 4 KB (preloaded data must not overlap it)
+
+
 class _Emitter:
     HBM_NODE = 0x04000000   # bytes per HBM node (ARCH_HBM_NODE_ADDR_SPACE): offset // HBM_NODE selects the node / edge port
 
@@ -21,7 +25,7 @@ class _Emitter:
         Each HBM node has its own NoC edge port, so weights in another node than the activations double
         the HBM->TCDM bandwidth the HBM-bound GEMMs see (docs/DSE.md, attention and tiling section)."""
         self.lines: list[str] = []
-        self.next_off = 0
+        self.next_off = HBM_DATA_START
         self.param_off = param_base
         self.n = 0
         self.space = space

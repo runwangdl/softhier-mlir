@@ -1,14 +1,20 @@
 /* Two GEMMs with different RedMulE tile shapes back to back on one cluster (attention pattern):
- *   A: 256x256x64  (scores: contraction 64)      B: 256x64x256 (P.V: output width 64)   then C: 256x256x256 */
+ *   A: 256x256x64  (scores: contraction 64)      B: 256x64x256 (P.V: output width 64)   then C: 256x256x256
+ * Inputs: LCG matrices, preloaded by the host (shape.h: SH_PRELOAD = sentinel offset; run.py gemm-seq mirrors
+ * the offsets and fills below) or generated here (--data device). */
 #include "sh_ops.h"
+#include "shape.h"   /* HBM_START [SH_PRELOAD] */
 int main(void) {
     sh_init();
-    const uint64_t xa = sh_hbm_addr(0x000000), wa = sh_hbm_addr(0x100000), za = sh_hbm_addr(0x200000);
+    const uint64_t xa = sh_hbm_addr(HBM_START), wa = sh_hbm_addr(0x100000), za = sh_hbm_addr(0x200000);
     const uint64_t xb = sh_hbm_addr(0x300000), wb = sh_hbm_addr(0x400000), zb = sh_hbm_addr(0x500000);
     const uint64_t xc = sh_hbm_addr(0x600000), wc = sh_hbm_addr(0x700000), zc = sh_hbm_addr(0x800000);
     const uint64_t xd = sh_hbm_addr(0x900000), wd = sh_hbm_addr(0xA00000), zd = sh_hbm_addr(0xB00000);  /* D: 64-col slices of 768-wide W/Z */
     const uint64_t xe = sh_hbm_addr(0xC00000), we = sh_hbm_addr(0xD00000), ze = sh_hbm_addr(0xE00000);  /* E: softmax(P) . V slice, real data */
     const int lead = (sh_cluster_id() == 0 && sh_is_first_core());
+#ifdef SH_PRELOAD
+    sh_preload_wait(sh_hbm_addr(SH_PRELOAD));
+#else
     if (lead) {
         sh_test_fill_int_fp16(xa, 256, 64, 64, 1, -1, 1);  sh_test_fill_int_fp16(wa, 64, 256, 256, 2, -2, 2);
         sh_test_fill_int_fp16(xb, 256, 256, 256, 3, -1, 1); sh_test_fill_int_fp16(wb, 256, 64, 64, 4, -2, 2);
@@ -19,6 +25,7 @@ int main(void) {
         sh_test_fill_fp16(we, 256, 768, 768, 11, -16, 16, 0.125f);  /* V-like */
     }
     sh_barrier_global();
+#endif
     sh_softmax_rows(xe, xe, 256, 256, 256, 0.125f, 0);   /* P = softmax(scores/8), in place, cluster 0 */
     sh_gemm_cfg a = { .tm = 256, .tn = 256, .tk = 64, .pipeline = 1 }, b = { .tm = 256, .tn = 64, .tk = 256, .pipeline = 1 }, c = { .pipeline = 1 };
     sh_gemm(xa, wa, za, 256, 256, 64, 64, 256, 256, &a, 0);

@@ -6,10 +6,17 @@
     python tests/gvsoc/run.py mlir examples/gemm512_linalg.mlir -p linalg-to-softhier
     python tests/gvsoc/run.py mlir examples/*.mlir          # every example, auto passes
     python tests/gvsoc/run.py siglip --seq 256 --cluster all [--define ATTN_SERIAL ATTN_CANARY ...]
+    python tests/gvsoc/run.py gemm-seq                      # mixed tile shapes back to back (gemm_seq)
+    python tests/gvsoc/run.py rowops --data device          # inputs generated on the device instead of preloaded
     python tests/gvsoc/run.py mesh --modes 0 1 2 5 6        # multi-cluster slice-store repro (mesh_slices)
 
 Environment: SOFTHIER_MODEL_DIR=<dir>[:<dir>] puts extra gvsoc model directories in front of
 install/models (pin or test a model build); see docs/SIMULATOR_NOTES.md.
+
+Test inputs (`--data`, default `preload`): the LCG matrices every test starts from are generated on the
+host (softhier_mlir.testing.lcg, the twin of sh_test_fill_fp16) and put into HBM through the simulator's
+preload image before the program starts; `--data device` generates them on the device as before (one
+core, ~70 s of wall time for a SigLIP layer). Same bytes either way, so results and ROIs are identical.
 
 Each case writes tests/gvsoc/<test>/shape.h, builds the SDK app in the x86 chroot and runs
 GVSoC natively (ideal HBM). Prints PASS/FAIL and the ROI in ns.
@@ -28,6 +35,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from softhier_mlir.sim.gvsoc import PERF_RE, build_sw, run_sim  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+DATA = "preload"        # --data: "preload" (host-generated inputs in the HBM preload image) | "device" (on-device LCG)
+HBM_START = 0x1000      # first HBM offset the C tests use: the SDK allocator owns the first 4 KB (preload.MIN_OFFSET)
+
+
+def preload_image(app: Path, arrays: dict[int, np.ndarray], sentinel_off: int | None = None) -> tuple[Path | None, str]:
+    """`--data preload`: write the test's input matrices ({hbm offset: fp16 array}) + the end-of-image sentinel
+    (default: the first 4 KB boundary above the arrays) into <app>/preload.elf. Returns (elf, shape.h line
+    defining SH_PRELOAD = the sentinel's offset); (None, "") with `--data device`, where main.c keeps its fills."""
+    if DATA != "preload":
+        return None, ""
+    from softhier_mlir.sim.preload import make_preload_elf, sentinel_array
+    end = max(off + a.nbytes for off, a in arrays.items())
+    sent = (max(end, sentinel_off or 0) + 0xFFF) & ~0xFFF
+    elf = make_preload_elf(app / "preload.elf", {**arrays, sent: sentinel_array()})
+    return elf, f"#define SH_PRELOAD 0x{sent:x}\n"
 
 DEFAULT_GEMM = ["256x256x256", "256x768x192:256,256,192", "512x768x768:256,256,256",
                 "256x256x256:256,256,256,0", "256x256x512:256,256,256,1,1",
@@ -47,21 +69,30 @@ def parse_shape(s: str) -> dict:
 
 
 def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False, offsets: tuple | None = None) -> bool:
-    """offsets: HBM byte offsets of X, W, Z (default all in HBM node 0; a node is 64 MB)."""
+    """offsets: HBM byte offsets of X, W, Z (default X at HBM_START, W at 16 MB, Z at 32 MB: all in HBM node 0;
+    a node is 64 MB and has its own NoC edge port, docs/DSE.md section 8)."""
+    from softhier_mlir.testing import lcg
     app = HERE / "gemm"
     all_ok = True
     for s in shapes:
         c = parse_shape(s)
-        extra = ("#define REAL_DATA 1\n" if real else "")
+        M, N, K, acc = c["M"], c["N"], c["K"], c["accumulate"]
+        # == the fills in gemm/main.c (Z0 = 3.0 when accumulating)
+        off = {"x": HBM_START, "w": 0x01000000, "z": 0x02000000}
         if offsets:
-            extra += f"#define X_OFF 0x{offsets[0]:x}\n#define W_OFF 0x{offsets[1]:x}\n#define Z_OFF 0x{offsets[2]:x}\n"
+            off = {"x": max(offsets[0], HBM_START), "w": offsets[1], "z": offsets[2]}
+        x = lcg.fill_fp16(M, K, 1, 0, 64, 1 / 4096) if real else lcg.fill_fp16(M, K, 1, -1, 1)
+        w = lcg.fill_fp16(K, N, 2, -16, 16, 0.125) if real else lcg.fill_fp16(K, N, 2, -2, 2)
+        z = lcg.fill_fp16(M, N, 3, 3 if acc else 0, 3 if acc else 0)
+        pre, pre_h = preload_image(app, {off["x"]: x, off["w"]: w, off["z"]: z})
         (app / "shape.h").write_text(
-            f"#define GEMM_M {c['M']}\n#define GEMM_N {c['N']}\n#define GEMM_K {c['K']}\n"
+            f"#define GEMM_M {M}\n#define GEMM_N {N}\n#define GEMM_K {K}\n"
             f"#define TILE_M {c['tm']}\n#define TILE_N {c['tn']}\n#define TILE_K {c['tk']}\n"
-            f"#define PIPELINE {c['pipeline']}\n#define ACCUMULATE {c['accumulate']}\n"
-            f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n" + extra)
+            f"#define PIPELINE {c['pipeline']}\n#define ACCUMULATE {acc}\n"
+            f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n" + ("#define REAL_DATA 1\n" if real else "")
+            + f"#define OFF_X 0x{off['x']:x}\n#define OFF_W 0x{off['w']:x}\n#define OFF_Z 0x{off['z']:x}\n" + pre_h)
         build_sw(app)
-        r = run_sim()
+        r = run_sim(preload=pre)
         lines = [ln for ln in r["stdout"].splitlines() if ln.startswith("[gemm]") or "mismatch" in ln]
         ok = r["ok"] and any("GEMM_PASS" in ln for ln in lines)
         all_ok &= ok
@@ -76,13 +107,19 @@ def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False, offsets
 def run_rowops(rows: int, cols: int, cluster: str, nsamples: int = 64) -> bool:
     from softhier_mlir.testing import lcg
     app = HERE / "rowops"
-    (app / "shape.h").write_text(f"#define ROWS {rows}\n#define COLS {cols}\n#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n")
+    x16 = lcg.fill_fp16(rows, cols, 11, -16, 16, 0.125)
+    b16 = lcg.fill_fp16(rows, cols, 12, -16, 16, 0.125)
+    g16 = lcg.fill_fp16(1, cols, 13, 1, 8, 0.25)
+    be16 = lcg.fill_fp16(1, cols, 14, -4, 4, 0.25)
+    mb = rows * cols * 2                        # == the layout in rowops/main.c: x, b, g (+be at +4 KB), then 7 outputs
+    assert mb % 64 == 0, "rows*cols must be a multiple of 32 (64 B aligned matrices)"
+    pre, pre_h = preload_image(app, {HBM_START: x16, HBM_START + mb: b16, HBM_START + 2 * mb: g16, HBM_START + 2 * mb + 4096: be16},
+                               sentinel_off=HBM_START + 10 * mb)
+    (app / "shape.h").write_text(f"#define ROWS {rows}\n#define COLS {cols}\n#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n"
+                                 f"#define HBM_START 0x{HBM_START:x}\n" + pre_h)
     build_sw(app)
-    r = run_sim()
-    x = lcg.fill_fp16(rows, cols, 11, -16, 16, 0.125).astype(np.float32)
-    b = lcg.fill_fp16(rows, cols, 12, -16, 16, 0.125).astype(np.float32)
-    g = lcg.fill_fp16(1, cols, 13, 1, 8, 0.25).astype(np.float32)
-    be = lcg.fill_fp16(1, cols, 14, -4, 4, 0.25).astype(np.float32)
+    r = run_sim(preload=pre)
+    x, b, g, be = (a.astype(np.float32) for a in (x16, b16, g16, be16))
     mean = x.mean(1, keepdims=True); var = x.var(1, keepdims=True)
     ref = {
         "LN": (x - mean) / np.sqrt(var + 1e-5) * g + be,
@@ -124,13 +161,36 @@ def run_fp16cvt() -> bool:
     return ok
 
 
+def siglip_layer_inputs(S: int, D: int, F: int, H: int) -> tuple[dict[int, np.ndarray], int]:
+    """== the ALLOC order and fills of siglip_layer/main.c -> ({hbm offset: array}, end of the layout)."""
+    from softhier_mlir.testing import lcg
+    nxt = HBM_START
+
+    def alloc(nbytes):
+        nonlocal nxt
+        a = nxt; nxt += (nbytes + 4095) & ~4095; return a
+    off = {}
+    for nm, nb in [("x", S * D), ("ln1", S * D), ("q", S * D), ("k", S * D), ("v", S * D), ("kT", D * S), ("sc", H * S * S),
+                   ("o", S * D), ("ao", S * D), ("h", S * D), ("ln2", S * D), ("f1", S * F), ("g", S * F), ("f2", S * D), ("out", S * D),
+                   ("wq", D * D), ("wk", D * D), ("wv", D * D), ("wo", D * D), ("w1", D * F), ("w2", F * D),
+                   ("bq", D), ("bk", D), ("bv", D), ("bo", D), ("b1", F), ("b2", D), ("g1", D), ("be1", D), ("g2", D), ("be2", D)]:
+        off[nm] = alloc(nb * 2)
+    fills = [("x", S, D, 1, -16, 16, 0.125)] + [(nm, D, D, sd, -8, 8, 1 / 128) for nm, sd in (("wq", 2), ("wk", 3), ("wv", 4), ("wo", 5))] + \
+            [("w1", D, F, 6, -8, 8, 1 / 128), ("w2", F, D, 7, -8, 8, 1 / 256)] + \
+            [(nm, 1, D, sd, -4, 4, 0.0625) for nm, sd in (("bq", 8), ("bk", 9), ("bv", 10), ("bo", 11))] + \
+            [("b1", 1, F, 12, -4, 4, 0.0625), ("b2", 1, D, 13, -4, 4, 0.0625), ("g1", 1, D, 14, 2, 6, 0.25),
+             ("be1", 1, D, 15, -4, 4, 0.125), ("g2", 1, D, 16, 2, 6, 0.25), ("be2", 1, D, 17, -4, 4, 0.125)]
+    return {off[nm]: lcg.fill_fp16(r, c, sd, lo, hi, sc) for nm, r, c, sd, lo, hi, sc in fills}, nxt
+
+
 def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: int = 64, extra: str = "") -> bool:
     from softhier_mlir.testing import lcg, siglip_ref
     app = HERE / "siglip_layer"
+    pre, pre_h = preload_image(app, *siglip_layer_inputs(seq, d, ff, heads))
     (app / "shape.h").write_text(f"#define SEQ {seq}\n#define D_MODEL {d}\n#define D_FF {ff}\n#define N_HEADS {heads}\n"
-                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n" + extra)
+                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n#define HBM_START 0x{HBM_START:x}\n" + pre_h + extra)
     build_sw(app)
-    r = run_sim(timeout=7200)
+    r = run_sim(timeout=7200, preload=pre)
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
     if "O0a" in got:
@@ -166,9 +226,10 @@ def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers:
     mlir = siglip.emit(seq, d, ff, heads, layers, -1 if cluster == "SH_ALL" else int(cluster), True, nsamples=nsamples,
                        fused_attention=fused, tiles=tiles, hbm_split=hbm_split)
     (app / "siglip.mlir").write_text(mlir)
-    (app / "main.c").write_text(lower_and_translate(app / "siglip.mlir", None))
+    (app / "main.c").write_text(lower_and_translate(app / "siglip.mlir", None, pre := translate_preload(app)))
     build_sw(app)
-    r = run_sim(timeout=7200, traces=("redmule", "idma", "cluster_registers") if trace else (), log=trace)
+    r = run_sim(timeout=7200, preload=pre if pre and pre.exists() else None,
+                traces=("redmule", "idma", "cluster_registers") if trace else (), log=trace)
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"]
@@ -411,10 +472,15 @@ def run_attention(seq: int, d: int, heads: int, cluster: str, composed: bool, ns
     extra: more shape.h lines (Q_BLOCK=<rows>, SH_ATTN_KT_DMA=0, ... from --define)."""
     from softhier_mlir.testing import lcg
     app = HERE / "attention"
+    mb = (seq * d * 2 + 4095) & ~4095           # == attention/main.c: q, k, v, o, then kT and the H score matrices
+    pre, pre_h = preload_image(app, {HBM_START: lcg.fill_fp16(seq, d, 21, -8, 8, 0.125), HBM_START + mb: lcg.fill_fp16(seq, d, 22, -8, 8, 0.125),
+                                     HBM_START + 2 * mb: lcg.fill_fp16(seq, d, 23, -16, 16, 0.125), HBM_START + 3 * mb: lcg.fill_fp16(seq, d, 24, 7, 7)},
+                               sentinel_off=HBM_START + 5 * mb + heads * seq * seq * 2)
     (app / "shape.h").write_text(f"#define SEQ {seq}\n#define D_MODEL {d}\n#define N_HEADS {heads}\n"
-                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n#define COMPOSED {1 if composed else 0}\n" + extra)
+                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n#define COMPOSED {1 if composed else 0}\n"
+                                 f"#define HBM_START 0x{HBM_START:x}\n" + pre_h + extra)
     build_sw(app)
-    r = run_sim(timeout=7200)
+    r = run_sim(timeout=7200, preload=pre)
     ref = attention_reference(seq, d, heads)
     got = lcg.parse_samples(r["stdout"])
     ok = r["ok"] and "ATTENTION_DONE" in r["stdout"] and "ATTENTION_FAIL" not in r["stdout"]
@@ -436,6 +502,57 @@ def run_attention(seq: int, d: int, heads: int, cluster: str, composed: bool, ns
     return ok
 
 
+def run_gemm_seq() -> bool:
+    """tests/gvsoc/gemm_seq: five GEMMs of different tile shapes back to back on cluster 0, self-checked on the device."""
+    from softhier_mlir.testing import lcg
+    app = HERE / "gemm_seq"
+    f = lcg.fill_fp16
+    arrays = {HBM_START: f(256, 64, 1, -1, 1), 0x100000: f(64, 256, 2, -2, 2),           # == the fills in gemm_seq/main.c
+              0x300000: f(256, 256, 3, -1, 1), 0x400000: f(256, 64, 4, -2, 2),
+              0x600000: f(256, 256, 5, -1, 1), 0x700000: f(256, 256, 6, -2, 2),
+              0x900000: f(256, 256, 7, -1, 1), 0xA00000: f(256, 768, 8, -2, 2), 0xB00000: f(256, 768, 9, 7, 7),
+              0xC00000: f(256, 256, 10, -32, 32, 0.125), 0xD00000: f(256, 768, 11, -16, 16, 0.125)}
+    pre, pre_h = preload_image(app, arrays, sentinel_off=0xF00000)
+    (app / "shape.h").write_text(f"#define HBM_START 0x{HBM_START:x}\n" + pre_h)
+    build_sw(app)
+    r = run_sim(preload=pre)
+    lines = [ln for ln in r["stdout"].splitlines() if ln.startswith("[") and ("PASS" in ln or "FAIL" in ln or "mismatch" in ln)]
+    ok = r["ok"] and "GEMM_PASS" in r["stdout"] and "FAIL" not in r["stdout"]
+    print(f"{'PASS' if ok else 'FAIL'} gemm_seq wall={r['wall_s']}s")
+    for ln in lines:
+        print("     " + ln)
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
+
+
+def translate_preload(app: Path) -> Path | None:
+    """The preload image softhier-translate writes for a generated program (`--data preload`), else None."""
+    return app / "preload.elf" if DATA == "preload" else None
+
+
+def run_mesh(modes: list[str], heads: int = 12) -> bool:
+    """tests/gvsoc/mesh_slices: `heads` clusters each write one 64-column slice of a 256x768 output.
+    MODE 0 gemm, 1 dma stores, 2 scalar stores, 3 gemm serialized, 4 gemm private buffers,
+    5 scores+softmax+P.V (the attention sequence), 6/7 as 5 + a follow-up 16-cluster GEMM reading it."""
+    app = HERE / "mesh_slices"
+    all_ok = True
+    for m in modes:
+        mode, _, defs = m.partition(":")
+        (app / "shape.h").write_text(f"#define MODE {mode}\n#define NH {heads}\n" + "".join(f"#define {d}\n" for d in defs.split(",") if d))
+        build_sw(app)
+        r = run_sim()
+        ok = r["ok"] and "MESH_PASS" in r["stdout"]
+        all_ok &= ok
+        print(f"{'PASS' if ok else 'FAIL'} mesh_slices mode={m} heads={heads} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+        for ln in r["stdout"].splitlines():
+            if ln.startswith("[") and "FAIL" in ln and "mesh_slices" not in ln:
+                print("     " + ln)
+        if not r["ok"]:
+            print(r["stdout"][-1500:])
+    return all_ok
+
+
 # passes each example needs (none = already in the softhier dialect)
 EXAMPLE_PASSES = {
     "gemm512_linalg.mlir": "linalg-to-softhier",
@@ -444,16 +561,29 @@ EXAMPLE_PASSES = {
 }
 
 
-def lower_and_translate(mlir: Path, passes: str | None) -> str:
-    """softhier-opt [-p passes] | softhier-translate -> C source."""
+# passes each example needs (none = already in the softhier dialect)
+EXAMPLE_PASSES = {
+    "gemm512_linalg.mlir": "linalg-to-softhier",
+    "mlp_linalg.mlir": "linalg-to-softhier",
+    "gemm1024_summa.mlir": "linalg-to-softhier,distribute-summa,pipeline-gemm",
+}
+
+
+def lower_and_translate(mlir: Path, passes: str | None, preload_elf: Path | None = None) -> str:
+    """softhier-opt [-p passes] | softhier-translate -> C source. With preload_elf the test inputs go into that
+    HBM preload image (host-generated) and the program only waits for it; the file is absent afterwards when
+    some input could not be preloaded (translate says why on stderr) and the program fills on the device."""
     py = sys.executable
     src = mlir.read_text()
     if passes:
         r = subprocess.run([py, "-m", "softhier_mlir.tools.softhier_opt", str(mlir), "-p", passes],
                            capture_output=True, text=True, check=True)
         src = r.stdout
-    r = subprocess.run([py, "-m", "softhier_mlir.tools.softhier_translate", "/dev/stdin"],
+    r = subprocess.run([py, "-m", "softhier_mlir.tools.softhier_translate", "/dev/stdin"] +
+                       (["--preload-elf", str(preload_elf)] if preload_elf else []),
                        input=src, capture_output=True, text=True, check=True)
+    if r.stderr.strip():
+        print("     " + r.stderr.strip().replace("\n", "\n     "))
     return r.stdout
 
 
@@ -463,9 +593,9 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
     for f in files:
         mlir = Path(f)
         p = passes if passes is not None else EXAMPLE_PASSES.get(mlir.name)
-        (app / "main.c").write_text(lower_and_translate(mlir, p))
+        (app / "main.c").write_text(lower_and_translate(mlir, p, pre := translate_preload(app)))
         build_sw(app)
-        r = run_sim()
+        r = run_sim(preload=pre if pre and pre.exists() else None)
         lines = [ln for ln in r["stdout"].splitlines() if "_CHECK" in ln or "[sh_" in ln]
         checks = [ln for ln in lines if "_CHECK" in ln]
         # examples without a self-check (pure timing runs) pass when the simulation completes
@@ -481,7 +611,9 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir", "mesh", "attention", "preload", "smolvla"])
+    ap.add_argument("test", choices=["gemm", "gemm-seq", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir", "mesh", "attention", "preload", "smolvla"])
+    ap.add_argument("--data", choices=["preload", "device"], default="preload",
+                    help="test inputs: generated on the host into the HBM preload image (default) or on the device")
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--npz", default="/app/models/smolvla_base/vision_s256.npz", help="smolvla: output of `smolvla.py prepare`")
     ap.add_argument("--attn", type=int, default=-1, help="smolvla: cluster of the per-head attention ops (-1 = SH_ALL per op)")
@@ -513,11 +645,14 @@ if __name__ == "__main__":
     ap.add_argument("--tiles", default="model", help="siglip-mlir: GEMM tile policy, 'model' (softhier_mlir.dse.tiling) or 'tm,tn,tk'")
     ap.add_argument("--hbm-split", action="store_true", help="siglip-mlir: parameters in HBM node 1, activations in node 0")
     a = ap.parse_args()
+    DATA = a.data
     if a.cluster is None:
         a.cluster = "all" if a.test == "smolvla" else "0"
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real,
                       tuple(int(v, 0) for v in a.offsets.split(",")) if a.offsets else None)
+    elif a.test == "gemm-seq":
+        ok = run_gemm_seq()
     elif a.test == "rowops":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
     elif a.test == "fp16cvt":
