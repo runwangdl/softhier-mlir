@@ -59,3 +59,22 @@ uint16_t sh_f32_to_fp16(float f) {
 }
 /* Core-local cycle counter: the mcycle CSR reads the gvsoc clock, so several regions can be timed in one run. */
 uint32_t sh_cycles(void) { uint32_t c; asm volatile("csrr %0, mcycle" : "=r"(c)); return c; }
+/* HBM preload: `hbm_preload_done` is raised when the loader has issued its last 64 KB write, and the data then
+ * crosses the NoC from cluster (0,0) at link bandwidth (tens of us for 16 MB, ms for the full SmolVLA image), so
+ * the first global barrier does NOT imply the data is there. The image writer puts a 64 B sentinel (one NoC flit)
+ * as the last segment; cluster 0 spins on it, waits a margin for in-flight chunks on longer mesh paths, and
+ * everyone meets at a global barrier. */
+#define SH_PRELOAD_MAGIC 0x5EEDC0DEu
+void sh_preload_wait(uint64_t sentinel) {
+    if (flex_get_cluster_id() == 0 && flex_is_first_core()) {
+        const volatile uint32_t *w = (const volatile uint32_t *)(uintptr_t)sentinel;
+        const uint32_t t0 = sh_cycles();
+        while (w[0] != SH_PRELOAD_MAGIC || w[15] != SH_PRELOAD_MAGIC) {
+            if ((uint32_t)(sh_cycles() - t0) > 400000000u) { sh_printf("[sh_preload_wait] no sentinel after 400 ms, continuing\n"); break; }
+        }
+        const uint32_t t1 = sh_cycles();
+        while ((uint32_t)(sh_cycles() - t1) < 8192u) {}
+        sh_printf("[sh_preload_wait] image visible after %u cycles\n", (uint32_t)(t1 - t0));
+    }
+    flex_global_barrier_xy();
+}

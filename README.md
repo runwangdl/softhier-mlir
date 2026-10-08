@@ -101,7 +101,38 @@ for f in tests/filecheck/*.mlir; do echo "$f"; done   # see each file's RUN line
 ```
 
 To run generated C on GVSoC, drop it into `soft_hier_sdk/generated/<name>/`
-(with a one-line CMakeLists) and `make sh-old-hs app=... && make sh-old-run`.
+(with a one-line CMakeLists) and `make sh-old-hs app=... && make sh-old-run`, or use
+`tests/gvsoc/run.py` (private build dir, ideal HBM, host-side comparison).
+
+### Real weights: SmolVLA's SigLIP vision tower
+
+Parameters go into HBM through the simulator's preload path (`softhier_mlir/sim/preload.py`,
+see `docs/SIMULATOR_NOTES.md`), so a network with real weights needs no on-device data generation:
+
+```bash
+# checkpoint -> weights in library layout + im2col'd test image + fp32 HF reference (torch/transformers)
+python3 -m softhier_mlir.frontend.smolvla prepare --ckpt /app/models/smolvla_base/model.safetensors \
+        --seq 256 --out /app/models/smolvla_base/vision_s256.npz
+# npz -> MLIR (+ preload image) -> C -> gvsoc; compares sampled EMB / L<n> / OUT against the reference
+.venv/bin/python tests/gvsoc/run.py smolvla --npz /app/models/smolvla_base/vision_s256.npz --layers 1
+```
+
+`--seq 256` keeps the top-left 16x16 patches with their own position embeddings (exactly the full
+model restricted to those tokens); `--seq 1024 --all-layers` is the full 512x512 encoder. The
+program is one `scf.for` over the layers and one over the heads (the cluster instruction memory is
+64 KB), starts with `softhier.preload_wait` on the image's sentinel segment (the loader's done flag
+fires before the data has crossed the NoC) and prints `[mark]` stamps per layer; `--unroll` gives the
+spelled-out form with the layer-1 intermediate dumps, `--from-log` re-evaluates a finished run.
+
+Results (16 clusters, ideal HBM, gvsoc at 1 GHz; 256 sampled elements per tensor against the fp32
+HF `SiglipVisionModel`):
+
+| run | per layer (simulated) | total | wall | embeddings | layer 1 | layer 12 | post-LN |
+|---|---|---|---|---|---|---|---|
+| seq 256, 12 layers | 2.29 ms (attention 1.21, proj+MLP 1.07) | 38.8 ms compute + 2.7 ms preload | 502 s | max abs 0.0067 (max 1.23) | 0.039 (max 3.6) | 0.19 (max 359) | 0.21 (max 24.7, median 0.01) |
+
+Everything is at the fp16 floor (fp16 operands and RedMulE accumulation): the device agrees with
+the fp16-rounded numpy model of the same program as closely as with HF.
 
 ## Design-space exploration
 

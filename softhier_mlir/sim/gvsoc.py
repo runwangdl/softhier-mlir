@@ -155,8 +155,12 @@ build_sw.last_elf = None
 
 
 def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
-            ideal_hbm: bool = True) -> dict:
-    """Run gvsoc; returns ok/roi_ns/wall_s/stdout. ok = exited 0 and printed a ROI."""
+            ideal_hbm: bool = True, preload: Path | None = None, log: Path | None = None) -> dict:
+    """Run gvsoc; returns ok/roi_ns/wall_s/stdout. ok = exited 0 and printed a ROI.
+
+    preload: an HBM preload ELF (softhier_mlir.sim.preload.make_preload_elf); the chip's
+    hbm_preloader writes it into HBM before the program's first global barrier passes.
+    log: stream the simulator output to this file (for long runs) instead of only capturing it."""
     elf = elf or build_sw.last_elf or (SH / "sw_build" / "softhier.elf")
     env = dict(os.environ)
     env["SYSTEMC_HOME"] = str(SH / "third_party" / "systemc_install")
@@ -183,9 +187,16 @@ def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
     cmd = [str(inst / "bin" / "gapy"), "--platform=gvsoc", f"--target-dir={inst}/generators"] + \
           [f"--model-dir={d}" for d in model_dirs] + ["--target=pulp.chips.flex_cluster.flex_cluster",
            f"--binary={elf}", f"--work-dir={work}", "run"] + [f"--trace={t}" for t in traces]
+    if preload is not None:
+        cmd += ["--preload", str(Path(preload).resolve())]
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=Path(elf).parent, env=env, capture_output=True, text=True, timeout=timeout)
-    out = r.stdout + r.stderr
+    if log is None:
+        r = subprocess.run(cmd, cwd=Path(elf).parent, env=env, capture_output=True, text=True, timeout=timeout)
+        out = r.stdout + r.stderr
+    else:
+        with open(log, "w") as lf:
+            r = subprocess.run(cmd, cwd=Path(elf).parent, env=env, stdout=lf, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        out = Path(log).read_text()
     rois = [int(v) for v in PERF_RE.findall(out)]   # one entry per sh_timer_end()
     return {"ok": r.returncode == 0 and bool(rois), "returncode": r.returncode,
             "roi_ns": rois[0] if rois else None, "rois": rois, "wall_s": round(time.time() - t0, 1), "stdout": out}

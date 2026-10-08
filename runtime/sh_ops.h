@@ -28,11 +28,13 @@ uint32_t sh_num_clusters(void);
 void     sh_timer_start(void);          /* global timer: call from ONE core only */
 void     sh_timer_end(void);
 void     sh_eoc(uint32_t val);
-uint32_t sh_cycles(void);               /* this core's cycle counter (mcycle CSR = the gvsoc clock) */
+uint32_t sh_cycles(void);               /* this core's mcycle (1 GHz: 1 cycle = 1 ns; wraps every 4.29 s) */
 void     sh_printf(const char *fmt, ...);
 uint64_t sh_hbm_addr(uint64_t byte_offset);   /* HBM base + offset */
 uint64_t sh_hbm_malloc(uint32_t bytes);       /* first core of each cluster only (SDK allocator) */
 uint32_t sh_l1_size(void);                    /* TCDM bytes per cluster */
+void     sh_preload_wait(uint64_t sentinel);  /* all cores: block until the HBM preload image (whose last 64 B segment is the
+                                                 sentinel, softhier_mlir.sim.preload.sentinel_array) is visible; global barrier */
 
 #define SH_ALL 0xFFFFFFFFu   /* `cluster` argument: split the work over all clusters (global barrier at the end) */
 
@@ -111,6 +113,7 @@ void sh_test_fill_int_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld
 void sh_test_fill_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, int lo, int hi, float scale);
 /* Print nsamples fp16 codes of a matrix at LCG(seed) positions: "<tag> r c hex" lines, for host comparison. */
 void sh_test_dump_samples(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, uint32_t nsamples, const char *tag);
+void sh_test_dump_samples_idx(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, uint32_t nsamples, const char *tag, uint32_t idx); /* tag<idx> */
 /* Check `nsamples` pseudo-random positions of Z against z0 + a scalar fp32 dot product of X,W
  * (z0 = the constant Z was pre-filled with when testing accumulate=1). Returns number of mismatches (|diff| > tol). First core. Prints a summary. */
 uint32_t sh_test_check_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
