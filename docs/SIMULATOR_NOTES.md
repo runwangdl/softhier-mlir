@@ -18,13 +18,15 @@ removed from `gvsoc-pulp` in 2026-01 and the public SDK (2026-06) only ships the
 | 7 | three cores in a cluster are not faster than one on straight-line code; a 5-instruction loop runs 5.5x slower depending on its address | one `instr_router` (8 B/cycle) shared by the three cores, 32 B single-line prefetchers, no RVC: ~1 instruction/cycle for the whole cluster unless the loop fits one 32 B line | minimise instructions per element (fp16 SIMD `vfadd.h` ... = 4 lanes per instruction), `#pragma GCC optimize("align-loops=32")` in the library |
 | 8 | an `fsd` by the FP subsystem followed by an integer `lw`/`lhu` of the same address (and `sw` followed by `fld`) reads stale data; data stored with `fsd` was not yet in TCDM when the DMA read it after the barrier | the integer core and its FP subsystem are two masters; neither program order nor the barrier CSR orders their memory accesses | `sh_v4_after_fsd` / `sh_v4_after_sw` / `sh_fp_fence` (`runtime/sh_simd.inc.c`): an `fmv.x.w` whose result the loads depend on drains the subsystem; a read-back feeding the `fld` address orders the other direction |
 | 9 | core 0 hangs forever in a loop over a TCDM buffer at offset 0 | TCDM address 0 is `NULL` to GCC (and the SDK L1 allocator lives at 0x10) | the library never stages data below TCDM 0x1000 (`SH_ROWOPS_L1_BASE`) |
+| 10 | software softmax / LN / GELU results depend on the *binary layout*: `siglip --cluster all` failed (P0 = softmax(-x), negative "probabilities", O off by 0.8) while `--cluster 0`, or the same binary plus an unrelated `printf`, passed; identical numbers whether the heads ran concurrently or serialized | Snitch core <-> FP-subsystem integer-register hazard: `fcvt.w.s`, `flt.s`, `feq.s`, `fmv.x.s`, `fclass.s` (and the fp16/fp8 scalar variants) lack the `nseq` tag that the `.d` versions have, so they are queued in the FPU sequence buffer; the integer core runs ahead, reads the destination register before the subsystem wrote it, and the late write-back clobbers newer values (insn trace: `addi a5,a5,127` / `slli` execute before `fcvt.w.s a5`, then `fmv.w.x fa4,a5` gets the stale `a5`). Only bites when the sequence buffer is non-empty, i.e. depends on cycle timing / code alignment | patch `gvsoc_snitch_fp_int_nseq.patch` (ISA tables: add `nseq` to every scalar FP instruction with an integer operand), regenerate `isa_snitch_rv32imfdva.cpp`, rebuild `gen_isa_snitch_rv32imfdva_cpp_*`; until it is installed, run with `SOFTHIER_MODEL_DIR=<dir with the patched .so>` (see below) |
 
 Other facts the library relies on:
 - RedMulE convention: `flex_redmule_config(m, n, k)` computes `Y[m,k] += X[m,n] . W[n,k]`
   (the contraction is `n`). `sh_gemm` therefore calls `config(tm, tk, tn)`.
 - The iDMA model does 2-D transfers HBM -> TCDM but not TCDM -> HBM: stores are per-row 1-D.
 - Only one `IoReq` is in flight per FP subsystem; the 64 KB instruction memory is enough
-  for the whole library (`.text` ~20 KB).
+  for the whole library (`.text` ~20 KB). Every cluster has its own copy of that memory
+  (`.text`/`.rodata`/`.sdata`) and its own stack memory behind the cluster's `narrow_axi` router.
 - Every core executes `main()`: never keep mutable program state in `.bss` (it is shared
   L3 memory); allocate HBM offsets on the stack or with constants.
 
@@ -75,6 +77,34 @@ with every tensor within tolerance. Remaining cost is instruction fetch (#7): so
 
 Open point (not needed by the library): why `flh` still reads 0 after the handler patch was not
 investigated further; the library avoids scalar fp16 loads entirely (`fld` of four halves).
+
+## Integer-register hazard between the Snitch core and its FP subsystem (#6, 2026-10-08)
+
+How it was found (`tests/gvsoc/mesh_slices`, `run.py siglip --define ...`): every isolated multi-cluster
+ingredient passed (12 clusters storing 64-column slices of one 256x768 matrix with GEMM / 1-D DMA /
+scalar stores, the full scores-softmax-P.V sequence on 12 clusters, the follow-up 16-cluster GEMM), the
+failing run gave bit-identical wrong numbers with a global barrier between the heads, and the P0
+checksum did not change after the softmax wrote it. So neither the DMA, the NoC nor the HBM model
+corrupts anything concurrently: the softmax itself produced `softmax(-0.125 x)` (row dump matched it to
+3e-3, with tiny negative entries where the `exp` polynomial was evaluated far outside its range), and
+the instruction trace of `cluster_0/fp_ss0` + `cluster_0/pe0` showed the integer core consuming the
+`fcvt.w.s` result before the subsystem produced it. The decisive clue was that two binaries whose only
+difference was dead code after the attention loop (`.sdata` shifted by 0x20) passed and failed
+deterministically.
+
+Timing effect of the fix: the core now stalls on every FP -> int transfer. `siglip --seq 256`:
+`--cluster all` 52.14 -> 52.72 M ns (+1.1 %), `--cluster 0` 700.5 -> 718.2 M ns (+2.5 %, more software
+row ops per cluster); RedMulE-only runs are unchanged. All 13 sampled tensors match numpy in both modes
+(O/H/G/OUT maxerr 0.003-0.028).
+
+Running against a model build that is not installed: `softhier_mlir.sim.gvsoc.run_sim` calls `gapy`
+with `--work-dir=<ELF dir>` (private `gvsoc_config.json`; without it two concurrent runs from any
+agents on this machine swap each other's ELF) and prepends every directory in `SOFTHIER_MODEL_DIR`
+(colon separated) to the model search path, so a patched `.so` can be tested without touching
+`/app/install/softhier/install/models`. The patched integer-core ISA model was built from
+`build/core`'s compile/link lines with only the regenerated `isa_snitch_rv32imfdva.cpp` replaced (the
+patch header lists the targets); the FP-subsystem decoder does not matter for this bug because the
+sequencer decides on the core's instruction descriptor.
 
 ## Host speed of the RedMulE functional model (patch `gvsoc_redmule_neon.patch`, 2026-10-08)
 

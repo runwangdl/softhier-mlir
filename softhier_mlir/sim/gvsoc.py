@@ -164,10 +164,20 @@ def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
     env["PYTHONPATH"] = f"{SH}/install/python:{SH}/soft_hier/flex_cluster_utilities:" + env.get("PYTHONPATH", "")
     if ideal_hbm:
         env["SOFTHIER_IDEAL_HBM"] = "1"
-    cmd = [str(SH / "install" / "bin" / "gvsoc"), "--target=pulp.chips.flex_cluster.flex_cluster",
-           f"--binary={elf}", "run"] + [f"--trace={t}" for t in traces]
-    # gapy writes gvsoc_config.json (which names the binary) into the cwd and gvsoc_launcher reads
-    # it back: two runs sharing a cwd swap binaries. Run from the binary's own directory, never SH.
+    # --work-dir: gapy writes gvsoc_config.json (which names the binary) into the work dir and runs
+    # from there. Without it every run shares $SOFTHIER_HOME/gvsoc_config.json and two concurrent
+    # simulations (several agents, or threads) silently run each other's ELF.
+    work = Path(elf).resolve().parent
+    # SOFTHIER_MODEL_DIR: an extra model directory searched BEFORE install/models (the engine takes
+    # the first include dir that has the .so), so a run can pin e.g. one RedMulE model build while
+    # the shared install is being rebuilt by someone else. This replicates install/bin/gvsoc.
+    inst = SH / "install"
+    env["LD_LIBRARY_PATH"] = f"{inst}/lib:" + env["LD_LIBRARY_PATH"]
+    env["PATH"] = f"{inst}/bin:" + env.get("PATH", "")
+    model_dirs = [d for d in os.environ.get("SOFTHIER_MODEL_DIR", "").split(":") if d] + [str(inst / "models")]
+    cmd = [str(inst / "bin" / "gapy"), "--platform=gvsoc", f"--target-dir={inst}/generators"] + \
+          [f"--model-dir={d}" for d in model_dirs] + ["--target=pulp.chips.flex_cluster.flex_cluster",
+           f"--binary={elf}", f"--work-dir={work}", "run"] + [f"--trace={t}" for t in traces]
     t0 = time.time()
     r = subprocess.run(cmd, cwd=Path(elf).parent, env=env, capture_output=True, text=True, timeout=timeout)
     out = r.stdout + r.stderr

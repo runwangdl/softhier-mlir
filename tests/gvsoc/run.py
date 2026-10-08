@@ -5,6 +5,11 @@
     python tests/gvsoc/run.py gemm --shapes 256x256x256 512x768x768:256,256,256
     python tests/gvsoc/run.py mlir examples/gemm512_linalg.mlir -p linalg-to-softhier
     python tests/gvsoc/run.py mlir examples/*.mlir          # every example, auto passes
+    python tests/gvsoc/run.py siglip --seq 256 --cluster all [--define ATTN_SERIAL ATTN_CANARY ...]
+    python tests/gvsoc/run.py mesh --modes 0 1 2 5 6        # multi-cluster slice-store repro (mesh_slices)
+
+Environment: SOFTHIER_MODEL_DIR=<dir>[:<dir>] puts extra gvsoc model directories in front of
+install/models (pin or test a model build); see docs/SIMULATOR_NOTES.md.
 
 Each case writes tests/gvsoc/<test>/shape.h, builds the SDK app in the x86 chroot and runs
 GVSoC natively (ideal HBM). Prints PASS/FAIL and the ROI in ns.
@@ -114,15 +119,17 @@ def run_fp16cvt() -> bool:
     return ok
 
 
-def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: int = 64) -> bool:
+def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: int = 64, extra: str = "") -> bool:
     from softhier_mlir.testing import lcg, siglip_ref
     app = HERE / "siglip_layer"
     (app / "shape.h").write_text(f"#define SEQ {seq}\n#define D_MODEL {d}\n#define D_FF {ff}\n#define N_HEADS {heads}\n"
-                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n")
+                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n" + extra)
     build_sw(app)
     r = run_sim(timeout=7200)
     ref = siglip_ref.layer_reference(seq, d, ff, heads)
     got = lcg.parse_samples(r["stdout"])
+    if "O0a" in got:
+        ref = {**ref, "O0a": ref["O0"]}
     ok = r["ok"] and "SIGLIP_LAYER_DONE" in r["stdout"]
     for ln in r["stdout"].splitlines():
         if ln.startswith("[sh_") or ln.startswith("[head"):
@@ -167,6 +174,28 @@ def run_siglip_mlir(seq: int, d: int, ff: int, heads: int, cluster: str, layers:
         ok &= bad == 0
     (app / "last_run.log").write_text(r["stdout"])
     return ok
+
+
+def run_mesh(modes: list[str], heads: int = 12) -> bool:
+    """tests/gvsoc/mesh_slices: `heads` clusters each write one 64-column slice of a 256x768 output.
+    MODE 0 gemm, 1 dma stores, 2 scalar stores, 3 gemm serialized, 4 gemm private buffers,
+    5 scores+softmax+P.V (the attention sequence), 6/7 as 5 + a follow-up 16-cluster GEMM reading it."""
+    app = HERE / "mesh_slices"
+    all_ok = True
+    for m in modes:
+        mode, _, defs = m.partition(":")
+        (app / "shape.h").write_text(f"#define MODE {mode}\n#define NH {heads}\n" + "".join(f"#define {d}\n" for d in defs.split(",") if d))
+        build_sw(app)
+        r = run_sim()
+        ok = r["ok"] and "MESH_PASS" in r["stdout"]
+        all_ok &= ok
+        print(f"{'PASS' if ok else 'FAIL'} mesh_slices mode={m} heads={heads} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+        for ln in r["stdout"].splitlines():
+            if ln.startswith("[") and "FAIL" in ln and "mesh_slices" not in ln:
+                print("     " + ln)
+        if not r["ok"]:
+            print(r["stdout"][-1500:])
+    return all_ok
 
 
 # passes each example needs (none = already in the softhier dialect)
@@ -214,7 +243,7 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir"])
+    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir", "mesh"])
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--d", type=int, default=768)
@@ -226,8 +255,10 @@ if __name__ == "__main__":
     ap.add_argument("files", nargs="*", help="mlir: input .mlir files")
     ap.add_argument("-p", "--passes", help="mlir: pass pipeline for softhier-opt (default: per-example table)")
     ap.add_argument("--shapes", nargs="*")
+    ap.add_argument("--modes", nargs="*", default=["0", "1", "2", "5", "6"], help="mesh: MODE[:DEF,...]")
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
+    ap.add_argument("--define", nargs="*", default=[], help="siglip: extra NAME[=VALUE] macros for shape.h")
     a = ap.parse_args()
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real)
@@ -235,8 +266,11 @@ if __name__ == "__main__":
         ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
     elif a.test == "fp16cvt":
         ok = run_fp16cvt()
+    elif a.test == "mesh":
+        ok = run_mesh(a.modes, a.heads)
     elif a.test == "siglip":
-        ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0")
+        ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0",
+                        extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "siglip-mlir":
         ok = run_siglip_mlir(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else a.cluster, a.layers)
     else:
