@@ -16,24 +16,28 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from softhier_mlir.sim.gvsoc import build_sw, run_sim  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
-DEFAULT_GEMM = ["256x256x256", "256x768x192:256,192,256", "512x768x768:256,256,256",
-                "256x256x256:256,256,256,0", "256x256x512:256,256,256,1,1"]
+DEFAULT_GEMM = ["256x256x256", "256x768x192:256,256,192", "512x768x768:256,256,256",
+                "256x256x256:256,256,256,0", "256x256x512:256,256,256,1,1",
+                "1024x768x768:256,256,256,1,0,all", "1024x3072x768:256,256,256,1,0,all"]
 
 
 def parse_shape(s: str) -> dict:
-    """MxNxK[:tm,tn,tk[,pipeline[,accumulate]]]"""
+    """MxNxK[:tm,tn,tk[,pipeline[,accumulate[,cluster]]]]   cluster = 0 | all"""
     dims, _, rest = s.partition(":")
     m, n, k = (int(v) for v in dims.lower().split("x"))
-    opts = [int(v) for v in rest.split(",")] if rest else []
-    tm, tn, tk = (opts + [0, 0, 0])[:3]
-    pipe = opts[3] if len(opts) > 3 else 1
-    acc = opts[4] if len(opts) > 4 else 0
-    return dict(M=m, N=n, K=k, tm=tm, tn=tn, tk=tk, pipeline=pipe, accumulate=acc)
+    opts = rest.split(",") if rest else []
+    tm, tn, tk = (int(v) for v in (opts + ["0", "0", "0"])[:3])
+    pipe = int(opts[3]) if len(opts) > 3 else 1
+    acc = int(opts[4]) if len(opts) > 4 else 0
+    cluster = "SH_ALL" if len(opts) > 5 and opts[5] == "all" else "0"
+    return dict(M=m, N=n, K=k, tm=tm, tn=tn, tk=tk, pipeline=pipe, accumulate=acc, cluster=cluster)
 
 
 def run_gemm(shapes: list[str], nsamples: int = 256) -> bool:
@@ -45,7 +49,7 @@ def run_gemm(shapes: list[str], nsamples: int = 256) -> bool:
             f"#define GEMM_M {c['M']}\n#define GEMM_N {c['N']}\n#define GEMM_K {c['K']}\n"
             f"#define TILE_M {c['tm']}\n#define TILE_N {c['tn']}\n#define TILE_K {c['tk']}\n"
             f"#define PIPELINE {c['pipeline']}\n#define ACCUMULATE {c['accumulate']}\n"
-            f"#define NSAMPLES {nsamples}\n")
+            f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n")
         build_sw(app)
         r = run_sim()
         lines = [ln for ln in r["stdout"].splitlines() if ln.startswith("[gemm]") or "mismatch" in ln]
@@ -57,6 +61,61 @@ def run_gemm(shapes: list[str], nsamples: int = 256) -> bool:
         if not r["ok"]:
             print(r["stdout"][-1500:])
     return all_ok
+
+
+def run_rowops(rows: int, cols: int, cluster: str, nsamples: int = 64) -> bool:
+    from softhier_mlir.testing import lcg
+    app = HERE / "rowops"
+    (app / "shape.h").write_text(f"#define ROWS {rows}\n#define COLS {cols}\n#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n")
+    build_sw(app)
+    r = run_sim()
+    x = lcg.fill_fp16(rows, cols, 11, -16, 16, 0.125).astype(np.float32)
+    b = lcg.fill_fp16(rows, cols, 12, -16, 16, 0.125).astype(np.float32)
+    g = lcg.fill_fp16(1, cols, 13, 1, 8, 0.25).astype(np.float32)
+    be = lcg.fill_fp16(1, cols, 14, -4, 4, 0.25).astype(np.float32)
+    mean = x.mean(1, keepdims=True); var = x.var(1, keepdims=True)
+    ref = {
+        "LN": (x - mean) / np.sqrt(var + 1e-5) * g + be,
+        "SM": (lambda e: e / e.sum(1, keepdims=True))(np.exp(0.5 * x - (0.5 * x).max(1, keepdims=True))),
+        "GELU": 0.5 * x * (1 + np.tanh(0.7978845608 * (x + 0.044715 * x ** 3))),
+        "ADD": x + b, "BIAS": x + be, "SCALE": x * np.float32(0.3), "T": x.T,
+    }
+    got = lcg.parse_samples(r["stdout"])
+    ok = r["ok"] and "ROWOPS_DONE" in r["stdout"]
+    print(f"{'PASS' if ok else 'FAIL'} rowops {rows}x{cols} cluster={cluster} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    for tag, arr in ref.items():
+        if tag not in got:
+            print(f"     {tag:<6} MISSING"); ok = False; continue
+        bad, maxerr = lcg.compare_samples(got[tag], arr, atol=2e-2, rtol=2e-2)
+        print(f"     {tag:<6} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
+        ok &= bad == 0
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
+
+
+def run_siglip(seq: int, d: int, ff: int, heads: int, cluster: str, nsamples: int = 64) -> bool:
+    from softhier_mlir.testing import lcg, siglip_ref
+    app = HERE / "siglip_layer"
+    (app / "shape.h").write_text(f"#define SEQ {seq}\n#define D_MODEL {d}\n#define D_FF {ff}\n#define N_HEADS {heads}\n"
+                                 f"#define CLUSTER {cluster}\n#define NSAMPLES {nsamples}\n")
+    build_sw(app)
+    r = run_sim(timeout=7200)
+    ref = siglip_ref.layer_reference(seq, d, ff, heads)
+    got = lcg.parse_samples(r["stdout"])
+    ok = r["ok"] and "SIGLIP_LAYER_DONE" in r["stdout"]
+    macs = 4 * seq * d * d + 2 * seq * d * ff + 2 * seq * seq * d
+    print(f"{'PASS' if ok else 'FAIL'} siglip_layer S={seq} D={d} F={ff} H={heads} cluster={cluster} "
+          f"roi={r['roi_ns']} ns ({macs / 1e6:.0f} MMAC, {macs / r['roi_ns'] if r['roi_ns'] else 0:.0f} MAC/ns) wall={r['wall_s']}s")
+    for tag, arr in ref.items():
+        if tag not in got:
+            print(f"     {tag:<4} MISSING"); ok = False; continue
+        bad, maxerr = lcg.compare_samples(got[tag], arr, atol=0.05, rtol=0.05)
+        print(f"     {tag:<4} samples={len(got[tag])} bad={bad} maxerr={maxerr:.4f} {'PASS' if bad == 0 else 'FAIL'}")
+        ok &= bad == 0
+    if not r["ok"]:
+        print(r["stdout"][-1500:])
+    return ok
 
 
 # passes each example needs (none = already in the softhier dialect)
@@ -104,7 +163,14 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["gemm", "mlir"])
+    ap.add_argument("test", choices=["gemm", "mlir", "rowops", "siglip"])
+    ap.add_argument("--seq", type=int, default=256)
+    ap.add_argument("--d", type=int, default=768)
+    ap.add_argument("--ff", type=int, default=3072)
+    ap.add_argument("--heads", type=int, default=12)
+    ap.add_argument("--rows", type=int, default=256)
+    ap.add_argument("--cols", type=int, default=768)
+    ap.add_argument("--cluster", default="0", help="rowops: 0 or all")
     ap.add_argument("files", nargs="*", help="mlir: input .mlir files")
     ap.add_argument("-p", "--passes", help="mlir: pass pipeline for softhier-opt (default: per-example table)")
     ap.add_argument("--shapes", nargs="*")
@@ -112,6 +178,10 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples)
+    elif a.test == "rowops":
+        ok = run_rowops(a.rows, a.cols, "SH_ALL" if a.cluster == "all" else "0")
+    elif a.test == "siglip":
+        ok = run_siglip(a.seq, a.d, a.ff, a.heads, "SH_ALL" if a.cluster == "all" else "0")
     else:
         ok = run_mlir(a.files, a.passes)
     sys.exit(0 if ok else 1)

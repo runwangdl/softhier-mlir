@@ -1,9 +1,10 @@
-#define GEMM_M 256
-#define GEMM_N 768
-#define GEMM_K 192
+#define GEMM_M 1024
+#define GEMM_N 3072
+#define GEMM_K 768
 #define TILE_M 256
-#define TILE_N 192
-#define TILE_K 192
+#define TILE_N 256
+#define TILE_K 256
 #define PIPELINE 1
 #define ACCUMULATE 0
+#define CLUSTER SH_ALL
 #define NSAMPLES 256

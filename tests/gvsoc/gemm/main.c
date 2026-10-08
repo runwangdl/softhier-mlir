@@ -1,7 +1,7 @@
 /* gvsoc test: sh_gemm on one cluster, data generated on device, sampled self-check.
  * Shape/tiling come from shape.h (written by tests/gvsoc/run.py). */
 #include "sh_ops.h"
-#include "shape.h"      /* GEMM_M GEMM_N GEMM_K TILE_M TILE_N TILE_K PIPELINE ACCUMULATE NSAMPLES */
+#include "shape.h"      /* GEMM_M GEMM_N GEMM_K TILE_M TILE_N TILE_K PIPELINE ACCUMULATE CLUSTER NSAMPLES */
 
 int main(void) {
     sh_init();
@@ -17,11 +17,11 @@ int main(void) {
     sh_gemm_cfg cfg = { .tm = TILE_M, .tn = TILE_N, .tk = TILE_K, .pipeline = PIPELINE,
                         .accumulate = ACCUMULATE, .fmt = SH_FP16, .l1_base = 0 };
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
-        sh_printf("[gemm] %ux%ux%u tile %ux%ux%u pipeline=%d acc=%d l1=%u B\n", M, N, K, TILE_M ? TILE_M : 256, TILE_N ? TILE_N : 256, TILE_K ? TILE_K : 256,
-                  PIPELINE, ACCUMULATE, sh_gemm_l1_bytes(M, N, K, &cfg));
+        sh_printf("[gemm] %ux%ux%u tile %ux%ux%u pipeline=%d acc=%d cluster=%s l1=%u B\n", M, N, K, TILE_M ? TILE_M : 256, TILE_N ? TILE_N : 256, TILE_K ? TILE_K : 256,
+                  PIPELINE, ACCUMULATE, CLUSTER == SH_ALL ? "all" : "0", sh_gemm_l1_bytes(M, N, K, &cfg));
         sh_timer_start();
     }
-    int rc = sh_gemm(x, w, z, M, N, K, K, N, N, &cfg, 0);
+    int rc = sh_gemm(x, w, z, M, N, K, K, N, N, &cfg, CLUSTER);
     sh_barrier_global();
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
         sh_timer_end();

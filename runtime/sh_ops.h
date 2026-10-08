@@ -32,6 +32,8 @@ uint64_t sh_hbm_addr(uint64_t byte_offset);   /* HBM base + offset */
 uint64_t sh_hbm_malloc(uint32_t bytes);       /* first core of each cluster only (SDK allocator) */
 uint32_t sh_l1_size(void);                    /* TCDM bytes per cluster */
 
+#define SH_ALL 0xFFFFFFFFu   /* `cluster` argument: split the work over all clusters (global barrier at the end) */
+
 /* ---- formats ------------------------------------------------------------------------ */
 enum sh_fmt { SH_FP16 = 0, SH_FP8 = 1, SH_INT16 = 2, SH_INT8 = 3 };
 
@@ -44,7 +46,8 @@ typedef struct {
     uint32_t l1_base;        /* TCDM byte offset of the scratch area (default 0) */
 } sh_gemm_cfg;
 
-/* Single-cluster tiled GEMM, runs on cluster `cluster` (others return at once).
+/* Tiled GEMM. `cluster` = the one cluster that runs it, or SH_ALL: output tiles are dealt
+ * round-robin over all clusters (each streams its own panels from HBM; global barrier at the end).
  * Requires M%tm==0, N%tn==0, K%tk==0 and the 5-tile scratch to fit in TCDM.
  * Returns 0 on success, <0 on a constraint violation (reason printed by the first core). */
 int sh_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
@@ -59,6 +62,16 @@ int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uin
 /* Bytes of TCDM the given cfg needs (so a compiler can check the budget without running). */
 uint32_t sh_gemm_l1_bytes(uint32_t M, uint32_t N, uint32_t K, const sh_gemm_cfg *cfg);
 
+/* ---- row-wise / elementwise ops on fp16 HBM tensors (rows x cols, leading dim ld) -------------
+ * `cluster`: executing cluster id, or SH_ALL to split row blocks over all clusters. */
+void sh_layernorm(uint64_t y, uint64_t x, uint64_t gamma, uint64_t beta, uint32_t rows, uint32_t cols, uint32_t ld, float eps, uint32_t cluster);
+void sh_softmax_rows(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, float scale, uint32_t cluster); /* softmax(scale*x) per row */
+void sh_gelu(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t cluster);                    /* tanh approximation */
+void sh_add(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t cluster);         /* y = a + b */
+void sh_add_bias(uint64_t y, uint64_t x, uint64_t bias_row, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t cluster); /* y = x + bias (per column) */
+void sh_scale(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, float s, uint32_t cluster);
+void sh_transpose(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint32_t ld_src, uint32_t ld_dst, uint32_t cluster); /* dst[cols,rows] */
+
 /* ---- TCDM-resident ops (calling cluster only; intra-cluster sync inside) ------------------ */
 uint32_t sh_l1_addr(uint32_t off);                                   /* TCDM byte offset -> address */
 void     sh_l1_zero(uint32_t off, uint32_t bytes);                   /* via ZOMEM iDMA */
@@ -69,8 +82,12 @@ void     sh_redmule(uint32_t x, uint32_t w, uint32_t y, uint32_t m, uint32_t n, 
 void     sh_dma_copy(uint64_t dst, uint64_t src, uint32_t bytes);    /* 1-D, DM core, sync */
 
 /* ---- test helpers (on-device data generation + self-check, no host round trip) --------- */
-/* Fill rows x cols fp16 matrix (ld elements) with integers in [lo, hi] from an LCG(seed). First core. */
+/* Fill rows x cols fp16 matrix (ld elements) with integers in [lo, hi] from an LCG(seed), times `scale`
+ * (sh_test_fill_int_fp16 = scale 1). Twin implementation: softhier_mlir/testing/lcg.py. First core. */
 void sh_test_fill_int_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, int lo, int hi);
+void sh_test_fill_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, int lo, int hi, float scale);
+/* Print nsamples fp16 codes of a matrix at LCG(seed) positions: "<tag> r c hex" lines, for host comparison. */
+void sh_test_dump_samples(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, uint32_t nsamples, const char *tag);
 /* Check `nsamples` pseudo-random positions of Z against z0 + a scalar fp32 dot product of X,W
  * (z0 = the constant Z was pre-filled with when testing accumulate=1). Returns number of mismatches (|diff| > tol). First core. Prints a summary. */
 uint32_t sh_test_check_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,

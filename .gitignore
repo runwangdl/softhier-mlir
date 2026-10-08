@@ -8,3 +8,5 @@ build/
 dist/
 tests/gvsoc/gemm/shape.h
 tests/gvsoc/mlir_app/main.c
+tests/gvsoc/rowops/shape.h
+tests/gvsoc/siglip_layer/shape.h

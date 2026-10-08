@@ -1,15 +1,26 @@
 /* On-device test data + self-check (no host round trip). All run on the calling core. */
 static inline uint32_t sh_lcg(uint32_t *s) { *s = *s * 1664525u + 1013904223u; return *s >> 8; }
 
-void sh_test_fill_int_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, int lo, int hi) {
+void sh_test_fill_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, int lo, int hi, float scale) {
     uint32_t s = seed ^ 0x9e3779b9u;
     const uint32_t range = (uint32_t)(hi - lo + 1);
     for (uint32_t r = 0; r < rows; ++r) {
         volatile uint16_t *row = (volatile uint16_t *)(uintptr_t)(a + (uint64_t)r * ld * 2);
         for (uint32_t cc = 0; cc < cols; ++cc) {
             int v = lo + (int)(sh_lcg(&s) % range);
-            row[cc] = sh_f32_to_fp16((float)v);
+            row[cc] = sh_f32_to_fp16((float)v * scale);
         }
+    }
+}
+void sh_test_fill_int_fp16(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, int lo, int hi) {
+    sh_test_fill_fp16(a, rows, cols, ld, seed, lo, hi, 1.0f);
+}
+void sh_test_dump_samples(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, uint32_t seed, uint32_t nsamples, const char *tag) {
+    uint32_t s = seed ^ 0x9e3779b9u;
+    for (uint32_t n = 0; n < nsamples; ++n) {
+        uint32_t i = sh_lcg(&s) % rows, j = sh_lcg(&s) % cols;
+        uint16_t v = ((const volatile uint16_t *)(uintptr_t)(a + (uint64_t)i * ld * 2))[j];
+        sh_printf("%s %u %u %04x\n", tag, i, j, (uint32_t)v);
     }
 }
 
