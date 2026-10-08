@@ -174,7 +174,12 @@ def run_sim(elf: Path | None = None, traces: tuple = (), timeout: int = 3600,
     inst = SH / "install"
     env["LD_LIBRARY_PATH"] = f"{inst}/lib:" + env["LD_LIBRARY_PATH"]
     env["PATH"] = f"{inst}/bin:" + env.get("PATH", "")
-    model_dirs = [d for d in os.environ.get("SOFTHIER_MODEL_DIR", "").split(":") if d] + [str(inst / "models")]
+    model_dirs = [d for d in os.environ.get("SOFTHIER_MODEL_DIR", "").split(":") if d]
+    # Fixed Snitch integer-core model (fp->int `nseq` tags, see docs/SIMULATOR_NOTES.md #10) built next to
+    # the stock models: used by default when present. SOFTHIER_STOCK_MODELS=1 forces the stock model.
+    if (inst / "models_fix").is_dir() and not os.environ.get("SOFTHIER_STOCK_MODELS"):
+        model_dirs.append(str(inst / "models_fix"))
+    model_dirs.append(str(inst / "models"))
     cmd = [str(inst / "bin" / "gapy"), "--platform=gvsoc", f"--target-dir={inst}/generators"] + \
           [f"--model-dir={d}" for d in model_dirs] + ["--target=pulp.chips.flex_cluster.flex_cluster",
            f"--binary={elf}", f"--work-dir={work}", "run"] + [f"--trace={t}" for t in traces]
