@@ -403,6 +403,7 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             _, _, ldo, _ = bufs.geom(op.o)
             heads, kvh = op.heads.value.data, op.kv_heads.value.data
             dh = bufs.geom(op.q)[1] // heads
+            nb = max(1, _int_attr(op, "n_batch", 1))       # candidate blocks sharing the prefix KV
             if op.ko is not None:
                 So, _, ldko, _ = bufs.geom(op.ko)
                 _, _, ldvo, _ = bufs.geom(op.vo)
@@ -410,8 +411,13 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             else:
                 So, ldko, ldvo, own = 0, 0, 0, "0, 0"
             tok = bufs.haddr(op.mask) if op.mask is not None else "0"
-            b(f"{ind}sh_x_attention({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
-              f"{Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
+            if nb == 1:
+                b(f"{ind}sh_x_attention({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
+                  f"{Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
+            else:
+                assert Sq % nb == 0 and So % nb == 0, (Sq, So, nb)
+                b(f"{ind}sh_x_attention_n({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
+                  f"{Sq // nb}, {Lp}, {So // nb}, {nb}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
 
         elif isinstance(op, DumpAllOp):
             rows, cols, ld, _ = bufs.geom(op.buf)

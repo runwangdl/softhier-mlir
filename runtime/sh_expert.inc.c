@@ -71,23 +71,33 @@ void sh_x_axpy(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols,
     sh_rowop(y, a, b, 0, 0, rows, cols, ldy, lda, ldb, sh_xk_axpy, &alpha, cluster);
 }
 
-/* ---- GQA cross / self attention over a stationary prefix KV ---------------------------------------- */
-typedef struct { uint32_t q, k, kt, s, v, o, sum, vrow, vld, prof, end, Lpad; } sh_x_attn_l1;
+/* ---- GQA cross / self attention over a stationary prefix KV ----------------------------------------
+ * nb candidates (docs/WORLD_MODEL.md): q holds nb blocks of Sq query rows, ko / vo nb blocks of So own rows, o nb
+ * blocks of Sq rows. The prefix K/V (and its kT transpose) is staged once per head; with own keys the head runs nb
+ * passes, each over [prefix ; own block c] (Lpad = Lp + So rounded up to 32, the same scores width as nb = 1), so
+ * candidate c's queries never see another candidate's keys and the softmax work is nb x the single-candidate work
+ * instead of nb x (Lp + nb So). Without own keys (cross layers) all nb Sq rows go through one pass. */
+typedef struct { uint32_t q, k, kt, s, v, vown, o, sum, vrow, vld, prof, end, Lpad, R; } sh_x_attn_l1;
 
-static inline sh_x_attn_l1 sh_x_attn_layout(uint32_t Sq, uint32_t dh, uint32_t L, uint32_t base) {
-    sh_x_attn_l1 l; const uint32_t Lpad = (L + 31u) & ~31u, NC = ARCH_NUM_CORE_PER_CLUSTER;
-    l.Lpad = Lpad;
-    l.q = base;                               l.k = l.q + sh_x_up64(Sq * dh * 2);
-    l.kt = l.k + sh_x_up64(L * dh * 2);       l.s = l.kt + sh_x_up64(dh * Lpad * 2);
-    l.v = l.s + sh_x_up64(Sq * Lpad * 2);     l.o = l.v + sh_x_up64(Lpad * dh * 2);
-    l.sum = l.o + sh_x_up64(Sq * dh * 2);     l.vrow = l.sum + sh_x_up64(Sq * 4);
-    l.vld = l.vrow + sh_x_up64(Lpad * 2);     l.prof = l.vld + NC * 2 * sh_x_up64(Lpad * 2);
-    l.end = l.prof + sh_x_up64(SH_X_NPROF * 4);
+static inline sh_x_attn_l1 sh_x_attn_layout_n(uint32_t Sq, uint32_t dh, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t base) {
+    sh_x_attn_l1 l; const uint32_t Lpad = (Lp + So + 31u) & ~31u, NC = ARCH_NUM_CORE_PER_CLUSTER;
+    const uint32_t Sq_all = Sq * nb, R = So ? Sq : Sq_all;     /* query rows per pass */
+    l.Lpad = Lpad; l.R = R;
+    l.q = base;                                     l.k = l.q + sh_x_up64(Sq_all * dh * 2);
+    l.kt = l.k + sh_x_up64((Lp + nb * So) * dh * 2); l.s = l.kt + sh_x_up64(dh * Lpad * 2);
+    l.v = l.s + sh_x_up64(R * Lpad * 2);            l.vown = l.v + sh_x_up64(Lpad * dh * 2);
+    l.o = l.vown + sh_x_up64(nb * So * dh * 2);     l.sum = l.o + sh_x_up64(Sq_all * dh * 2);
+    l.vrow = l.sum + sh_x_up64(R * 4);              l.vld = l.vrow + sh_x_up64(Lpad * 2);
+    l.prof = l.vld + NC * 2 * sh_x_up64(Lpad * 2);  l.end = l.prof + sh_x_up64(SH_X_NPROF * 4);
     return l;
 }
-uint32_t sh_x_attention_l1_bytes(uint32_t Sq, uint32_t L, uint32_t dh) { return sh_x_attn_layout(Sq, dh, L, SH_X_L1_BASE).end; }
+uint32_t sh_x_attention_l1_bytes_n(uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t dh) { return sh_x_attn_layout_n(Sq, dh, Lp, So, nb ? nb : 1, SH_X_L1_BASE).end; }
+uint32_t sh_x_attention_l1_bytes(uint32_t Sq, uint32_t L, uint32_t dh) { return sh_x_attention_l1_bytes_n(Sq, L, 0, 1, dh); }
+/* the stamps live behind the layout actually used; the kernel stores their offset at SH_X_L1_BASE - 8 */
 uint32_t sh_x_attention_profile(uint32_t Sq, uint32_t L, uint32_t dh, uint32_t phase) {
-    return ((volatile uint32_t *)local(sh_x_attn_layout(Sq, dh, L, SH_X_L1_BASE).prof))[phase & (SH_X_NPROF - 1)];
+    (void)Sq; (void)L; (void)dh;
+    const uint32_t off = *(volatile uint32_t *)local(SH_X_L1_BASE - 8);
+    return ((volatile uint32_t *)local(off))[phase & (SH_X_NPROF - 1)];
 }
 #define SH_X_STAMP(i) do { if (first) ((volatile uint32_t *)local(l.prof))[i] = sh_mcycle(); } while (0)
 
@@ -121,40 +131,42 @@ static inline float sh_x_softmax_row(sh_v4h *x, const sh_v4h *vld, const sh_v4h 
     return sum + sh_v4_hsum(acc);
 }
 
-int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
-                        uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
-                        uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster) {
+int sh_x_attention_head_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                          uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
+                          uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster) {
     if (cluster != SH_ALL && flex_get_cluster_id() != cluster) return 0;
     const int first = flex_is_first_core(), dm = flex_is_dm_core();
     const uint32_t core = flex_get_core_id(), NC = ARCH_NUM_CORE_PER_CLUSTER, L = Lp + So;
-    const sh_x_attn_l1 l = sh_x_attn_layout(Sq, dh, L, SH_X_L1_BASE);
-    const uint32_t Lpad = l.Lpad, cv = Lpad >> 2, vb = sh_x_up64(Lpad * 2);
+    if (nb == 0) nb = 1;
+    const sh_x_attn_l1 l = sh_x_attn_layout_n(Sq, dh, Lp, So, nb, SH_X_L1_BASE);
+    const uint32_t Lpad = l.Lpad, cv = Lpad >> 2, vb = sh_x_up64(Lpad * 2), R = l.R, Sq_all = Sq * nb, npass = So ? nb : 1;
+    if (first) *(volatile uint32_t *)local(SH_X_L1_BASE - 8) = l.prof;
     if ((dh & 3) || Sq == 0 || L == 0 || (ko == 0) != (So == 0) || l.end > ARCH_CLUSTER_TCDM_SIZE) {
-        if (first) sh_printf("[sh_x_attention_head] Sq=%u Lp=%u So=%u dh=%u: need dh %% 4 == 0, own K/V iff So > 0, L1 %u <= %u\n",
-                             Sq, Lp, So, dh, l.end, (uint32_t)ARCH_CLUSTER_TCDM_SIZE);
+        if (first) sh_printf("[sh_x_attention_head] Sq=%u Lp=%u So=%u nb=%u dh=%u: need dh %% 4 == 0, own K/V iff So > 0, L1 %u <= %u\n",
+                             Sq, Lp, So, nb, dh, l.end, (uint32_t)ARCH_CLUSTER_TCDM_SIZE);
         return -1;
     }
     SH_X_STAMP(0);
-    /* 1. stage q, K rows (prefix then own), V rows; zero kT / scores / o / V padding; transpose K by DMA */
+    /* 1. stage q (all candidates), prefix K / V, own K / V (all candidates: K rows behind the prefix rows, V apart);
+     *    zero kT / o / V's own + padding rows; transpose the prefix K columns by DMA (once per head) */
     if (dm) {
-        sh_load_block_async(l.q, q, Sq, dh, ldq);
+        sh_load_block_async(l.q, q, Sq_all, dh, ldq);
         sh_load_block_async(l.k, kp, Lp, dh, ldkp);
         sh_load_block_async(l.v, vp, Lp, dh, ldvp);
-        if (So) { sh_load_block_async(l.k + Lp * dh * 2, ko, So, dh, ldko); sh_load_block_async(l.v + Lp * dh * 2, vo, So, dh, ldvo); }
+        if (So) { sh_load_block_async(l.k + Lp * dh * 2, ko, nb * So, dh, ldko); sh_load_block_async(l.vown, vo, nb * So, dh, ldvo); }
         if (tok) bare_dma_start_1d(local(l.vrow), tok, Lp * 2);
         sh_l1_zero_dm(l.kt, dh * Lpad * 2);               /* waits for everything issued so far */
-        sh_l1_zero_dm(l.s, Sq * Lpad * 2);
-        sh_l1_zero_dm(l.o, Sq * dh * 2);
-        if (Lpad > L) sh_l1_zero_dm(l.v + L * dh * 2, (Lpad - L) * dh * 2);
-        for (uint32_t c = 0; c < dh; ++c)                   /* kT row c = column c of K: L elements of 2 B, stride dh*2 */
-            bare_dma_start_2d(local(l.kt + c * Lpad * 2), local(l.k + c * 2), 2, 2, dh * 2, L);
+        sh_l1_zero_dm(l.o, Sq_all * dh * 2);
+        if (Lpad > Lp) sh_l1_zero_dm(l.v + Lp * dh * 2, (Lpad - Lp) * dh * 2);
+        for (uint32_t c = 0; c < dh; ++c)                   /* kT row c = column c of the prefix K: Lp elements of 2 B, stride dh*2 */
+            bare_dma_start_2d(local(l.kt + c * Lpad * 2), local(l.k + c * 2), 2, 2, dh * 2, Lp);
         bare_dma_wait_all();
     }
     flex_intra_cluster_sync();
     /* 2. per-core validity rows: prefix from `tok` (padding class 0xFFFF -> 0, else 1; all 1 without tok), own columns
      *    [0, lo] of this core's first row, padding columns 0 */
-    uint32_t lo, hi; sh_share(Sq, 1, &lo, &hi);
-    volatile uint16_t *vld = (volatile uint16_t *)local(l.vld + core * 2 * vb), *nb = vld + (vb >> 1);
+    uint32_t lo, hi; sh_share(R, 1, &lo, &hi);
+    volatile uint16_t *vld = (volatile uint16_t *)local(l.vld + core * 2 * vb), *nbias = vld + (vb >> 1);
     {
         const volatile uint16_t *vr = (const volatile uint16_t *)local(l.vrow);
         for (uint32_t j = 0; j < Lpad; ++j) {
@@ -162,54 +174,76 @@ int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint6
             if (j < Lp) v = tok ? (vr[j] != SH_LLM_PAD) : 1u;
             else if (j < L) v = (j - Lp) <= lo;
             else v = 0;
-            vld[j] = v ? 0x3C00u : 0u; nb[j] = v ? 0u : 0xFBFFu;
+            vld[j] = v ? 0x3C00u : 0u; nbias[j] = v ? 0u : 0xFBFFu;
         }
     }
     SH_X_STAMP(1);
-    /* 3. E = q kT on RedMulE */
-    if (first) { flex_redmule_config(Sq, dh, Lpad); flex_redmule_trigger(l.q, l.kt, l.s, REDMULE_FP_16); flex_redmule_wait(); }
-    flex_intra_cluster_sync();
-    SH_X_STAMP(2);
-    /* 4. masked row softmax numerators (rows split over the cores), fp32 row sums */
-    {
-        const sh_v4_exp2_consts ec = sh_v4_exp2_init();
-        const float s2 = scale * SH_LOG2E;
-        const sh_v4h s24 = sh_v4_splat(s2), cm14 = sh_v4_splat_h(SH_CM14);
-        float *sum = (float *)local(l.sum);
-        const sh_v4h *vv = (const sh_v4h *)(uintptr_t)vld, *nn = (const sh_v4h *)(uintptr_t)nb;
-        vv = sh_x_after_sh(nb + Lpad - 1, vv);
-        for (uint32_t r = lo; r < hi; ++r) {
-            if (So && r > lo) { vld[Lp + r] = 0x3C00u; nb[Lp + r] = 0u; vv = sh_x_after_sh(nb + Lp + r, vv); }
-            sum[r] = sh_x_softmax_row(SH_V4P(local(l.s + r * Lpad * 2)), vv, nn, cv, s2, &ec, s24, cm14);
+    const sh_v4_exp2_consts ec = sh_v4_exp2_init();
+    const float s2 = scale * SH_LOG2E;
+    const sh_v4h s24 = sh_v4_splat(s2), cm14 = sh_v4_splat_h(SH_CM14);
+    for (uint32_t p = 0; p < npass; ++p) {
+        const uint32_t qoff = l.q + p * R * dh * 2, ooff = l.o + p * R * dh * 2;
+        /* 3. per pass: zero the scores; with own keys bring candidate p's own K columns / V rows in and reset the
+         *    causal columns this core enabled during the previous pass */
+        if (dm) {
+            sh_l1_zero_dm(l.s, R * Lpad * 2);
+            if (So) {
+                bare_dma_start_1d(local(l.v + Lp * dh * 2), local(l.vown + p * So * dh * 2), So * dh * 2);
+                for (uint32_t c = 0; c < dh; ++c)
+                    bare_dma_start_2d(local(l.kt + c * Lpad * 2 + Lp * 2), local(l.k + (Lp + p * So) * dh * 2 + c * 2), 2, 2, dh * 2, So);
+                bare_dma_wait_all();
+            }
         }
-        sh_fp_fence();
-    }
-    flex_intra_cluster_sync();
-    SH_X_STAMP(3);
-    /* 5. o = E V on RedMulE */
-    if (first) { flex_redmule_config(Sq, Lpad, dh); flex_redmule_trigger(l.s, l.v, l.o, REDMULE_FP_16); flex_redmule_wait(); }
-    flex_intra_cluster_sync();
-    SH_X_STAMP(4);
-    /* 6. o_i /= sum_i (fp16 SIMD), store */
-    {
-        const float *sum = (const float *)local(l.sum); const uint32_t dv = dh >> 2;
-        for (uint32_t r = lo; r < hi; ++r) {
-            sh_v4h *ov = SH_V4P(local(l.o + r * dh * 2)); const sh_v4h inv4 = sh_v4_splat(1.f / sum[r]);
-            for (uint32_t j = 0; j < dv; ++j) ov[j] = sh_v4_mul_r(ov[j], inv4);
+        if (So && p) for (uint32_t j = Lp + lo + 1; j < Lp + hi; ++j) { vld[j] = 0u; nbias[j] = 0xFBFFu; }
+        flex_intra_cluster_sync();
+        /* 4. E = q_p kT on RedMulE */
+        if (first) { flex_redmule_config(R, dh, Lpad); flex_redmule_trigger(qoff, l.kt, l.s, REDMULE_FP_16); flex_redmule_wait(); }
+        flex_intra_cluster_sync();
+        SH_X_STAMP(2);
+        /* 5. masked row softmax numerators (rows split over the cores), fp32 row sums */
+        {
+            float *sum = (float *)local(l.sum);
+            const sh_v4h *vv = (const sh_v4h *)(uintptr_t)vld, *nn = (const sh_v4h *)(uintptr_t)nbias;
+            vv = sh_x_after_sh(nbias + Lpad - 1, vv);
+            for (uint32_t r = lo; r < hi; ++r) {
+                if (So && r > lo) { vld[Lp + r] = 0x3C00u; nbias[Lp + r] = 0u; vv = sh_x_after_sh(nbias + Lp + r, vv); }
+                sum[r] = sh_x_softmax_row(SH_V4P(local(l.s + r * Lpad * 2)), vv, nn, cv, s2, &ec, s24, cm14);
+            }
+            sh_fp_fence();
         }
-        sh_fp_fence();
+        flex_intra_cluster_sync();
+        SH_X_STAMP(3);
+        /* 6. o_p = E V on RedMulE */
+        if (first) { flex_redmule_config(R, Lpad, dh); flex_redmule_trigger(l.s, l.v, ooff, REDMULE_FP_16); flex_redmule_wait(); }
+        flex_intra_cluster_sync();
+        SH_X_STAMP(4);
+        /* 7. o_i /= sum_i (fp16 SIMD) */
+        {
+            const float *sum = (const float *)local(l.sum); const uint32_t dv = dh >> 2;
+            for (uint32_t r = lo; r < hi; ++r) {
+                sh_v4h *ov = SH_V4P(local(ooff + r * dh * 2)); const sh_v4h inv4 = sh_v4_splat(1.f / sum[r]);
+                for (uint32_t j = 0; j < dv; ++j) ov[j] = sh_v4_mul_r(ov[j], inv4);
+            }
+            sh_fp_fence();
+        }
+        flex_intra_cluster_sync();
     }
-    flex_intra_cluster_sync();
-    if (dm) sh_store_block_sync(o, l.o, Sq, dh, ldo);
+    if (dm) sh_store_block_sync(o, l.o, Sq_all, dh, ldo);
     flex_intra_cluster_sync();
     SH_X_STAMP(5);
     return 0;
 }
 
-int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
-                   uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
-                   uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo,
-                   float scale, uint32_t cluster) {
+int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                        uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
+                        uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster) {
+    return sh_x_attention_head_n(q, kp, vp, ko, vo, tok, o, Sq, Lp, So, 1, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, scale, cluster);
+}
+
+int sh_x_attention_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                     uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t H, uint32_t Hkv, uint32_t dh,
+                     uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo,
+                     float scale, uint32_t cluster) {
     const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y;
     int rc = 0;
     if (H == 0 || Hkv == 0 || H % Hkv) {
@@ -220,12 +254,18 @@ int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t v
     for (uint32_t h = 0; h < H; ++h) {
         const uint32_t cl = (cluster == SH_ALL) ? h % P : cluster, kvh = h / grp;
         const uint64_t qo = (uint64_t)h * dh * 2, ko_ = (uint64_t)kvh * dh * 2;
-        int r = sh_x_attention_head(q + qo, kp + ko_, vp + ko_, ko ? ko + ko_ : 0, vo ? vo + ko_ : 0, tok, o + qo,
-                                    Sq, Lp, So, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, scale, cl);
+        int r = sh_x_attention_head_n(q + qo, kp + ko_, vp + ko_, ko ? ko + ko_ : 0, vo ? vo + ko_ : 0, tok, o + qo,
+                                      Sq, Lp, So, nb, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, scale, cl);
         if (r) rc = r;
     }
     if (cluster == SH_ALL) flex_global_barrier_xy();
     return rc;
+}
+int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                   uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
+                   uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo,
+                   float scale, uint32_t cluster) {
+    return sh_x_attention_n(q, kp, vp, ko, vo, tok, o, Sq, Lp, So, 1, H, Hkv, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, scale, cluster);
 }
 
 /* ---- test helper: print every element of an HBM fp16 matrix ("<tag> r c hex"), first core of cluster 0 -------- */

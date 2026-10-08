@@ -490,7 +490,10 @@ class CrossAttentionOp(IRDLOperation):
     the tokens' own keys/values attended causally (query i sees own key j iff j <= i). ``mask %tok``: the
     prefix's 1 x Lp i16 token-class array (as for ``softhier.attention``'s mask: 0xFFFF = padding key; the
     expert's queries attend every non-padding prefix key). Query head h uses kv head h / (heads / kv_heads).
-    Each head runs inside one cluster's TCDM; ``cluster = -1`` deals head h to cluster h % P."""
+    Each head runs inside one cluster's TCDM; ``cluster = -1`` deals head h to cluster h % P.
+    ``n_batch = N``: the rows of ``q`` / ``ko`` / ``vo`` / ``o`` are N candidate blocks (N x Sq query tokens that
+    share the prefix KV); candidate c's queries attend the prefix and, causally, only their own block c
+    (``sh_x_attention_n``, docs/WORLD_MODEL.md)."""
     name = "softhier.cross_attention"
     irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
     q = operand_def(MemRefType)
@@ -503,6 +506,7 @@ class CrossAttentionOp(IRDLOperation):
     scale = prop_def(FloatAttr)
     heads = prop_def(IntegerAttr)
     kv_heads = prop_def(IntegerAttr)
+    n_batch = opt_prop_def(IntegerAttr)
     assembly_format = ("$q `,` $kp `,` $vp (`own` $ko^ `,` $vo)? (`mask` $mask^)? `->` $o attr-dict `:` "
                        "type($q) `,` type($kp) `,` type($vp) (`own` type($ko)^ `,` type($vo))? (`mask` type($mask)^)? `->` type($o)")
 
