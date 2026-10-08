@@ -91,8 +91,8 @@ the 16 layers (300 MiB) do not fit the 256 MiB west HBM edge with the activation
 south edge (offset 0x30000000) and the layer loop selects the region with `arith.divui` (one address expression,
 no second loop body).
 
-**KV cache layout (for the expert agent)**: `kv_base` (printed by the run, 0x711000 for the 1-camera program),
-`kv_stride = 2 * S_pad * 320 * 2` bytes per layer; layer L's keys at `kv_base + L * kv_stride` as `[S_pad, 320]`
+**KV cache layout (for the expert agent)**: `kv_base` (printed by the run: HBM offset 0x1111000 for the 241-token
+program, 0x711000 for the 113-token one), `kv_stride = 2 * S_pad * 320 * 2` bytes per layer (0x50000 at S_pad = 256); layer L's keys at `kv_base + L * kv_stride` as `[S_pad, 320]`
 fp16 row-major (kv head g = columns `[64g, 64g+64)`, **RoPE already applied**, rows >= n are padding), its values
 at `+ S_pad * 320 * 2` with the same shape. The token-class array (`memref<S_pad x i16>`) and the RoPE table
 `[S_pad, 64]` are preloaded next to the inputs; the expert must use the same classes (its own tokens get class 2
@@ -191,4 +191,98 @@ Everything the expert consumes is at the fp16 floor: **K within 0.08 (0.2-0.6 % 
 
 ### 241 tokens (3 cameras), 16 layers, 16 clusters
 
-RESULTS_C3
+The full prefix: 3 cameras (192 image tokens) + 48 language + state = 241 tokens, S_pad = 256. Same two-program
+split (preload 177.5 MiB / 150.5 MiB, program 49 KB, wall 308 s + 306 s), 128 samples per tensor.
+
+Simulated time: preload wait 2.9 ms (not timed), 3 pixel shuffles + connector GEMM (192 x 960 x 12288) +
+scaling **0.871 ms**, then
+
+| layer | attention (ms) | proj + MLP (ms) | total (ms) | | layer | attention | proj + MLP | total |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1.166 | 1.113 | 2.279 | | 9 | 1.158 | 1.113 | 2.271 |
+| 2 | 1.081 | 0.928 | 2.009 | | 10 | 1.081 | 0.928 | 2.009 |
+| 3 | 1.073 | 0.925 | 1.998 | | 11 | 1.073 | 0.925 | 1.998 |
+| 4 | 1.073 | 0.925 | 1.998 | | 12 | 1.073 | 0.925 | 1.998 |
+| 5 | 1.073 | 0.955 | 2.028 | | 13 | 1.073 | 0.955 | 2.028 |
+| 6 | 1.088 | 0.979 | 2.067 | | 14 | 1.087 | 0.979 | 2.067 |
+| 7 | 1.088 | 0.980 | 2.067 | | 15 | 1.087 | 0.980 | 2.067 |
+| 8 | 1.088 | 0.979 | 2.067 | | 16 | 1.088 | 0.980 | 2.067 |
+
+**2.064 ms per layer, 33.0 ms for the 16 layers + 0.87 ms connector = 33.9 ms for the whole 241-token prefix**
+(the SigLIP vision tower at 256 tokens was 2.29 ms per layer for 12 layers). Attention is now 52 % of a layer:
+one head of S = 256 is ~1.07 M cycles on its cluster (16 clusters, 15 heads: no second round, but the per-head
+softmax is 4x the S = 128 one), the GEMMs (M = 256) 0.93-1.11 ms. Layer 1 / 9 are slower because the per-layer
+weights are streamed for the first time by the measuring cluster (no reuse across layers anyway); the 0.03-0.05
+ms steps between layers 2-8 follow the HBM placement of the weights (the first layers sit nearer the west edge).
+
+Accuracy (rows that are read: 192 image + 5 language + state):
+
+| tensor | samples | max abs vs fp32 ref | median | max \|ref\| | max / max\|ref\| | vs fp16 floor max abs | |
+|---|---|---|---|---|---|---|---|
+| EMB | 106 | 7.7116 | 0.5488 | 2212.90 | 3.48e-03 | 7.7500 | PASS |
+| L1 | 110 | 7.8208 | 0.5691 | 2255.62 | 3.47e-03 | 7.7500 | PASS |
+| K1 | 107 | 0.0384 | 0.0078 | 11.57 | 3.32e-03 | 0.0371 | PASS |
+| V1 | 104 | 0.0017 | 0.0002 | 0.66 | 2.51e-03 | 0.0016 | PASS |
+| L2 | 110 | 7.7158 | 0.6005 | 2323.26 | 3.32e-03 | 7.5000 | PASS |
+| K2 | 107 | 0.0523 | 0.0108 | 18.18 | 2.87e-03 | 0.0527 | PASS |
+| V2 | 104 | 0.0208 | 0.0033 | 1.74 | 1.19e-02 | 0.0208 | PASS |
+| L3 | 110 | 7.6523 | 0.5926 | 2356.79 | 3.25e-03 | 7.5000 | PASS |
+| K3 | 107 | 0.0575 | 0.0111 | 16.08 | 3.58e-03 | 0.0566 | PASS |
+| V3 | 104 | 0.0223 | 0.0036 | 2.62 | 8.52e-03 | 0.0225 | PASS |
+| L4 | 110 | 7.5847 | 0.6207 | 2364.34 | 3.21e-03 | 7.5000 | PASS |
+| K4 | 107 | 0.0587 | 0.0140 | 13.38 | 4.39e-03 | 0.0596 | PASS |
+| V4 | 104 | 0.0249 | 0.0046 | 2.63 | 9.47e-03 | 0.0249 | PASS |
+| L5 | 110 | 7.4478 | 0.6122 | 2375.92 | 3.13e-03 | 7.5000 | PASS |
+| K5 | 107 | 0.0496 | 0.0096 | 12.25 | 4.05e-03 | 0.0503 | PASS |
+| V5 | 104 | 0.0332 | 0.0060 | 2.70 | 1.23e-02 | 0.0321 | PASS |
+| L6 | 110 | 7.5123 | 0.6220 | 2354.20 | 3.19e-03 | 7.5000 | PASS |
+| K6 | 107 | 0.0708 | 0.0114 | 15.43 | 4.59e-03 | 0.0703 | PASS |
+| V6 | 104 | 0.0309 | 0.0067 | 3.25 | 9.53e-03 | 0.0303 | PASS |
+| L7 | 110 | 7.5905 | 0.6131 | 2332.69 | 3.25e-03 | 7.5000 | PASS |
+| K7 | 107 | 0.0446 | 0.0089 | 13.92 | 3.20e-03 | 0.0391 | PASS |
+| V7 | 104 | 0.0388 | 0.0066 | 2.99 | 1.30e-02 | 0.0386 | PASS |
+| L8 | 110 | 7.5968 | 0.6060 | 2322.90 | 3.27e-03 | 7.5000 | PASS |
+| K8 | 107 | 0.0506 | 0.0089 | 15.22 | 3.32e-03 | 0.0508 | PASS |
+| V8 | 104 | 0.0335 | 0.0068 | 3.49 | 9.59e-03 | 0.0330 | PASS |
+| L9 | 110 | 0.1507 | 0.0197 | 2338.73 | 6.44e-05 | 0.2500 | PASS |
+| K9 | 107 | 0.0238 | 0.0025 | 14.02 | 1.70e-03 | 0.0254 | PASS |
+| V9 | 104 | 0.0168 | 0.0021 | 3.91 | 4.29e-03 | 0.0166 | PASS |
+| L10 | 110 | 0.2016 | 0.0221 | 2383.81 | 8.46e-05 | 0.3750 | PASS |
+| K10 | 107 | 0.0307 | 0.0032 | 14.31 | 2.14e-03 | 0.0293 | PASS |
+| V10 | 104 | 0.0130 | 0.0019 | 4.13 | 3.15e-03 | 0.0127 | PASS |
+| L11 | 110 | 0.1672 | 0.0330 | 2415.65 | 6.92e-05 | 0.5000 | PASS |
+| K11 | 107 | 0.0299 | 0.0032 | 13.71 | 2.18e-03 | 0.0273 | PASS |
+| V11 | 104 | 0.0205 | 0.0016 | 3.70 | 5.55e-03 | 0.0215 | PASS |
+| L12 | 110 | 0.2258 | 0.0407 | 2420.71 | 9.33e-05 | 0.5000 | PASS |
+| K12 | 107 | 0.0271 | 0.0026 | 13.42 | 2.02e-03 | 0.0312 | PASS |
+| V12 | 104 | 0.0266 | 0.0022 | 4.13 | 6.44e-03 | 0.0283 | PASS |
+| L13 | 110 | 0.2805 | 0.0519 | 2418.38 | 1.16e-04 | 0.5000 | PASS |
+| K13 | 107 | 0.0348 | 0.0027 | 15.21 | 2.28e-03 | 0.0312 | PASS |
+| V13 | 104 | 0.0186 | 0.0014 | 3.20 | 5.82e-03 | 0.0186 | PASS |
+| L14 | 110 | 0.2543 | 0.0526 | 2490.59 | 1.02e-04 | 0.5000 | PASS |
+| K14 | 107 | 0.0338 | 0.0027 | 16.32 | 2.07e-03 | 0.0352 | PASS |
+| V14 | 104 | 0.0154 | 0.0015 | 2.93 | 5.26e-03 | 0.0146 | PASS |
+| L15 | 110 | 0.2644 | 0.0517 | 2507.23 | 1.05e-04 | 0.5000 | PASS |
+| K15 | 107 | 0.0225 | 0.0030 | 15.13 | 1.49e-03 | 0.0239 | PASS |
+| V15 | 104 | 0.0169 | 0.0023 | 4.22 | 4.00e-03 | 0.0179 | PASS |
+| L16 | 110 | 0.4478 | 0.0502 | 2517.17 | 1.78e-04 | 0.5000 | PASS |
+| K16 | 107 | 0.0586 | 0.0028 | 16.63 | 3.52e-03 | 0.0625 | PASS |
+| V16 | 104 | 0.0191 | 0.0020 | 4.90 | 3.90e-03 | 0.0139 | PASS |
+| OUT | 107 | 0.0090 | 0.0006 | 20.97 | 4.29e-04 | 0.0107 | PASS |
+
+Same picture as at 113 tokens: **K within 0.071 (0.15-0.46 % of max), V within 0.039 (0.25-1.3 % of max), OUT
+0.009 of 21**, the residual stream at 7.5-7.8 of ~2300 (the connector's fp16 accumulation, constant through the
+layers; 0.15-0.45 for layers 9-16 alone). 0 bad samples in all 50 tensors of both programs.
+
+## What is not done / caveats
+
+- The 16 layers were simulated as two 8-layer programs because the simulator is OOM-killed at ~1.05 GB RSS on this
+  7.8 GB host (three attempts, same RSS each time, killed during layer 2-4 whenever another job spiked); the KV
+  cache / weight addressing of a single 16-layer program is emitted and builds (49 KB, 324 MiB image, 11 layers
+  west + 5 south), it has just not run to completion here. `--layer0 8` starts from the reference's L8 in fp16.
+- Padded language rows are computed but not compared (lerobot: uniform attention over all 241 keys; device: over
+  S_pad). Nothing reads them (the expert masks them as keys).
+- The state row is the only query that attends the state token; it is compared like every other valid row.
+- Timing tiles (`VLM_TILES`) are a first choice (128 x 192/320 x 320 for the 960-wide GEMMs), not tuned; with 15
+  heads on 16 clusters the attention softmax (fetch-bound SIMD, ~9 cycles per score element) is now the largest
+  single item of a layer.
