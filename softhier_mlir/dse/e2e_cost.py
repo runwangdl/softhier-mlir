@@ -161,6 +161,7 @@ class Model:
             y_k.append(sum(g["redmule"]) / g["n"] / macs("expert_step", Lp=Lp, C=C))
             gk = r["groups"]["expert_kvproj"]
             Xk.append([1.0, Lp]); yk_t.append(r["seg"]["expert_kv_projection"]); yk_b.append(gk["hbm_rd"] + gk["hbm_wr"])
+            self_kk = getattr(self, "_kk", []); self_kk.append(sum(gk["redmule"]) / macs("expert_kvproj", Lp=Lp)); self._kk = self_kk
         self.X, self.y_t = np.array(X), np.array(y_t)
         self.c_t = np.linalg.lstsq(self.X, self.y_t, rcond=None)[0] if len(X) >= 3 else None
         self.c_b = np.linalg.lstsq(self.X, np.array(y_b), rcond=None)[0] if len(X) >= 3 else None
@@ -192,7 +193,7 @@ class Model:
                   "idma": [float("nan")] * NCL, "sync": [float("nan")] * NCL, "n": 1}
         kv = float(self.ck_t @ [1.0, Lp])
         g_kv = {"dur_ns": kv * 1e6, "hbm_rd": float(self.ck_b @ [1.0, Lp]), "hbm_wr": 0.0,
-                "redmule": [self.k_busy * macs("expert_kvproj", Lp=Lp) / NCL] * NCL, "idma": [float("nan")] * NCL, "sync": [float("nan")] * NCL, "n": 1}
+                "redmule": [float(np.mean(self._kk)) * macs("expert_kvproj", Lp=Lp) / NCL] * NCL, "idma": [float("nan")] * NCL, "sync": [float("nan")] * NCL, "n": 1}
         return g_kv, g_step, [st] * 10
 
 
@@ -297,7 +298,7 @@ def write(rows: list[dict], recs: list[dict], csv_path: Path, md_path: Path) -> 
     L += ["", "## Expert model", "",
           f"step ms = {m.c_t[0]:.4f} + {m.c_t[1]:.5f} C + {m.c_t[2]:.3e} C Lp (C = action rows, Lp = prefix tokens), fitted on "
           f"{len(m.pts)} simulated (Lp, C) points; KV projection ms = {m.ck_t[0]:.4f} + {m.ck_t[1]:.3e} Lp; RedMulE busy = "
-          f"{m.k_busy:.3f} ns per MAC summed over clusters (from the traces).", "",
+          f"{1e3 * m.k_busy:.2f} ns per kMAC summed over clusters (from the traces; KV projection fitted separately).", "",
           "| Lp | C | simulated ms/step | leave-one-out model | error |", "|---|---|---|---|---|"]
     for Lp, C, y, p, e in m.residuals():
         L.append(f"| {Lp} | {C} | {y:.3f} | {p:.3f} | {e:+.1f} % |")
