@@ -37,14 +37,14 @@ def _app(app_dir: Path | None) -> Path:
     return app
 
 
-def _build_and_run(app: Path, mlir: str, pre: dict, timeout: int, log: Path | None) -> dict:
+def _build_and_run(app: Path, mlir: str, pre: dict, timeout: int, log: Path | None, traces: tuple = ()) -> dict:
     (app / "expert.mlir").write_text(mlir)
     elf = make_preload_elf(app / "preload.elf", pre)
     (app / "main.c").write_text(lower_and_translate(app / "expert.mlir", None))
     build_sw(app)
     text = sum(sz for _, sz in _elf_load_segments(build_sw.last_elf) if sz)
     print(f"[expert] preload {elf.stat().st_size / 2 ** 20:.1f} MiB, program {text / 1024:.1f} KB; simulating...", flush=True)
-    r = run_sim(preload=elf, timeout=timeout, log=log)
+    r = run_sim(preload=elf, timeout=timeout, log=log, traces=traces)
     (app / "last_run.log").write_text(r["stdout"])
     return r
 
@@ -52,7 +52,12 @@ def _build_and_run(app: Path, mlir: str, pre: dict, timeout: int, log: Path | No
 def marks_seq(stdout: str) -> list[tuple[str, int]]:
     """[(tag, ns since the first mark)] in order, unwrapping the 32-bit mcycle."""
     out, prev, acc = [], None, 0
-    for ln in stdout.splitlines():
+    if "[iDMA] Finished" in stdout:      # traced run: program output interleaved with trace lines (tests/gvsoc/dma_bytes.py)
+        from tests.gvsoc.dma_bytes import parse
+        lines = [f"[mark] {t} {c}" for t, c in parse(stdout)[0]]
+    else:
+        lines = stdout.splitlines()
+    for ln in lines:
         if ln.startswith("[mark] "):
             _, tag, c = ln.split()
             c = int(c)
@@ -126,6 +131,15 @@ def run_op(which: str, seed: int, cluster: int, nsamples: int, app_dir=None, col
             print(f"     {tag:<6} MISSING"); ok = False; continue
         good, _ = compare(tag, got[tag], arr, atol=max(0.02, 0.01 * float(np.abs(arr).max())), rtol=0.03)
         ok &= good
+    if which.startswith("gemm8") and "Z0" in got and "Z2" in got:   # expanded on the cores == host-expanded copy, bit for bit
+        same = got["Z0"] == got["Z2"]
+        print(f"     Z0 (fp8 bytes, expanded on the cores) vs Z2 (host-expanded fp16 copy): {'bit-identical' if same else 'DIFFERENT'} "
+              f"on {len(got['Z0'])} samples")
+        ok &= same
+        t = dict(marks)
+        seq = [k for k, _ in marks]
+        for a_, b_ in zip(seq, seq[1:]):
+            print(f"     time {b_:<9} {(t[b_] - t[a_]) / 1e3:8.1f} us")
     if not r["ok"]:
         print(r["stdout"][-2000:])
     return ok
@@ -142,7 +156,8 @@ def cand_seeds(n_cand: int, seeds=None) -> list:
 
 def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile: bool, dumps, nsamples: int = 64,
              app_dir=None, log: Path | None = None, from_log: Path | None = None, timeout: int = 48 * 3600, tiles=None,
-             n_cand: int = 1, seeds=None, save_x: Path | None = None) -> bool:
+             n_cand: int = 1, seeds=None, attn: str = "stream", fp8_mode: int | None = None, save_x=None,
+             trace_dma: bool = False) -> bool:
     from softhier_mlir.frontend import smolvla_expert as E
     data = dict(np.load(npz))
     P = {k[2:]: data[k] for k in data if k.startswith("p_")}
@@ -154,10 +169,10 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
     if from_log is None:
         app = _app(app_dir)
         mlir, pre = E.emit_flow(data, steps, layers, cluster, fmt_steps, profile, tuple(dumps), nsamples, tiles=tiles or E.TILES,
-                                n_cand=n_cand, x0=x0)
-        r = _build_and_run(app, mlir, pre, timeout, log)
+                                n_cand=n_cand, x0=x0, attn=attn, fp8_mode=fp8_mode)
+        r = _build_and_run(app, mlir, pre, timeout, log, ("idma",) if trace_dma else ())
         stdout, ok = r["stdout"], r["ok"]
-        print(f"{'PASS' if ok else 'FAIL'} expert flow steps={steps} layers={layers} cand={n_cand} cluster={cluster} fmt={fmt_steps} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+        print(f"{'PASS' if ok else 'FAIL'} expert flow steps={steps} layers={layers} cand={n_cand} cluster={cluster} fmt={fmt_steps} attn={attn} fp8_mode={fp8_mode} roi={r['roi_ns']} ns wall={r['wall_s']}s")
     else:
         stdout = Path(from_log).read_text()
         rois = [int(v) for v in PERF_RE.findall(stdout)]
@@ -166,12 +181,17 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
     for ln in stdout.splitlines():
         if ln.startswith("[sh_"):
             print("     " + ln)
+    if trace_dma:   # bytes moved by every iDMA, by kind, per mark segment (tests/gvsoc/dma_bytes.py)
+        from tests.gvsoc.dma_bytes import report
+        report(stdout)
     # ---- timing
     marks = marks_seq(stdout)
     mt = dict(marks)
     if "kvproj" in mt:
         print(f"     KV projection of the cross layers (once per chunk): {(mt['kvproj'] - mt['start']) / 1e6:.3f} ms")
-    step_t, prev = [], mt.get("kvproj", mt.get("start", 0))
+    if "kvdeal" in mt:
+        print(f"     KV deal into TCDM (once per chunk): {(mt['kvdeal'] - mt['kvproj']) / 1e6:.3f} ms")
+    step_t, prev = [], mt.get("kvdeal", mt.get("kvproj", mt.get("start", 0)))
     for s in range(steps):
         if f"step{s}" not in mt:
             break
@@ -182,24 +202,32 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
               f"chunk ({steps} steps) {sum(step_t) / 1e6:.3f} ms" + (f" + KV projection {(mt['kvproj'] - mt['start']) / 1e6:.3f} ms" if "kvproj" in mt else ""))
     if profile:
         bd = op_breakdown(marks)
-        tot = sum(v[0] for k, v in bd.items() if k not in ("xdump", "start", "kvproj", "end"))
+        tot = sum(v[0] for k, v in bd.items() if k not in ("xdump", "start", "kvproj", "kvdeal", "end"))
         print("     per-op breakdown (sum over steps and layers):")
         for k, (t, n) in sorted(bd.items(), key=lambda kv: -kv[1][0]):
-            if k in ("xdump", "start", "kvproj", "end"):
+            if k in ("xdump", "start", "kvproj", "kvdeal", "end"):
                 continue
             print(f"       {k:<8} {t / 1e6:9.3f} ms  {100 * t / tot:5.1f} %   {n:4d} x {t / n / 1e3:8.1f} us")
     # ---- accuracy: device x_t per step vs lerobot and vs the fp16-floor numpy model
     got = lcg.parse_samples(stdout)
     if n_cand > 1:
         return _check_cands(E, P, ref_xt, got, steps, layers, n_cand, seeds, x0, ok, save_x)
-    floor_xt, floor_inter = E.np_flow(P, steps, layers, record=("H" in dumps or "O" in dumps))
-    if save_x is not None:
-        np.savez(save_x, x=np.stack([_full(got.get(f"X{s}", []), 50, 32) for s in range(steps)]), seeds=np.array([-1 if v is None else v for v in seeds]))
+    fp8 = fp8_mode is not None and fmt_steps is not None and "fp8" in fmt_steps
+    if fp8 and fp8_mode in (1, 3):
+        print(f"     fp8 mode {fp8_mode} (timing model, W' tiles zero): the numbers are invalid by construction, not compared")
+        return ok
+    floor_xt, floor_inter = E.np_flow(P, steps, layers, record=("H" in dumps or "O" in dumps), fmt_steps=fmt_steps if fp8 else None)
+    if fp8:     # the reference of an fp8 schedule is its own fp16-floor twin; lerobot / all-fp16 are reported as distances
+        f16_xt, _ = E.np_flow(P, steps, layers)
+    xs = {}
     for s in range(steps):
         tag = f"X{s}"
         if tag not in got:
             print(f"     {tag:<6} MISSING"); ok = False; continue
-        want = ref_xt[s + 1] if layers == 16 else floor_xt[s + 1]
+        xs[s] = np.zeros((50, 32), np.float32)
+        for r_, c, v in got[tag]:
+            xs[s][r_, c] = v
+        want = ref_xt[s + 1] if (layers == 16 and not fp8) else floor_xt[s + 1]
         good, err = compare(tag, got[tag], want, atol=0.05, rtol=0.02, floor=floor_xt[s + 1])
         ok &= good
     if "A" in got:
@@ -211,7 +239,14 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
         print(f"     x_{steps} (50 x 32, all elements){' = actions' if steps == 10 else ''} vs lerobot fp32: max abs {err.max():.4f} mean {err.mean():.4f} "
               f"(|actions| max {np.abs(want).max():.3f}); vs fp16 floor: max abs {np.abs(vals - floor_xt[steps]).max():.4f}; "
               f"floor vs lerobot: {np.abs(floor_xt[steps] - want).max():.4f}")
-        ok &= err.max() < 0.1
+        ok &= err.max() < 0.1 or fp8
+        if fp8:
+            print(f"     fp8 schedule {fmt_steps}: x_{steps} vs its fp8 twin max {np.abs(vals - floor_xt[steps]).max():.4f}; "
+                  f"vs all-fp16 twin max {np.abs(vals - f16_xt[steps]).max():.4f} mean {np.abs(vals - f16_xt[steps]).mean():.5f}; "
+                  f"vs lerobot max {err.max():.4f} mean {err.mean():.5f}")
+            ok &= np.abs(vals - floor_xt[steps]).max() < 0.1
+    if save_x and xs:
+        np.savez(save_x, x=np.stack([xs[s] for s in sorted(xs)]), steps=np.array(sorted(xs)))
     full = layers == 16          # the lerobot intermediates exist for the full model only; else compare with the twin
     if "EMB0" in got:
         compare("EMB0", got["EMB0"], data["ref_s0_emb"] if full else floor_inter["EMB"], atol=0.05, rtol=0.03, floor=floor_inter.get("EMB"))
@@ -278,7 +313,12 @@ if __name__ == "__main__":
     ap.add_argument("--tiles", help="flow: override tile shapes, e.g. qkv=50,240,720;o=50,240,960")
     ap.add_argument("--cands", type=int, default=1, help="flow: candidate chunks denoised at once (S_q = 50 N)")
     ap.add_argument("--seeds", nargs="*", help="flow: noise seed per candidate (none = the npz/lerobot noise); default none,1,2,...")
-    ap.add_argument("--save-x", help="flow: write the device x_t per step to this .npz")
+    ap.add_argument("--attn", default="stream", choices=["stream", "kvs"], help="flow: attention dataflow (kvs = KV-stationary)")
+    ap.add_argument("--fp8-mode", type=int, choices=[0, 1, 2, 3], help="flow: real fp8 steps (--fmt fp8 entries) of the layer GEMMs: "
+                    "0 expand on the cores, 1 no expansion (timing of a DMA-path cast), 2 host-expanded copy (numbers), "
+                    "3 = 1 without the activation cast pass (bound of a cast fused into the producer)")
+    ap.add_argument("--save-x", help="flow: save the device x_t per step (npz)")
+    ap.add_argument("--trace-dma", action="store_true", help="flow: gvsoc iDMA trace -> HBM / cluster-to-cluster bytes per segment")
     a = ap.parse_args()
     if a.test == "layer":
         ok = run_layer(a.seed, a.cluster, a.nsamples, a.app_dir)
@@ -295,5 +335,5 @@ if __name__ == "__main__":
                 tiles[k] = tuple(int(x) for x in v.split(","))
         ok = run_flow(a.npz, a.steps, a.layers, a.cluster, fmt, a.profile, a.dumps, a.nsamples, a.app_dir,
                       Path(a.log) if a.log else None, Path(a.from_log) if a.from_log else None, tiles=tiles,
-                      n_cand=a.cands, seeds=a.seeds, save_x=Path(a.save_x) if a.save_x else None)
+                      n_cand=a.cands, seeds=a.seeds, attn=a.attn, fp8_mode=a.fp8_mode, save_x=a.save_x, trace_dma=a.trace_dma)
     sys.exit(0 if ok else 1)

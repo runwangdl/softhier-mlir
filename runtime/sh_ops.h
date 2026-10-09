@@ -144,6 +144,29 @@ int sh_x_attention_head_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uin
 uint32_t sh_x_attention_l1_bytes_n(uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t dh);
 uint32_t sh_x_attention_l1_bytes(uint32_t Sq, uint32_t L, uint32_t dh);                        /* L = Lp + So, nb = 1 */
 uint32_t sh_x_attention_profile(uint32_t Sq, uint32_t L, uint32_t dh, uint32_t phase);         /* mcycle stamps 0 entry, 1 staged, 2 scores, 3 softmax, 4 P.V, 5 stored */
+/* ---- flow-matching dataflow (sh_flow.inc.c, docs/FLOW_DATAFLOW.md) ----------------------------------------------
+ * KV-stationary attention: sh_f_kvs_deal once per chunk deals layer l's prefix K / V (self layers when bit l of selfmask
+ * is set: ks0 / vs0 + (l / 2) * sstride; cross layers: kx0 / vx0 + (l / 2) * xstride; [Lp, Hkv * dh], leading dim ld)
+ * into TCDM (cluster g * grp + p keeps key part p of kv head g of every layer); sh_f_attention_kvs computes one layer's
+ * attention from it (query block multicast, partials combined over the NoC). All cores of all clusters; global barriers. */
+int sh_f_kvs_deal(uint64_t ks0, uint64_t vs0, uint64_t sstride, uint64_t kx0, uint64_t vx0, uint64_t xstride,
+                  uint32_t nlayers, uint32_t selfmask, uint32_t Lp, uint32_t So, uint32_t Hkv, uint32_t grp, uint32_t dh, uint32_t ld);
+int sh_f_attention_kvs(uint64_t q, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o, uint32_t layer, uint32_t selfmask,
+                       uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
+                       uint32_t ldq, uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale);
+uint32_t sh_f_kvs_resident_bytes(uint32_t nlayers, uint32_t Lp, uint32_t So, uint32_t dh, uint32_t npart, uint32_t selfmask);
+uint32_t sh_f_kvs_profile(uint32_t phase);   /* mcycle stamps of the last call on this cluster: 0 entry, 1 q multicast, 2 staged, 3 scores, 4 softmax, 5 P.V + barrier, 6 combined */
+/* fp8 (e4m3) weight GEMM steps: x <- RN4(x) * 2^kexp in place (4 significant bits); Z = X' W' with W' expanded from
+ * e4m3 bytes (expand = 1: on the cores; 0: not at all, timing of a DMA-path cast, numbers invalid); and the per-step
+ * selector (fmt != SH_FP8: sh_gemm on w16; SH_FP8: rn4 with the int16 at kexp, then mode 0 / 1 on the bytes w8 or
+ * mode 2: sh_gemm on the host-expanded fp16 copy wq16). */
+void sh_f_rn4(uint64_t x, uint32_t rows, uint32_t cols, uint32_t ld, int32_t kexp, uint32_t cluster);
+int sh_f_gemm_w8(uint64_t x, uint64_t w8, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
+                 uint32_t ldx, uint32_t ldw, uint32_t ldz, const sh_gemm_cfg *cfg, uint32_t expand, uint32_t cluster);
+uint32_t sh_f_gemm_w8_l1_bytes(const sh_gemm_cfg *cfg);
+int sh_f_gemm_step(uint64_t x, uint64_t w16, uint64_t w8, uint64_t wq16, uint64_t kexp, uint64_t z,
+                   uint32_t M, uint32_t N, uint32_t K, uint32_t ldx, uint32_t ldw, uint32_t ldz,
+                   const sh_gemm_cfg *cfg, uint32_t fmt, uint32_t mode, uint32_t cluster);
 /* Print every element of a matrix ("<tag> r c hex"; tag<idx> variant). Calling core. */
 void sh_test_dump_all(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag);
 void sh_test_dump_all_idx(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag, uint32_t idx);

@@ -33,6 +33,7 @@ from xdsl.irdl import (
     opt_prop_def,
     prop_def,
     result_def,
+    var_operand_def,
 )
 
 # --------------------------------------------------------------------------- #
@@ -771,9 +772,23 @@ class CopyOp(IRDLOperation):
     assembly_format = "$src `->` $dst attr-dict `:` type($src) `->` type($dst)"
 
 
+@irdl_op_definition
+class CallOp(IRDLOperation):
+    """A direct call of a library function: ``callee(<args>)`` with ``args`` a C argument-list template in which ``{i}``
+    stands for operand i (a memref: its 64-bit HBM address; an index: its C expression). Used by experimental kernels
+    (the flow-matching dataflow, runtime/sh_flow.inc.c) whose argument lists are not worth a dedicated op yet."""
+    name = "softhier.call"
+    irdl_options = (ParsePropInAttrDict(),)
+    operands_ = var_operand_def()
+    callee = prop_def(StringAttr)
+    args = prop_def(StringAttr)
+    assembly_format = "$operands_ attr-dict `:` type($operands_)"
+
+
 SoftHier = Dialect(
     "softhier",
     [
+        CallOp,
         MarkOp,
         PreloadWaitOp,
         HbmBufferOp,
