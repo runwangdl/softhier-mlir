@@ -62,7 +62,7 @@ def _align(off: int, a: int = 0x100000) -> int:
 def emit_pipeline(e2e, mode: str = "split", mask_a: int = 0x0FFF, mask_b: int = 0xF000, stages=("A", "B"), periods: int = 2,
                   vlayers: int = 3, players: int = 4, xlayers: int = 4, steps: int = 10, chunk: int = 50,
                   inner_marks: bool | None = None, optimize: str | None = "Os", far: bool = True,
-                  dump_kv: bool = True) -> tuple[str, dict, dict]:
+                  dump_kv: str = "all") -> tuple[str, dict, dict]:
     """-> (mlir, {hbm offset: preload array}, info). mode "time" ignores the masks (all ops SH_ALL, A then B per period);
     "split" runs A on mask_a and B on mask_b concurrently. inner_marks (default: on unless both stages run concurrently):
     the emitters' per-layer / per-step marks; concurrent stages print stage-end marks only (both sets' leaders print
@@ -125,7 +125,7 @@ def emit_pipeline(e2e, mode: str = "split", mask_a: int = 0x0FFF, mask_b: int = 
     st = f'memref<{sent.shape[0]}x{sent.shape[1]}xf16, "hbm_west">'
     out: list[str] = dv + dp + dx
     out += [f"%sentinel = softhier.hbm_buffer {{offset = {sent_off} : i32}} : {st}",
-            f'softhier.mark {{tag = "preload"}}', f"softhier.preload_wait %sentinel : {st}",
+            f"softhier.preload_wait %sentinel : {st}",
             "%KC0 = arith.constant 0 : index", "%KC1 = arith.constant 1 : index", "%KC2 = arith.constant 2 : index",
             f"%KNP = arith.constant {periods} : index",
             'softhier.mark {tag = "start"}',
@@ -148,7 +148,7 @@ def emit_pipeline(e2e, mode: str = "split", mask_a: int = 0x0FFF, mask_b: int = 
     # ---- outputs: the last chunk's actions (B's x) and the KV block A wrote last
     if "B" in stages:
         out.append('softhier.dump_all %x_x {tag = "ACT"}' + f' : memref<{chunk}x{X.AD}xf16, "hbm_west">')
-    if "A" in stages and dump_kv:
+    if "A" in stages and dump_kv in ("all", "samples"):
         last = periods % 2      # A of period p wrote block (p + 1) % 2; the last period: periods % 2
         kvt = f'memref<{n}x{V.TKVD}xf16, strided<[{V.TKVD}, 1], offset: 0>, "hbm_west">'
         full = f'memref<{S}x{V.TKVD}xf16, "hbm_west">'
@@ -157,7 +157,8 @@ def emit_pipeline(e2e, mode: str = "split", mask_a: int = 0x0FFF, mask_b: int = 
                 off = pi["kv_base"] + (last * players + L) * pi["kv_stride"] + j * S * V.TKVD * 2
                 out += [f"%dkv{L}{kv} = softhier.hbm_buffer {{offset = {off} : i32}} : {full}",
                         f"%dkv{L}{kv}v = softhier.view %dkv{L}{kv} : {full} -> {kvt}",
-                        f'softhier.dump_all %dkv{L}{kv}v {{tag = "{kv}C{L}"}} : {kvt}']
+                        (f'softhier.dump_all %dkv{L}{kv}v {{tag = "{kv}C{L}"}} : {kvt}' if dump_kv == "all" else
+                         f'softhier.dump_samples %dkv{L}{kv}v {{seed = {700 + 2 * L + j} : i32, n = 256 : i32, tag = "{kv}C{L}"}} : {kvt}')]
     fa = [f'sh.optimize = "{optimize}"'] if optimize else []
     if far:
         fa.append("sh.far_code")

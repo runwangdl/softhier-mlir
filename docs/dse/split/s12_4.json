@@ -1,0 +1,133 @@
+{
+ "name": "s12_4",
+ "mode": "split",
+ "mask_a": 4095,
+ "mask_b": 61440,
+ "stages": [
+  "A",
+  "B"
+ ],
+ "info": {
+  "mode": "split",
+  "mask_a": 4095,
+  "mask_b": 61440,
+  "stages": [
+   "A",
+   "B"
+  ],
+  "periods": 2,
+  "vlayers": 3,
+  "players": 4,
+  "xlayers": 4,
+  "steps": 10,
+  "chunk": 50,
+  "vis_off": 9502720,
+  "kv_base": 59363328,
+  "kv_stride": 163840,
+  "S_pad": 128,
+  "n": 65,
+  "image_end": 216262048,
+  "image_bytes": 198995554
+ },
+ "roi_ns": 106747230,
+ "wall_s": 293.6,
+ "program_bytes": 60416,
+ "image_bytes": 198995618,
+ "trace": true,
+ "marks": [
+  [
+   "preload",
+   0
+  ],
+  [
+   "start",
+   6627
+  ],
+  [
+   "A0",
+   13927921
+  ],
+  [
+   "B0",
+   52226947
+  ],
+  [
+   "period0",
+   52229336
+  ],
+  [
+   "A1",
+   66155987
+  ],
+  [
+   "B1",
+   104422082
+  ],
+  [
+   "period1",
+   104424571
+  ],
+  [
+   "end",
+   104427857
+  ]
+ ],
+ "garbled_marks": 0,
+ "periods": [
+  {
+   "p": 0,
+   "period_ns": 52222709,
+   "A_ns": 13921294,
+   "B_ns": 52220320
+  },
+  {
+   "p": 1,
+   "period_ns": 52195235,
+   "A_ns": 13926651,
+   "B_ns": 52192746
+  }
+ ],
+ "bit_identical_to_ts": {
+  "ACT": true,
+  "KC0": true,
+  "VC0": true,
+  "KC1": true,
+  "VC1": true,
+  "KC2": true,
+  "VC2": true,
+  "KC3": true,
+  "VC3": true
+ },
+ "trace_stats": {
+  "periods": [
+   {
+    "p": 0,
+    "period_ns": 52222709,
+    "hbm_MB": 583.032522,
+    "A_redmule_pct": 0.6487698037010425,
+    "A_idma_pct": 2.573451650443233,
+    "A_sync_pct": 6.534779247089614,
+    "B_redmule_pct": 2.1107646866806546,
+    "B_idma_pct": 6.711567280050524,
+    "B_sync_pct": 1.5288564405956038,
+    "all_redmule_pct": 1.0142685244459455,
+    "all_idma_pct": 3.6079805578450554,
+    "all_sync_pct": 5.283298545466112
+   },
+   {
+    "p": 1,
+    "period_ns": 52195235,
+    "hbm_MB": 1275.3196,
+    "A_redmule_pct": 0.6491350854792268,
+    "A_idma_pct": 2.5767297851358784,
+    "A_sync_pct": 79.90954458454557,
+    "B_redmule_pct": 8.1185006639016,
+    "B_idma_pct": 25.159924560163393,
+    "B_sync_pct": 5.979738380332994,
+    "all_redmule_pct": 2.51647648008482,
+    "all_idma_pct": 8.222528478892757,
+    "all_sync_pct": 61.427093033492426
+   }
+  ]
+ }
+}

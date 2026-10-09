@@ -62,6 +62,7 @@ def marks_of(stdout: str) -> tuple[list[tuple[str, int]], int]:
 def stage_times(marks: list[tuple[str, int]], periods: int) -> dict:
     """period p = start of p (start / period<p-1>) -> period<p>; A<p> / B<p> measured from the start of p."""
     t = dict(marks)
+    t["start"] = next(v for k, v in marks if k == "start")
     res = {"periods": []}
     for p in range(periods):
         t0 = t["start"] if p == 0 else t[f"period{p - 1}"]
@@ -73,8 +74,8 @@ def stage_times(marks: list[tuple[str, int]], periods: int) -> dict:
     return res
 
 
-def dumps_of(stdout: str) -> dict[str, np.ndarray]:
-    """dump_all lines '<tag> r c hex' -> {tag: fp16 array}"""
+def dumps_of(stdout: str) -> dict[str, dict]:
+    """dump lines '<tag> r c hex' -> {tag: {(r, c): fp16 bits}} (dump_all: every element; dump_samples: a sample)"""
     vals: dict[str, dict] = {}
     for ln in stdout.splitlines():
         p = ln.split()
@@ -83,28 +84,31 @@ def dumps_of(stdout: str) -> dict[str, np.ndarray]:
                 vals.setdefault(p[0], {})[(int(p[1]), int(p[2]))] = int(p[3], 16)
             except ValueError:
                 continue
-    out = {}
-    for tag, d in vals.items():
-        R = 1 + max(r for r, _ in d); C = 1 + max(c for _, c in d)
-        a = np.zeros((R, C), np.uint16)
-        for (r, c), v in d.items():
-            a[r, c] = v
-        out[tag] = a.view(np.float16)
-    return out
+    return vals
+
+
+def dense(d: dict) -> np.ndarray:
+    R = 1 + max(r for r, _ in d); C = 1 + max(c for _, c in d)
+    a = np.zeros((R, C), np.uint16)
+    for (r, c), v in d.items():
+        a[r, c] = v
+    return a.view(np.float16)
 
 
 def run(name: str, mode: str, a: str, b: str, stages: list[str], periods: int, trace: bool, build_only: bool,
-        vlayers: int, players: int, xlayers: int, timeout: int) -> bool:
+        vlayers: int, players: int, xlayers: int, timeout: int, steps: int = 10, kv_dump: str = "samples",
+        far: bool = True) -> bool:
     from softhier_mlir.frontend import smolvla_split as SP
     ma, mb = set_mask(parse_set(a)) or 0xFFFF, set_mask(parse_set(b)) or 0xFFFF
     app = HERE / "split_app" / name
     app.mkdir(parents=True, exist_ok=True)
     rt = (ROOT / "runtime").resolve()
-    (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c {FLAGS} PARENT_SCOPE)\n"
+    flags = FLAGS if far else FLAGS.replace(" -DSH_FAR_CODE", "")
+    (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c {flags} PARENT_SCOPE)\n"
                                         f"set(INCLUDE_DIRS {rt} PARENT_SCOPE)\n")
     e2e = np.load(NPZ)
     mlir, pre, info = SP.emit_pipeline(e2e, mode=mode, mask_a=ma, mask_b=mb, stages=tuple(stages), periods=periods,
-                                       vlayers=vlayers, players=players, xlayers=xlayers)
+                                       vlayers=vlayers, players=players, xlayers=xlayers, steps=steps, dump_kv=kv_dump, far=far)
     (app / "prog.mlir").write_text(mlir)
     elf_pre = make_preload_elf(app / "preload.elf", pre)
     image = sum(x.nbytes for x in pre.values())
@@ -136,21 +140,25 @@ def run(name: str, mode: str, a: str, b: str, stages: list[str], periods: int, t
            "roi_ns": r["roi_ns"], "wall_s": r["wall_s"], "program_bytes": imem, "image_bytes": image, "trace": trace,
            "marks": marks, "garbled_marks": garbled}
     res.update(stage_times(marks, periods))
-    d = dumps_of(out)
+    dd = dumps_of(out)
+    d = {tag: dense(v) for tag, v in dd.items()}
     np.savez(app / "outputs.npz", **d)
     ok = True
     ref_app = HERE / "split_app" / "ts"
-    if name != "ts" and (ref_app / "outputs.npz").exists():
-        ref = dict(np.load(ref_app / "outputs.npz"))
+    same_cfg = name != "ts" and (OUT / "ts.json").exists() and all(
+        json.loads((OUT / "ts.json").read_text())["info"][k] == info[k] for k in ("vlayers", "players", "xlayers", "steps"))
+    if same_cfg and (ref_app / "outputs.npz").exists():
+        ref = {k: v.view(np.uint16) for k, v in np.load(ref_app / "outputs.npz").items()}
         cmp = {}
-        for tag, arr in d.items():
-            if tag in ref:
-                same = arr.shape == ref[tag].shape and np.array_equal(arr.view(np.uint16), ref[tag].view(np.uint16))
+        for tag, vals in dd.items():
+            # ACT of a B-only run is computed on the preloaded (lerobot) KV block, not on A's: nothing to compare
+            if tag in ref and (tag != "ACT" or ("A" in stages and periods >= 2)):
+                same = all(r < ref[tag].shape[0] and c < ref[tag].shape[1] and int(ref[tag][r, c]) == v for (r, c), v in vals.items())
                 cmp[tag] = bool(same)
                 ok &= same
         res["bit_identical_to_ts"] = cmp
         print(f"     vs ts: {sum(cmp.values())}/{len(cmp)} outputs bit-identical {sorted(k for k, v in cmp.items() if not v)}")
-    if name == "ts" or res.get("check_twin"):
+    if kv_dump == "all" and "B" in stages and "A" in stages:
         res["twin"] = twin_check(e2e, d, info)
         print(f"     expert fp16 twin on the device KV: actions max abs {res['twin']['max_abs']:.4f}")
     for p in res["periods"]:
@@ -190,6 +198,7 @@ def trace_stats(log: Path, marks, periods: int, ma: int, mb: int, mode: str) -> 
     from softhier_mlir.sim.trace import segment_stats
     segs = segment_stats(log)
     t = dict(marks)
+    t["start"] = next(v for k, v in marks if k == "start")
     out = []
     for p in range(periods):
         t0 = t["start"] if p == 0 else t[f"period{p - 1}"]
@@ -209,6 +218,7 @@ def png(name: str, period: int, out: Path | None) -> None:
     from softhier_mlir.sim.trace import _ANSI, _DMA_ANY, _RED, _SYNC, to_png
     res = json.loads((OUT / f"{name}.json").read_text())
     t = dict(res["marks"])
+    t["start"] = next(v for k, v in res["marks"] if k == "start")
     t0 = t["start"] if period == 0 else t[f"period{period - 1}"]
     t1 = t[f"period{period}"]
     ev = []
@@ -249,6 +259,10 @@ def main() -> None:
     pr.add_argument("--xlayers", type=int, default=4)
     pr.add_argument("--trace", action="store_true")
     pr.add_argument("--build-only", action="store_true")
+    pr.add_argument("--steps", type=int, default=10)
+    pr.add_argument("--kv-dump", default="samples", choices=("all", "samples", "none"),
+                    help="all: every KV element (the fp16 twin check of the expert), samples: 256 per tensor (bitwise vs ts)")
+    pr.add_argument("--no-far", action="store_true", help="control code in instruction memory (fits only for one stage)")
     pr.add_argument("--timeout", type=int, default=12 * 3600)
     pp = sub.add_parser("png")
     pp.add_argument("--name", required=True)
@@ -256,7 +270,8 @@ def main() -> None:
     pp.add_argument("--out")
     a = ap.parse_args()
     if a.cmd == "run":
-        ok = run(a.name, a.mode, a.a, a.b, a.stages, a.periods, a.trace, a.build_only, a.vlayers, a.players, a.xlayers, a.timeout)
+        ok = run(a.name, a.mode, a.a, a.b, a.stages, a.periods, a.trace, a.build_only, a.vlayers, a.players, a.xlayers, a.timeout,
+                 a.steps, a.kv_dump, not a.no_far)
         sys.exit(0 if ok else 1)
     png(a.name, a.period, Path(a.out) if a.out else None)
 

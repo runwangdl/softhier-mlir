@@ -1,0 +1,151 @@
+{
+ "name": "s8_8_A",
+ "mode": "split",
+ "mask_a": 255,
+ "mask_b": 65280,
+ "stages": [
+  "A"
+ ],
+ "info": {
+  "mode": "split",
+  "mask_a": 255,
+  "mask_b": 65280,
+  "stages": [
+   "A"
+  ],
+  "periods": 1,
+  "vlayers": 3,
+  "players": 4,
+  "xlayers": 4,
+  "steps": 10,
+  "chunk": 50,
+  "vis_off": 9502720,
+  "kv_base": 59363328,
+  "kv_stride": 163840,
+  "S_pad": 128,
+  "n": 65,
+  "image_end": 216262048,
+  "image_bytes": 198995554
+ },
+ "roi_ns": 18220467,
+ "wall_s": 44.8,
+ "program_bytes": 55628,
+ "image_bytes": 198995618,
+ "trace": false,
+ "marks": [
+  [
+   "start",
+   0
+  ],
+  [
+   "start",
+   5345
+  ],
+  [
+   "vemb0",
+   95670
+  ],
+  [
+   "attn1",
+   1988280
+  ],
+  [
+   "layer1",
+   3902653
+  ],
+  [
+   "attn2",
+   5795164
+  ],
+  [
+   "layer2",
+   7709804
+  ],
+  [
+   "attn3",
+   9602714
+  ],
+  [
+   "layer3",
+   11517462
+  ],
+  [
+   "vis0",
+   11786754
+  ],
+  [
+   "start",
+   11792116
+  ],
+  [
+   "emb",
+   12136321
+  ],
+  [
+   "attn1",
+   12703429
+  ],
+  [
+   "layer1",
+   13572970
+  ],
+  [
+   "attn2",
+   14140637
+  ],
+  [
+   "layer2",
+   15010250
+  ],
+  [
+   "attn3",
+   15577238
+  ],
+  [
+   "layer3",
+   16472833
+  ],
+  [
+   "attn4",
+   17044879
+  ],
+  [
+   "layer4",
+   17976088
+  ],
+  [
+   "end",
+   18187705
+  ],
+  [
+   "A0",
+   18189491
+  ],
+  [
+   "period0",
+   18191787
+  ],
+  [
+   "end",
+   18194473
+  ]
+ ],
+ "garbled_marks": 0,
+ "periods": [
+  {
+   "p": 0,
+   "period_ns": 18191787,
+   "A_ns": 18189491
+  }
+ ],
+ "bit_identical_to_ts": {
+  "KC0": true,
+  "VC0": true,
+  "KC1": true,
+  "VC1": true,
+  "KC2": true,
+  "VC2": true,
+  "KC3": true,
+  "VC3": true
+ }
+}
