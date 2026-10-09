@@ -131,11 +131,45 @@ int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t v
 int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
                         uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
                         uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster);
-uint32_t sh_x_attention_l1_bytes(uint32_t Sq, uint32_t L, uint32_t dh);                        /* L = Lp + So */
+/* nb candidates at once: q = nb blocks of Sq query rows, ko / vo = nb blocks of So own rows, o = nb blocks of Sq rows; the
+ * prefix K/V is staged once per head, candidate c's queries attend the prefix and only their own block c causally
+ * (docs/WORLD_MODEL.md). nb = 1 is sh_x_attention. */
+int sh_x_attention_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                     uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t H, uint32_t Hkv, uint32_t dh,
+                     uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo,
+                     float scale, uint32_t cluster);
+int sh_x_attention_head_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+                          uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
+                          uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster);
+uint32_t sh_x_attention_l1_bytes_n(uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t dh);
+uint32_t sh_x_attention_l1_bytes(uint32_t Sq, uint32_t L, uint32_t dh);                        /* L = Lp + So, nb = 1 */
 uint32_t sh_x_attention_profile(uint32_t Sq, uint32_t L, uint32_t dh, uint32_t phase);         /* mcycle stamps 0 entry, 1 staged, 2 scores, 3 softmax, 4 P.V, 5 stored */
 /* Print every element of a matrix ("<tag> r c hex"; tag<idx> variant). Calling core. */
 void sh_test_dump_all(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag);
 void sh_test_dump_all_idx(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag, uint32_t idx);
+
+/* ---- on-chip world model (runtime/sh_wm.inc.c, docs/WORLD_MODEL.md) -----------------------------------------
+ * DreamerV3-style RSSM (LayerNorm-GRU, categorical latent with unimix 0.01, actor; world-model-on-edge wm/rssm.py),
+ * weight-stationary: the weight blob (softhier_mlir.frontend.wm_rssm.pack) is staged once into the TCDM of every
+ * participating cluster, K trajectories are dealt over the clusters (cluster == SH_ALL) or run on one, H steps each.
+ * posterior = 0: imagination (prior + actor): (h, z) <- prior(h, z, a); a <- tanh(actor(z, h)).
+ * posterior = 1: rssm.step: h <- GRU(img_in(z, a), h); z <- posterior(h, enc(obs_t)); a <- actor(z, h).
+ * HBM layouts (fp16 row-major): h0 [K, deter], z0 [K, stoch*classes], a0 [K, AP] (AP = act rounded up to 4, zero
+ * padded), obs [H, K, OP] (OP = obs rounded up to 4), outputs hs / zs / as = [H, K, .] when record, else [1, K, .]
+ * (the last step). Returns 0, or <0 on an unsupported shape (deter % 16, classes % 4, classes <= 32, L1). */
+typedef struct {
+    uint32_t deter, stoch, classes, hidden, units, obs, act;   /* rssm.py RSSMConfig (obs / act unpadded) */
+    uint32_t K, H;                                             /* trajectories, steps */
+    uint32_t posterior, record;
+    uint32_t kb;                                               /* rows per TCDM chunk (0: all of the cluster's rows, halved until they fit) */
+    uint64_t dbg;                                              /* 0, or HBM area: step 0 of the first chunk's intermediates, 64 KB slots (sh_wm.inc.c) */
+} sh_wm_cfg;
+int sh_wm_rssm(const sh_wm_cfg *c, uint64_t wblob, uint64_t h0, uint64_t z0, uint64_t a0, uint64_t obs,
+               uint64_t hs, uint64_t zs, uint64_t as, uint32_t cluster);
+/* cycles of the calling cluster's last sh_wm_rssm call per phase (first core's mcycle; every phase ends with an
+ * intra-cluster sync, so the phases add up to the cluster's time) */
+enum { SH_WM_P_LOAD, SH_WM_P_GEMM, SH_WM_P_LN, SH_WM_P_GRU, SH_WM_P_SOFTMAX, SH_WM_P_HEAD, SH_WM_P_STORE, SH_WM_P_ROWS, SH_WM_P_KB, SH_WM_NPROF = 16 };
+uint32_t sh_wm_profile(uint32_t phase);
 
 /* ---- TCDM-resident ops (calling cluster only; intra-cluster sync inside) ------------------ */
 uint32_t sh_l1_addr(uint32_t off);                                   /* TCDM byte offset -> address */

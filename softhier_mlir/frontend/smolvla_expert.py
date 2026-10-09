@@ -320,13 +320,45 @@ class _Prog:
 # tile shapes (tm, tn, tk) per GEMM family; overridable for experiments (docs/SMOLVLA_EXPERT.md)
 TILES = {"qkv": (S, 64, D), "o": (S, 48, DQ), "gu": (S, 256, 240), "d": (S, 48, 512), "kv": (LP, 64, DKV),
          "a": (S, 48, AD), "t": (S, 48, D), "out": (S, 32, D)}
+GEMM_K = {"qkv": D, "o": DQ, "gu": D, "d": FF, "a": AD, "t": D, "out": D}
+TCDM_BYTES = 0x100000
 
 
-def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_steps=None, tiles=TILES, prof=False, pidx=None):
+def batch_tiles(nb: int, tiles=TILES) -> dict:
+    """Tiles for nb candidate chunks (docs/WORLD_MODEL.md): every step GEMM gets tm = nb * 50 (one row tile, so each
+    weight tile is streamed from HBM once per step whatever nb is); tn is kept (same number of output tiles to deal
+    over the clusters); tk is the largest divisor of K <= the nb = 1 tk for which sh_gemm's double-buffered
+    scratch fits the TCDM. nb = 1 returns the tiles unchanged."""
+    if nb == 1:
+        return dict(tiles)
+    out = dict(tiles)
+    for fam, K in GEMM_K.items():
+        tm, tn, tk = tiles[fam]
+        tm = tm * nb
+        for d in range(min(tk, K), 0, -1):
+            if K % d == 0 and 2 * (tm * d + d * tn) * 2 + tm * tn * 2 <= TCDM_BYTES:
+                tk = d
+                break
+        else:
+            raise ValueError(f"no tk fits for {fam} at nb={nb}")
+        out[fam] = (tm, tn, tk)
+    return out
+
+
+def cand_noise(x0: np.ndarray, seeds) -> np.ndarray:
+    """[len(seeds) * 50, 32] fp16 initial noise of the candidates: seed None = the given x0 (lerobot's noise),
+    otherwise N(0, 1) from numpy's default_rng(seed)."""
+    blocks = [x0.astype(np.float16) if sd is None else np.random.default_rng(sd).standard_normal((S, AD)).astype(np.float16)
+              for sd in seeds]
+    return np.ascontiguousarray(np.concatenate(blocks, axis=0))
+
+
+def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_steps=None, tiles=TILES, prof=False, pidx=None, nb: int = 1):
     """Emit one expert layer. names: parameter / KV SSA names for this layer; kind 'self' | 'cross'.
     Activations: h (residual, in place), xn, qkv (q | k | v for self; q for cross), o, ao, gu, m, f2."""
     T, op, cl = P.T, P.op, P.cl
     m = lambda tag: P.mark(tag, pidx) if prof else None  # noqa: E731
+    nbat = f"n_batch = {nb} : i32, " if nb > 1 else ""      # candidate c's queries see only their own block's keys
     op(f"softhier.rmsnorm %h, %{names['g1']} -> %xn {{eps = {RMS_EPS:.1e} : f32, {cl}}} : {T['h']}, {T[names['g1']]} -> {T['xn']}")
     if kind == "self":
         P.gemm("xn", names["wqkv"], "qkv", *tiles["qkv"], step=step, fmt_steps=fmt_steps)
@@ -335,7 +367,7 @@ def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_step
         op(f"softhier.rope %k, %rq_self -> %k {{head_dim = {DH} : i32, {cl}}} : {T['k']}, {T['rq_self']} -> {T['k']}")
         m("rope")
         op(f"softhier.cross_attention %q, %{names['kp']}, %{names['vp']} own %k, %v mask %tok -> %o "
-           f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T['q']}, {T[names['kp']]}, {T[names['vp']]} "
+           f"{{scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {nbat}{cl}}} : {T['q']}, {T[names['kp']]}, {T[names['vp']]} "
            f"own {T['k']}, {T['v']} mask {T['tok']} -> {T['o']}")
     else:
         P.gemm("xn", names["wq"], "q", *tiles["qkv"], step=step, fmt_steps=fmt_steps)
@@ -359,15 +391,16 @@ def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_step
     m("down")
 
 
-def _activations(P: _Prog):
-    for nm, r, c in [("x", S, AD), ("e", S, D), ("e1", S, D), ("h", S, D), ("xn", S, D), ("qkv", S, DQ + 2 * DKV), ("o", S, DQ),
-                     ("ao", S, D), ("gu", S, 2 * FF), ("f2", S, D), ("fin", S, D), ("vt", S, AD)]:
+def _activations(P: _Prog, nb: int = 1):
+    R = S * nb       # nb candidate chunks stacked along the rows
+    for nm, r, c in [("x", R, AD), ("e", R, D), ("e1", R, D), ("h", R, D), ("xn", R, D), ("qkv", R, DQ + 2 * DKV), ("o", R, DQ),
+                     ("ao", R, D), ("gu", R, 2 * FF), ("f2", R, D), ("fin", R, D), ("vt", R, AD)]:
         P.B(nm, r, c)
-    P.view("q", "qkv", S, DQ, DQ + 2 * DKV, 0)
-    P.view("k", "qkv", S, DKV, DQ + 2 * DKV, DQ)
-    P.view("v", "qkv", S, DKV, DQ + 2 * DKV, DQ + DKV)
-    P.view("ga", "gu", S, FF, 2 * FF, 0)
-    P.view("up", "gu", S, FF, 2 * FF, FF)
+    P.view("q", "qkv", R, DQ, DQ + 2 * DKV, 0)
+    P.view("k", "qkv", R, DKV, DQ + 2 * DKV, DQ)
+    P.view("v", "qkv", R, DKV, DQ + 2 * DKV, DQ + DKV)
+    P.view("ga", "gu", R, FF, 2 * FF, 0)
+    P.view("up", "gu", R, FF, 2 * FF, FF)
 
 
 def emit_layer_test(seed: int = 1, cluster: int = -1, nsamples: int = 128, tiles=TILES, device_fill: bool = False) -> tuple[str, dict, dict]:
@@ -501,7 +534,8 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
 
 def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, fmt_steps: list[str] | None = None,
               profile: bool = False, dumps: tuple[str, ...] = ("X",), nsamples: int = 64, tiles=TILES,
-              kv_base: int | None = None, kv_stride: int = KV_STRIDE, s_pad: int = S_PAD, num_steps: int = STEPS) -> tuple[str, dict]:
+              kv_base: int | None = None, kv_stride: int = KV_STRIDE, s_pad: int = S_PAD, num_steps: int = STEPS,
+              n_cand: int = 1, x0: np.ndarray | None = None) -> tuple[str, dict]:
     """Step 2/3: the flow loop: the first `steps` steps of the `num_steps` Euler schedule (dt = -1/num_steps, time table
     row s). Returns (mlir, preload). layers must be even (self/cross pairs).
     Prefix KV: read in the VLM prefix program's layout (frontend.smolvla emit_vlm): layer L keys at
@@ -511,20 +545,33 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     dumps: X (x_t after every step, all 1600 elements), A (final actions), EMB / H / O (step-loop intermediates, sampled,
     tagged with step*16+layer so the host can pick step 0). fmt_steps: per-step RedMulE format of every weight GEMM
     inside the step loop (R4's experiment hook; fp8 steps are plumbing only, the operands stay fp16 in memory).
-    profile: a mark after every op group of every layer (per-op timing breakdown)."""
+    profile: a mark after every op group of every layer (per-op timing breakdown).
+    n_cand: candidate chunks denoised at once (docs/WORLD_MODEL.md): every activation has n_cand * 50 rows, x0 is
+    [n_cand * 50, 32] (default: the npz noise repeated), the RoPE tables repeat per candidate, the self layers' own
+    keys are causal within each candidate block (cross_attention n_batch), the prefix KV and the weights are shared;
+    tiles = batch_tiles(n_cand, tiles)."""
     data = np.load(npz) if isinstance(npz, (str, Path)) else npz
     W = {k[2:]: data[k] for k in data if k.startswith("p_")}
+    nb = n_cand
+    if x0 is not None:
+        W["x0"] = np.ascontiguousarray(x0.astype(np.float16))
+    elif nb > 1:
+        W["x0"] = np.tile(W["x0"], (nb, 1))
+    assert W["x0"].shape == (S * nb, AD), W["x0"].shape
+    if nb > 1:
+        W["rq_self"], W["rq_cross"] = np.tile(W["rq_self"], (nb, 1)), np.tile(W["rq_cross"], (nb, 1))
+        tiles = batch_tiles(nb, tiles)
     assert layers % 2 == 0 and layers <= LAYERS      # layers == 0: the step tail only (debugging)
     assert steps <= num_steps
     if fmt_steps is not None:
         assert len(fmt_steps) == steps, (len(fmt_steps), steps)
     P = _Prog(cluster, nsamples)
     T, op = P.T, P.op
-    _activations(P)
+    _activations(P, nb)
     for nm in ("x0", "wa", "ba", "wti", "tb", "wto", "bto", "gf", "wout", "bout", "rq_self", "rq_cross"):
         P.B(nm, *W[nm].shape, W[nm])
     P.B("tok", 1, LP, W["tok"].astype(np.uint16), elem="i16")
-    P.B("zero", S, AD, np.zeros((S, AD), np.float16))
+    P.B("zero", S * nb, AD, np.zeros((S * nb, AD), np.float16))
     # the prefix KV region (VLM layout)
     if kv_base is None:
         kv_base = P.e.next_off
@@ -594,13 +641,13 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
         op("%i0 = arith.addi %s16, %L0 : index"); op("%i1 = arith.addi %s16, %L1 : index")
         slab([f"{nm}_s" for nm, _, _ in SELF] + ["kp_s", "vp_s"] + [f"{nm}_c" for nm, _, _ in CROSS if nm not in ("wkx", "wvx")])
         _layer_ops(P, "s", "self", {k: f"{k}_s" for k in ("g1", "g2", "wqkv", "wo", "wgu", "wd", "kp", "vp")}, step="%s", fmt_steps=fs,
-                   tiles=tiles, prof=profile, pidx="%i0")
+                   tiles=tiles, prof=profile, pidx="%i0", nb=nb)
         if "O" in dumps:
             P.dump("o", 311, "O", "%i0")
         if "H" in dumps:
             P.dump("h", 312, "H", "%i0")
         _layer_ops(P, "c", "cross", {k: f"{k}_c" for k in ("g1", "g2", "wq", "wo", "wgu", "wd", "kx", "vx")}, step="%s", fmt_steps=fs,
-                   tiles=tiles, prof=profile, pidx="%i1")
+                   tiles=tiles, prof=profile, pidx="%i1", nb=nb)
         if "O" in dumps:
             P.dump("o", 311, "O", "%i1")
         if "H" in dumps:
