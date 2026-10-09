@@ -37,6 +37,7 @@ import numpy as np
 
 from softhier_mlir.frontend import smolvla as V
 from softhier_mlir.frontend import smolvla_expert as X
+from softhier_mlir.frontend.clusters import barrier_op, cl_attr, set_attr
 from softhier_mlir.frontend.siglip import _Emitter, gemm_tile_attrs
 from softhier_mlir.sim.preload import sentinel_array
 
@@ -101,11 +102,15 @@ def info(e2e) -> dict:
 
 # ----------------------------------------------------------------------------- phase V: vision + connector
 def emit_vision(e2e, cluster: int = -1, nsamples: int = 128, tiles: str = "model", vision_npz=VISION_NPZ,
-                vlm_npz=VLM_NPZ, layers: int = VLAYERS) -> tuple[str, dict[int, np.ndarray]]:
+                vlm_npz=VLM_NPZ, layers: int = VLAYERS, hbm_base: int | None = None, marks: bool = True,
+                connector: bool = True) -> tuple[str, dict[int, np.ndarray]]:
     """SigLIP (12 layers, the layer loop and head loop of frontend.smolvla.emit) inside one scf.for over the
     cameras, then the pixel shuffle of every camera's output and one connector GEMM over all image tokens.
     Marks: start, vemb<c>, attn<c*12+l>, layer<c*12+l>, vis<c> (post-LN), conn, end. Dumps: VIS (samples of the
-    SigLIP outputs, row = c*T + token), IMG (every element of the connector output: the hand-over)."""
+    SigLIP outputs, row = c*T + token), IMG (every element of the connector output: the hand-over).
+    Spatial split (frontend.smolvla_split): hbm_base = first HBM offset of this program's buffers (default
+    HBM_DATA_START), marks = False drops every mark, connector = False stops after the SigLIP output (`vis`, whose
+    offset is emit_vision.last_info["vis_off"]; the prefix program then runs pixel shuffle + connector)."""
     it = info(e2e)
     cams, T, n_img = it["cams"], it["T"], it["n_img"]
     vw = np.load(vision_npz)
@@ -114,10 +119,10 @@ def emit_vision(e2e, cluster: int = -1, nsamples: int = 128, tiles: str = "model
     wc = np.load(vlm_npz)["p_wc"]
     dh = D // HEADS
     e = _Emitter()
-    e.next_off = HBM_DATA_START
+    e.next_off = HBM_DATA_START if hbm_base is None else hbm_base
     Tt: dict[str, str] = {}
     pre: dict[int, np.ndarray] = {}
-    cl = f"cluster = {cluster} : i32"
+    cl = cl_attr(cluster)       # an id, -1 = SH_ALL, or a cluster set (frontend.clusters)
     hc = cl
     sp = e.space
     mt = lambda r, c: f'memref<{r}x{c}xf16, "{sp}">'  # noqa: E731
@@ -135,7 +140,8 @@ def emit_vision(e2e, cluster: int = -1, nsamples: int = 128, tiles: str = "model
         Tt[name] = e.buf(name, rows, cols)
 
     def mark(tag, idx=None):
-        e.op(f'softhier.mark {idx + " " if idx else ""}{{tag = "{tag}"}}')
+        if marks:
+            e.op(f'softhier.mark {idx + " " if idx else ""}{{tag = "{tag}"{set_attr(cluster)}}}')
 
     # activations of one camera (reused), the camera families (inputs, SigLIP outputs), connector buffers
     for nm, r, c in [("x", T, D), ("ln1", T, D), ("q", T, D), ("k", T, D), ("v", T, D), ("kT", D, T),
@@ -151,10 +157,12 @@ def emit_vision(e2e, cluster: int = -1, nsamples: int = 128, tiles: str = "model
     assert cam_stride == T * D * 2, "camera blocks must be contiguous (pixel shuffle / sample views)"
     Tt["vis"] = mt(cams * T, D)
     e.op(f"%vis = softhier.hbm_buffer {{offset = {vis_off} : i32}} : {Tt['vis']}")
-    B("ps", n_img, D * PS); B("img", n_img, V.TD)
+    if connector:
+        B("ps", n_img, D * PS); B("img", n_img, V.TD)
     B("pos", T, D, pos)
     B("wpe", D, D, PV["wpe"]); B("bpe", 1, D, PV["bpe"]); B("gpost", 1, D, PV["gpost"]); B("bepost", 1, D, PV["bepost"])
-    B("wc", D * PS, V.TD, wc)
+    if connector:
+        B("wc", D * PS, V.TD, wc)
     layer0_off, stride = {}, 0
     for L in range(layers):
         begin = e.next_off
@@ -210,7 +218,7 @@ def emit_vision(e2e, cluster: int = -1, nsamples: int = 128, tiles: str = "model
     e.op(f"softhier.softmax %sh -> %sh {{scale = {1 / math.sqrt(dh)!r} : f32, {hc}}} : {views['sh']} -> {views['sh']}")
     e.op(f"softhier.gemm %sh, %vh into %oh {{fmt = \"fp16\", {pv}, {hc}}} : {views['sh']}, {views['vh']}, {views['oh']}")
     e.op("}")
-    e.op("softhier.group_barrier {grid_x = 4 : i32, grid_y = 4 : i32}")
+    e.op(barrier_op(cluster))
     mark("attn", "%L1")
     e.op(f"softhier.gemm %o, %wo into %ao {{fmt = \"fp16\", {big}, {cl}}} : {Tt['o']}, {Tt['wo']}, {Tt['ao']}")
     e.op(f"softhier.add_bias %ao, %bo -> %ao {{{cl}}} : {Tt['ao']}, {Tt['bo']} -> {Tt['ao']}")
@@ -227,6 +235,12 @@ def emit_vision(e2e, cluster: int = -1, nsamples: int = 128, tiles: str = "model
     e.op(f"softhier.layernorm %x, %gpost, %bepost -> %fin {{eps = {V.LN_EPS:.1e} : f32, {cl}}} : {Tt['x']}, {Tt['gpost']}, {Tt['bepost']} -> {mt(T, D)}")
     mark("vis", "%cam")
     e.op("}")
+    if not connector:
+        body = "\n".join(e.lines)
+        mlir = f"builtin.module {{\n  func.func @smolvla_e2e_vision() {{\n{body}\n    func.return\n  }}\n}}\n"
+        emit_vision.last_info = {"image_bytes": sum(a.nbytes for a in pre.values()), "layer_stride": stride, "vis_off": vis_off,
+                                 "end": e.next_off}
+        return mlir, pre
     # connector: pixel shuffle per camera into rows of ps, one GEMM over every camera's image tokens
     it_c = it["img_tok"]
     for c in range(cams):

@@ -28,6 +28,11 @@ from tests.gvsoc.run import _elf_load_segments, lower_and_translate  # noqa: E40
 HERE = Path(__file__).resolve().parent
 
 
+def _cluster_arg(spec: str) -> int:
+    from softhier_mlir.frontend.clusters import parse
+    return parse(spec)
+
+
 def _app(app_dir: Path | None) -> Path:
     app = Path(app_dir) if app_dir else HERE / "expert_app"
     app.mkdir(parents=True, exist_ok=True)
@@ -302,7 +307,7 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--layers", type=int, default=16)
-    ap.add_argument("--cluster", type=int, default=-1)
+    ap.add_argument("--cluster", type=_cluster_arg, default=-1, help="-1 / all, an id, or a cluster set set:<mask> | rows:<y0>-<y1>")
     ap.add_argument("--nsamples", type=int, default=128)
     ap.add_argument("--fmt", help="flow: comma-separated RedMulE format per step (fp16|fp8|int16|int8)")
     ap.add_argument("--profile", action="store_true", help="flow: per-op marks")

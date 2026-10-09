@@ -207,7 +207,7 @@ static int sh_attn_check(uint32_t S, uint32_t dh, uint32_t sq, int first) {
 /* One head on one cluster (all q blocks of the head; q block = the largest that fits). */
 int sh_attention_head(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, uint32_t dh,
                       uint32_t ldq, uint32_t ldk, uint32_t ldv, uint32_t ldo, float scale, uint32_t cluster) {
-    if (cluster != SH_ALL && flex_get_cluster_id() != cluster) return 0;
+    if (cluster != SH_ALL && sh_set_r(cluster) == SH_SET_NONE) return 0;
     const uint32_t sq = sh_attention_q_block(S, dh, 1, 1);
     if (sh_attn_check(S, dh, sq, flex_is_first_core())) return -1;
     return sh_attn_items(q, k, v, o, S, dh, sq, ldq, ldk, ldv, ldo, scale, 0, S / sq);
@@ -224,11 +224,16 @@ int sh_attention_q(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, u
         if (lead) sh_printf("[sh_attention] D=%u not divisible by H=%u\n", D, H);
         return -1;
     }
-    if (!sq) sq = sh_attention_q_block(S, dh, H, cluster == SH_ALL ? P : 1);
+    if (!sq) sq = sh_attention_q_block(S, dh, H, sh_set_P(cluster));
     if (sh_attn_check(S, dh, sq, lead)) return -1;
     const uint32_t n = H * (S / sq);
     int rc = 0;
-    if (cluster == SH_ALL) {
+    if (SH_IS_GROUP(cluster)) {   /* a cluster set: contiguous chunks over its members, the set's barrier */
+        const uint32_t r = sh_set_r(cluster), Ps = sh_set_P(cluster);
+        if (r == SH_SET_NONE) return 0;
+        rc = sh_attn_items(q, k, v, o, S, dh, sq, ldq, ldk, ldv, ldo, scale, n * r / Ps, n * (r + 1) / Ps);
+        sh_set_end(cluster);
+    } else if (cluster == SH_ALL) {
         rc = sh_attn_items(q, k, v, o, S, dh, sq, ldq, ldk, ldv, ldo, scale, n * cid / P, n * (cid + 1) / P);
         flex_global_barrier_xy();
     } else if (cid == cluster) {

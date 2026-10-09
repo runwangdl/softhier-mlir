@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
+from softhier_mlir.frontend.clusters import c_cluster, cl_attr, set_attr
 from softhier_mlir.frontend.siglip import _Emitter
 from softhier_mlir.sim.preload import sentinel_array
 from softhier_mlir.testing import lcg
@@ -279,7 +280,8 @@ class _Prog:
         self.T: dict[str, str] = {}
         self.pre: dict[int, np.ndarray] = {}
         self.off: dict[str, int] = {}
-        self.cl = f"cluster = {cluster} : i32"
+        self.cl = cl_attr(cluster)            # an id, -1 = SH_ALL, or a cluster set (frontend.clusters)
+        self.cluster, self.sa = cluster, set_attr(cluster)
         self.nsamples, self.marks = nsamples, marks
         self.sp = self.e.space
 
@@ -322,13 +324,13 @@ class _Prog:
 
     def mark(self, tag, idx=None):
         if self.marks:
-            self.op(f'softhier.mark {idx + " " if idx else ""}{{tag = "{tag}"}}')
+            self.op(f'softhier.mark {idx + " " if idx else ""}{{tag = "{tag}"{self.sa}}}')
 
     def dump(self, name, seed, tag, idx=None, all_=False):
         if all_:
-            self.op(f'softhier.dump_all %{name}{", " + idx if idx else ""} {{tag = "{tag}"}} : {self.T[name]}')
+            self.op(f'softhier.dump_all %{name}{", " + idx if idx else ""} {{tag = "{tag}"{self.sa}}} : {self.T[name]}')
         else:
-            self.op(f'softhier.dump_samples %{name}{", " + idx if idx else ""} {{seed = {seed} : i32, n = {self.nsamples} : i32, tag = "{tag}"}} : {self.T[name]}')
+            self.op(f'softhier.dump_samples %{name}{", " + idx if idx else ""} {{seed = {seed} : i32, n = {self.nsamples} : i32, tag = "{tag}"{self.sa}}} : {self.T[name]}')
 
     def gemm(self, x, w, z, tm, tn, tk, step=None, fmt_steps=None, cl=None):
         fs = f', fmt_steps = [{", ".join(chr(34) + f + chr(34) for f in fmt_steps)}]' if fmt_steps else ""
@@ -367,7 +369,7 @@ class _Prog:
         M, K, ldx = self.geom(x); _, N, ldw = self.geom(w16); _, _, ldz = self.geom(z)
         cfg = f"&(sh_gemm_cfg){{{{ .tm = {tm}, .tn = {tn}, .tk = {tk}, .pipeline = 1, .accumulate = 0, .fmt = 0, .l1_base = 0 }}}}"
         fmt = f"((const uint32_t[]){{{{{table}}}}})[{{6}}]"
-        cl = "SH_ALL" if "cluster = -1" in self.cl else "0"
+        cl = c_cluster(self.cluster)
         self.call("sh_f_gemm_step", [f"%{x}", f"%{w16}", f"%{w8}", f"%{wq16}", f"%{ke}", f"%{z}", step],
                   f"{{0}}, {{1}}, {{2}}, {{3}}, {{4}}, {{5}}, {M}, {N}, {K}, {ldx}, {ldw}, {ldz}, {cfg}, {fmt}, {mode}, {cl}")
 
@@ -659,7 +661,8 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
               profile: bool = False, dumps: tuple[str, ...] = ("X",), nsamples: int = 64, tiles=TILES,
               kv_base: int | None = None, kv_stride: int = KV_STRIDE, s_pad: int = S_PAD, num_steps: int = STEPS,
               n_cand: int = 1, x0: np.ndarray | None = None, chunk: int | None = None,
-              attn: str = "stream", fp8_mode: int | None = None) -> tuple[str, dict]:
+              attn: str = "stream", fp8_mode: int | None = None, hbm_base: int | None = None, marks: bool = True,
+              kv_buf: str | None = None, pair_marks: bool = False) -> tuple[str, dict]:
     """Step 2/3: the flow loop: the first `steps` steps of the `num_steps` Euler schedule (dt = -1/num_steps, time table
     row s). Returns (mlir, preload). layers must be even (self/cross pairs).
     attn: "stream" (sh_x_attention: every head re-streams its kv head's prefix K / V from HBM every step) or "kvs"
@@ -681,7 +684,11 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     tiles = batch_tiles(n_cand, tiles).
     chunk: action rows per candidate (default the npz's 50; fewer rows == the first rows of 50 since own keys are causal).
     The prefix length is the token-class row's (p_tok [1, Lp]): 241 for the 3-camera 512 x 512 prefix, any other
-    (e.g. 65 / 97 for 1 / 3 cameras at 256 x 256, frontend.smolvla_e2e) reads the first Lp rows of each KV block."""
+    (e.g. 65 / 97 for 1 / 3 cameras at 256 x 256, frontend.smolvla_e2e) reads the first Lp rows of each KV block.
+    Spatial split / pipelining over chunks (frontend.smolvla_split; all off by default): hbm_base = first HBM offset of
+    this program's buffers, marks = False drops every mark, kv_buf = an `index` SSA value (defined by the caller)
+    selecting KV slot block kv_buf of a double-buffered region (layer L at kv_base + (L + kv_buf * layers) * kv_stride),
+    pair_marks = a mark after every self + cross layer pair of every step (tag pair<16 s + 2 p + 1>)."""
     data = np.load(npz) if isinstance(npz, (str, Path)) else npz
     W = {k[2:]: data[k] for k in data if k.startswith("p_")}
     lp = int(W["tok"].shape[1])
@@ -708,7 +715,9 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     assert steps <= num_steps
     if fmt_steps is not None:
         assert len(fmt_steps) == steps, (len(fmt_steps), steps)
-    P = _Prog(cluster, nsamples)
+    P = _Prog(cluster, nsamples, marks)
+    if hbm_base is not None:
+        P.e.next_off = hbm_base
     T, op = P.T, P.op
     _activations(P, rows, nb)
     for nm in ("x0", "wa", "ba", "wti", "tb", "wto", "bto", "gf", "wout", "bout", "rq_self", "rq_cross"):
@@ -781,9 +790,15 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     kvoff = {"kp_s": kv_base, "vp_s": kv_base + s_pad * DKV * 2, "kp_c": kv_base + kv_stride, "vp_c": kv_base + kv_stride + s_pad * DKV * 2}
 
     def slab(sfx_names):
+        kvi = "%p"
+        if kv_buf and any(nm in kvoff for nm in sfx_names):   # double-buffered KV region: pair p of block kv_buf
+            op(f"%cKVP = arith.constant {layers // 2} : index")
+            op(f"%pkb = arith.muli {kv_buf}, %cKVP : index")
+            op("%pk = arith.addi %p, %pkb : index")
+            kvi = "%pk"
         for nm in sfx_names:
             if nm in kvoff:   # prefix K / V of layer 2p (self) or 2p + 1 (cross) in the VLM's KV region
-                op(f"%{nm} = softhier.hbm_buffer %p {{offset = {kvoff[nm]} : i32, stride = {2 * kv_stride} : i32}} : {T[nm]}")
+                op(f"%{nm} = softhier.hbm_buffer {kvi} {{offset = {kvoff[nm]} : i32, stride = {2 * kv_stride} : i32}} : {T[nm]}")
             else:
                 op(f"%{nm} = softhier.hbm_buffer %p {{offset = {pair0[nm]} : i32, stride = {stride_of.get(nm, stride)} : i32}} : {T[nm]}")
     P.mark("start")
@@ -847,6 +862,8 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
             P.dump("o", 311, "O", "%i1")
         if "H" in dumps:
             P.dump("h", 312, "H", "%i1")
+        if pair_marks:
+            P.mark("pair", "%i1")
         op("}")
     op(f"softhier.rmsnorm %h, %gf -> %fin {{eps = {RMS_EPS:.1e} : f32, {P.cl}}} : {T['h']}, {T['gf']} -> {T['fin']}")
     P.gemm("fin", "wout", "vt", *tiles["out"], step="%s", fmt_steps=fs)

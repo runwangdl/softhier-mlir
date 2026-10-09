@@ -17,11 +17,12 @@
 
 static inline int sh_my_block(uint32_t blk, uint32_t cluster) {
     if (cluster == SH_ALL) return (blk % (ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y)) == flex_get_cluster_id();
+    if (SH_IS_GROUP(cluster)) return (blk % sh_set_P(cluster)) == sh_set_r(cluster);   /* rank in the set (none: never) */
     return flex_get_cluster_id() == cluster;
 }
 static inline void sh_end_op(uint32_t cluster) {
     flex_intra_cluster_sync();
-    if (cluster == SH_ALL) flex_global_barrier_xy();
+    sh_set_end(cluster);
 }
 /* this core's contiguous share [lo, hi) of n items (rows or elements), in units of `q`.
  * SH_ROWOPS_CORES (default: all cores of the cluster) can be lowered for scaling experiments. */
@@ -76,13 +77,16 @@ typedef void (*sh_rowfn_t)(const sh_blk *k);
 
 /* Generic driver. x (and optionally a per-row second input b) are streamed in `rpb`-row blocks;
  * p0/p1 are single parameter rows staged once. Every core calls this; kernels split the block. */
+#ifdef SH_NOCLONE_ROWOP   /* one copy of the row-op driver (GCC otherwise adds a constprop clone: 3 KB of instruction memory) */
+__attribute__((noclone))
+#endif
 static void sh_rowop(uint64_t y, uint64_t x, uint64_t b, uint64_t p0, uint64_t p1, uint32_t rows, uint32_t cols,
                      uint32_t ldy, uint32_t ldx, uint32_t ldb, sh_rowfn_t fn, const void *arg, uint32_t cluster) {
     const uint32_t rowb = cols * 2, nbuf = b ? 3 : 2;
     const uint32_t pbytes = (p0 || p1) ? SH_ROWOPS_PARAM_BYTES : 0;
     uint32_t rpb = (SH_ROWOPS_L1_BYTES - pbytes) / (rowb * nbuf * 2); if (rpb == 0) rpb = 1; if (rpb > rows) rpb = rows;
-    if (cluster == SH_ALL) {   /* enough blocks to keep every cluster busy */
-        const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, want = (rows + P - 1) / P;
+    if (sh_set_multi(cluster)) {   /* enough blocks to keep every cluster of the set busy */
+        const uint32_t P = sh_set_P(cluster), want = (rows + P - 1) / P;
         if (rpb > want) rpb = want ? want : 1;
     }
     const uint32_t setb = rpb * rowb * nbuf;                 /* bytes per buffer set */

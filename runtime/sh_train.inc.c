@@ -71,8 +71,8 @@ SH_T_COLD static void sh_t_rowop(const sh_t_args *a, sh_tfn_t fn, const void *ar
     const uint32_t p0b = a->p0 ? sh_t_up64(a->p0bytes) : 0;
     /* each stream's block is 64 B aligned: up to 2 x 8 x 64 B of slack per set */
     uint32_t rpb = (SH_T_L1_BYTES - p0b - 2048u) / (2u * (rin + rout)); if (rpb == 0) rpb = 1; if (rpb > rows) rpb = rows;
-    if (cluster == SH_ALL) {
-        const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, want = (rows + P - 1) / P;
+    if (sh_set_multi(cluster)) {
+        const uint32_t P = sh_set_P(cluster), want = (rows + P - 1) / P;
         if (rpb > want) rpb = want ? want : 1;
     }
     uint32_t oin[SH_T_NS], oout[SH_T_NS], setb = 0;
@@ -357,10 +357,10 @@ SH_T_COLD int sh_t_gemm_tr(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint3
 
 /* ---- copy and scale (the training programs' only elementwise needs besides the backward kernels) -----------------
  * sh_t_copy: HBM -> HBM rows by 1-D DMA on the DM cores (rows dealt over the clusters), no staging. */
-SH_T_COLD void sh_t_copy(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint32_t ldd, uint32_t lds, uint32_t cluster) {
-    const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, cid = flex_get_cluster_id();
-    if (flex_is_dm_core() && (cluster == SH_ALL || cid == cluster)) {
-        for (uint32_t r = cluster == SH_ALL ? cid : 0; r < rows; r += cluster == SH_ALL ? P : 1)
+SH_T_COLD SH_FAR void sh_t_copy(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint32_t ldd, uint32_t lds, uint32_t cluster) {
+    const uint32_t P = sh_set_P(cluster), cid = sh_set_r(cluster);   /* rank / size in the set; an id: 0 / 1 */
+    if (flex_is_dm_core() && cid != SH_SET_NONE) {
+        for (uint32_t r = cid; r < rows; r += P)
             bare_dma_start_1d(dst + (uint64_t)r * ldd * 2, src + (uint64_t)r * lds * 2, cols * 2);
         bare_dma_wait_all();
     }

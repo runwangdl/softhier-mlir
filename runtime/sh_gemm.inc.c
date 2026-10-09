@@ -52,8 +52,9 @@ static inline void sh_store_block_sync(uint64_t hbm, uint32_t l1_off, uint32_t r
 
 int sh_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
             uint32_t ldx, uint32_t ldw, uint32_t ldz, const sh_gemm_cfg *cfg, uint32_t cluster) {
-    const uint32_t cid = flex_get_cluster_id(), P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y;
-    if (cluster != SH_ALL && cid != cluster) return 0;
+    const uint32_t cid = sh_set_r(cluster), P = sh_set_P(cluster);   /* rank / size in the cluster set (SH_ALL: id / all) */
+    if (cid == SH_SET_NONE) return 0;
+    const int multi = sh_set_multi(cluster);
     sh_gemm_cfg c; sh_cfg_fill(&c, cfg);
     const int first = flex_is_first_core(), dm = flex_is_dm_core();
 
@@ -77,7 +78,7 @@ int sh_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t
 
     for (uint32_t r = 0; r < MT; ++r)
     for (uint32_t col = 0; col < NT; ++col) {
-        if (cluster == SH_ALL && ((r * NT + col) % P) != cid) continue;   /* output tiles dealt round-robin */
+        if (multi && ((r * NT + col) % P) != cid) continue;   /* output tiles dealt round-robin */
         const uint64_t zt = z + ((uint64_t)r * c.tm * ldz + col * c.tn) * 2;
         if (dm) {
             if (c.accumulate) { sh_load_block_async(y, zt, c.tm, c.tn, ldz); bare_dma_wait_all(); }
@@ -112,7 +113,7 @@ int sh_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t
         if (dm) sh_store_block_sync(zt, y, c.tm, c.tn, ldz);
         flex_intra_cluster_sync();
     }
-    if (cluster == SH_ALL) flex_global_barrier_xy();
+    sh_set_end(cluster);
     return 0;
 }
 #ifndef SH_NO_GEMM_MESH   /* programs that never call it can drop it (64 KB instruction memory; see sh_ops_lean) */

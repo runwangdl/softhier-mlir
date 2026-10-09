@@ -321,8 +321,8 @@ uint32_t sh_f_gemm_w8_l1_bytes(const sh_gemm_cfg *cfg) {
  * sh_gemm; per K-tile: DMA X / byte tile k+1 while RedMulE runs tile k and the cores expand bytes k+1 (expand = 1). */
 int sh_f_gemm_w8(uint64_t x, uint64_t w8, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
                  uint32_t ldx, uint32_t ldw, uint32_t ldz, const sh_gemm_cfg *cfg, uint32_t expand, uint32_t cluster) {
-    const uint32_t cid = flex_get_cluster_id(), P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y;
-    if (cluster != SH_ALL && cid != cluster) return 0;
+    const uint32_t cid = sh_set_r(cluster), P = sh_set_P(cluster);
+    if (cid == SH_SET_NONE) return 0;
     sh_gemm_cfg c; sh_cfg_fill(&c, cfg);
     const int first = flex_is_first_core(), dm = flex_is_dm_core();
     const uint32_t need = sh_f_gemm_w8_l1_bytes(&c);
@@ -340,7 +340,7 @@ int sh_f_gemm_w8(uint64_t x, uint64_t w8, uint64_t z, uint32_t M, uint32_t N, ui
     if (!expand && dm) sh_l1_zero_dm(W[0], 2 * wb);
     for (uint32_t r = 0; r < MT; ++r)
     for (uint32_t col = 0; col < NT; ++col) {
-        if (cluster == SH_ALL && ((r * NT + col) % P) != cid) continue;
+        if (sh_set_multi(cluster) && ((r * NT + col) % P) != cid) continue;
         const uint64_t zt = z + ((uint64_t)r * c.tm * ldz + col * c.tn) * 2;
         #define SH_F_LOAD(s, kk) do { sh_load_block_async(X[s], x + ((uint64_t)r * c.tm * ldx + (kk) * c.tk) * 2, c.tm, c.tk, ldx); \
             bare_dma_start_2d(local(B[s]), w8 + (uint64_t)(kk) * c.tk * ldw + col * c.tn, c.tn, c.tn, ldw, c.tk); } while (0)
@@ -362,7 +362,7 @@ int sh_f_gemm_w8(uint64_t x, uint64_t w8, uint64_t z, uint32_t M, uint32_t N, ui
         if (dm) sh_store_block_sync(zt, y, c.tm, c.tn, ldz);
         flex_intra_cluster_sync();
     }
-    if (cluster == SH_ALL) flex_global_barrier_xy();
+    sh_set_end(cluster);
     return 0;
 }
 

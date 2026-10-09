@@ -36,6 +36,7 @@ from softhier_mlir.sim.gvsoc import PERF_RE, build_sw, run_sim  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 DATA = "preload"        # --data: "preload" (host-generated inputs in the HBM preload image) | "device" (on-device LCG)
+GEMM_EXTRA = ""         # extra shape.h lines for the gemm test (tests/gvsoc/sets.py: "#define DUMP_Z 256")
 HBM_START = 0x1000      # first HBM offset the C tests use: the SDK allocator owns the first 4 KB (preload.MIN_OFFSET)
 
 
@@ -56,15 +57,26 @@ DEFAULT_GEMM = ["256x256x256", "256x768x192:256,256,192", "512x768x768:256,256,2
                 "1024x768x768:256,256,256,1,0,all", "1024x3072x768:256,256,256,1,0,all"]
 
 
+def cluster_c(spec: str) -> str:
+    """CLI cluster spelling -> the C `cluster` argument: all -> SH_ALL, set:<mask> -> SH_GROUP(mask) (a cluster set,
+    docs/SPATIAL_SPLIT.md), rows:<y0>-<y1> -> the set of those mesh rows, anything else verbatim (an id)."""
+    if spec == "all":
+        return "SH_ALL"
+    if spec.startswith(("set:", "rows:")):
+        from softhier_mlir.frontend.clusters import c_cluster, parse
+        return c_cluster(parse(spec))
+    return spec
+
+
 def parse_shape(s: str) -> dict:
-    """MxNxK[:tm,tn,tk[,pipeline[,accumulate[,cluster]]]]   cluster = 0 | all"""
+    """MxNxK[:tm,tn,tk[,pipeline[,accumulate[,cluster]]]]   cluster = 0 | all | set:<mask>"""
     dims, _, rest = s.partition(":")
     m, n, k = (int(v) for v in dims.lower().split("x"))
     opts = rest.split(",") if rest else []
     tm, tn, tk = (int(v) for v in (opts + ["0", "0", "0"])[:3])
     pipe = int(opts[3]) if len(opts) > 3 else 1
     acc = int(opts[4]) if len(opts) > 4 else 0
-    cluster = "SH_ALL" if len(opts) > 5 and opts[5] == "all" else "0"
+    cluster = cluster_c(opts[5]) if len(opts) > 5 else "0"
     return dict(M=m, N=n, K=k, tm=tm, tn=tn, tk=tk, pipeline=pipe, accumulate=acc, cluster=cluster)
 
 
@@ -90,7 +102,7 @@ def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False, offsets
             f"#define TILE_M {c['tm']}\n#define TILE_N {c['tn']}\n#define TILE_K {c['tk']}\n"
             f"#define PIPELINE {c['pipeline']}\n#define ACCUMULATE {acc}\n"
             f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n" + ("#define REAL_DATA 1\n" if real else "")
-            + f"#define OFF_X 0x{off['x']:x}\n#define OFF_W 0x{off['w']:x}\n#define OFF_Z 0x{off['z']:x}\n" + pre_h)
+            + f"#define OFF_X 0x{off['x']:x}\n#define OFF_W 0x{off['w']:x}\n#define OFF_Z 0x{off['z']:x}\n" + pre_h + GEMM_EXTRA)
         build_sw(app)
         r = run_sim(preload=pre)
         lines = [ln for ln in r["stdout"].splitlines() if ln.startswith("[gemm]") or "mismatch" in ln]
@@ -1104,11 +1116,11 @@ if __name__ == "__main__":
     elif a.test == "gemm-seq":
         ok = run_gemm_seq()
     elif a.test == "rowops":
-        ok = run_rowops(a.rows, (a.cols or 768), "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
+        ok = run_rowops(a.rows, (a.cols or 768), cluster_c(a.cluster), a.nsamples)
     elif a.test == "fp16cvt":
         ok = run_fp16cvt()
     elif a.test == "llmops":
-        ok = run_llmops(a.rows, a.cols or 960, a.heads or 15, a.kv_heads, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
+        ok = run_llmops(a.rows, a.cols or 960, a.heads or 15, a.kv_heads, cluster_c(a.cluster), a.nsamples)
     elif a.test == "smolvla-e2e" and a.prefix_only:
         ok = run_prefix_cost(a.prefix_only, a.layers, a.e2e_trace, Path(a.app_dir) if a.app_dir else None, not a.fresh)
     elif a.test == "smolvla-e2e" and a.vision_only:
@@ -1128,7 +1140,7 @@ if __name__ == "__main__":
         ok = run_siglip(a.seq, a.d, a.ff, (a.heads or 12), "SH_ALL" if a.cluster == "all" else "0",
                         extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "attention":
-        ok = run_attention(a.seq, a.d, (a.heads or 12), "SH_ALL" if a.cluster == "all" else a.cluster, a.composed, a.nsamples,
+        ok = run_attention(a.seq, a.d, (a.heads or 12), cluster_c(a.cluster), a.composed, a.nsamples,
                            extra="".join(f"#define {m.replace('=', ' ', 1)}\n" for m in a.define))
     elif a.test == "siglip-mlir":
         ok = run_siglip_mlir(a.seq, a.d, a.ff, (a.heads or 12), "SH_ALL" if a.cluster == "all" else a.cluster, a.layers, fused=a.fused,

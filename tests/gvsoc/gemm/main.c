@@ -44,6 +44,9 @@ int main(void) {
         else {
             bad = sh_test_check_gemm(x, w, z, M, N, K, K, N, N, NSAMPLES, 0.5f, ACCUMULATE ? 3.0f : 0.0f, "[gemm]");
             sh_printf("[gemm] %s\n", bad ? "GEMM_FAIL" : "GEMM_PASS");
+#ifdef DUMP_Z
+            sh_test_dump_samples(z, M, N, N, 777, DUMP_Z, "Z");   /* tests/gvsoc/sets.py: bitwise comparison across cluster sets */
+#endif
         }
     }
     sh_barrier_global();

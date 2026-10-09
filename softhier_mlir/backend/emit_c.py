@@ -71,6 +71,7 @@ from softhier_mlir.dialects.softhier import (
     LoraFwdOp,
     LinearBwdOp,
     CopyOp,
+    OnClustersOp,
 )
 
 _ELEM_BYTES = {"f16": 2, "bf16": 2, "f32": 4, "f64": 8, "i8": 1, "i16": 2, "i32": 4}
@@ -101,10 +102,33 @@ def _int_attr(op, name: str, default: int) -> int:
     return a.value.data if isinstance(a, IntegerAttr) else default
 
 
+def _cluster_set(op) -> int | None:
+    """The `cluster_set` attribute (16-bit cluster mask) or None."""
+    m = _int_attr(op, "cluster_set", -1)
+    return None if m < 0 else m & 0xFFFF
+
+
+def _set_expr(mask: int) -> str:
+    return f"SH_GROUP(0x{mask:04x}u)"
+
+
 def _cluster(op) -> str:
-    """The `cluster` attribute: -1 -> SH_ALL (split over all clusters), -2 -> SH_SELF (the calling cluster), absent -> 0."""
+    """The `cluster` attribute: -1 -> SH_ALL (split over all clusters), -2 -> SH_SELF (the calling cluster), absent -> 0;
+    a `cluster_set` mask attribute -> SH_GROUP(mask) (split over that set of clusters)."""
+    m = _cluster_set(op)
+    if m is not None:
+        return _set_expr(m)
     c = _int_attr(op, "cluster", 0)
-    return "SH_SELF" if c == -2 else "SH_ALL" if c < 0 else str(c)
+    if c < -2:
+        raise ValueError(f"{op.name}: cluster = {c} is not an id, -1 (SH_ALL) or -2 (SH_SELF); a cluster set is cluster_set = <mask>")
+    return "SH_SELF" if c == -2 else "SH_ALL" if c == -1 else str(c)
+
+
+def _printer(op) -> str:
+    """Guard of a print (mark / dump): cluster 0, or the lowest cluster of the op's `cluster_set`."""
+    m = _cluster_set(op)
+    who = "0" if m is None else f"sh_set_leader({_set_expr(m)})"
+    return f"sh_cluster_id() == {who} && sh_is_first_core()"
 
 
 def _float_attr(op, name: str, default: float) -> str:
@@ -287,6 +311,11 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
         elif isinstance(op, scf.ForOp):
             iv = idx.bind_iv(op.body.block.args[0])
             b(f"{ind}for (uint32_t {iv} = {idx.expr(op.lb)}; {iv} < {idx.expr(op.ub)}; {iv} += {idx.expr(op.step)}) {{")
+            _emit_ops(op.body.block.ops, bufs, idx, b, tag, ind + "    ")
+            b(f"{ind}}}")
+
+        elif isinstance(op, OnClustersOp):
+            b(f"{ind}if (sh_set_member({_set_expr(op.cluster_set.value.data & 0xFFFF)})) {{   // spatial split: this set only")
             _emit_ops(op.body.block.ops, bufs, idx, b, tag, ind + "    ")
             b(f"{ind}}}")
 
@@ -546,9 +575,9 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
         elif isinstance(op, DumpAllOp):
             rows, cols, ld, _ = bufs.geom(op.buf)
             if op.index is None:
-                b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_test_dump_all({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, \"{op.tag.data}\");")
+                b(f"{ind}if ({_printer(op)}) sh_test_dump_all({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, \"{op.tag.data}\");")
             else:
-                b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_test_dump_all_idx({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
+                b(f"{ind}if ({_printer(op)}) sh_test_dump_all_idx({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
                   f"\"{op.tag.data}\", (uint32_t)({idx.expr(op.index)}));")
 
         elif isinstance(op, TransposeOp) and bufs.space(op.src) != "tcdm":
@@ -558,34 +587,35 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
 
         elif isinstance(op, HbmFillLcgOp):
             rows, cols, ld, _ = bufs.geom(op.buf)
-            b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_test_fill_fp16({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
+            b(f"{ind}if ({_printer(op)}) sh_test_fill_fp16({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
               f"{op.seed.value.data}, {op.lo.value.data}, {op.hi.value.data}, {_f(op.scale)});")
 
         elif isinstance(op, DumpSamplesOp) and str(bufs.memref(op.buf).element_type) == "f32":
             rows, cols, ld, _ = bufs.geom(op.buf)
-            b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_t_dump_samples_f32({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
+            b(f"{ind}if ({_printer(op)}) sh_t_dump_samples_f32({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
               f"{op.seed.value.data}, {op.n.value.data}, \"{op.tag.data}\");")
 
         elif isinstance(op, DumpSamplesOp):
             rows, cols, ld, _ = bufs.geom(op.buf)
             if op.index is None:
-                b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_test_dump_samples({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
+                b(f"{ind}if ({_printer(op)}) sh_test_dump_samples({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
                   f"{op.seed.value.data}, {op.n.value.data}, \"{op.tag.data}\");")
             else:
-                b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_test_dump_samples_idx({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
+                b(f"{ind}if ({_printer(op)}) sh_test_dump_samples_idx({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
                   f"{op.seed.value.data}, {op.n.value.data}, \"{op.tag.data}\", (uint32_t)({idx.expr(op.index)}));")
 
         elif isinstance(op, GroupBarrierOp):
-            b(f"{ind}sh_barrier_global();")
+            m = _cluster_set(op)
+            b(f"{ind}sh_barrier_global();" if m is None else f"{ind}sh_set_barrier({_set_expr(m)});")
 
         elif isinstance(op, PreloadWaitOp):
             b(f"{ind}sh_preload_wait({bufs.haddr(op.buf)});")
 
         elif isinstance(op, MarkOp):
             if op.index is None:
-                b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_printf(\"[mark] %s %u\\n\", \"{op.tag.data}\", sh_cycles());")
+                b(f"{ind}if ({_printer(op)}) sh_printf(\"[mark] %s %u\\n\", \"{op.tag.data}\", sh_cycles());")
             else:
-                b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_printf(\"[mark] %s%u %u\\n\", \"{op.tag.data}\", "
+                b(f"{ind}if ({_printer(op)}) sh_printf(\"[mark] %s%u %u\\n\", \"{op.tag.data}\", "
                   f"(uint32_t)({idx.expr(op.index)}), sh_cycles());")
 
         else:
@@ -660,15 +690,15 @@ _MAIN_TEMPLATE = '''\
 // Generated by softhier-mlir (softhier dialect -> softhier-ops calls). Do not edit by hand.
 #include "sh_ops.h"
 
-static void {kernel_name}_inputs(void) {{   // preload wait + test inputs (not timed)
+{far}static void {kernel_name}_inputs(void) {{   // preload wait + test inputs (not timed)
 {prologue_body}
 }}
 
-static void {kernel_name}(void) {{
+{far}static void {kernel_name}(void) {{
 {kernel_body}
 }}
 
-static void {kernel_name}_checks(void) {{   // test outputs (not timed)
+{far}static void {kernel_name}_checks(void) {{   // test outputs (not timed)
 {epilogue_body}
 }}
 
@@ -697,7 +727,8 @@ def emit_c(module: ModuleOp) -> str:
     fn = next(op for op in module.body.block.ops if isinstance(op, func.FuncOp))
     optim = fn.attributes.get("sh.optimize")
     head = f'#pragma GCC optimize ("{optim.data}")\n' if optim is not None else ""
-    return head + _MAIN_TEMPLATE.format(kernel_name=fn.sym_name.data,
+    far = "SH_FAR " if "sh.far_code" in fn.attributes else ""   # the generated functions in HBM (runtime/sh_ops.h, -DSH_FAR_CODE)
+    return head + _MAIN_TEMPLATE.format(kernel_name=fn.sym_name.data, far=far,
                                  prologue_body=emit_kernel(fn, phase="prologue"),
                                  kernel_body=emit_kernel(fn, phase="kernel"),
                                  epilogue_body=emit_kernel(fn, phase="epilogue"))

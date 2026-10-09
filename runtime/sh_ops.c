@@ -10,6 +10,9 @@
 #include <stdarg.h>
 #include "sh_ops.h"
 
+#ifdef SH_LIB_OPTIMIZE        /* e.g. -DSH_LIB_OPTIMIZE=\"Os\": the library (not the SDK above) for size */
+#pragma GCC optimize (SH_LIB_OPTIMIZE)
+#endif
 #include "sh_rt.inc.c"
 #include "sh_simd.inc.c"
 #include "sh_gemm.inc.c"

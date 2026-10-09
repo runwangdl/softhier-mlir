@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
+from softhier_mlir.frontend.clusters import barrier_op, cl_attr, set_attr
 from softhier_mlir.frontend.siglip import _Emitter
 from softhier_mlir.sim.preload import sentinel_array
 
@@ -766,7 +767,8 @@ VLM_TILES = {"wc": (64, 320, 256), "wq": (128, 192, 320), "wk": (128, 320, 320),
 
 def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -1, attn: int = -1,
              dumps: tuple[str, ...] = ("EMB", "L1", "OUT"), nsamples: int = 64, marks: bool = True, layer0: int = 0,
-             dump_state: bool = False, pad_rows_zero: bool = False) -> tuple[str, dict[int, np.ndarray]]:
+             dump_state: bool = False, pad_rows_zero: bool = False, hbm_base: int | None = None, vis_off: int | None = None,
+             x_reset: bool = False, kv_buf: str | None = None) -> tuple[str, dict[int, np.ndarray]]:
     """-> (mlir, {hbm_offset: array to preload}) of the VLM prefix program: pixel shuffle + connector GEMM per camera,
     sqrt(960) scaling, then one scf.for over the decoder layers (RMSNorm, q/k/v GEMMs with k/v written straight
     into the per-layer KV cache, RoPE on q and k, masked GQA attention, o-proj + residual, RMSNorm, gate/up GEMMs,
@@ -787,7 +789,15 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     (tags KC<l> / VC<l>, l = layer0 + 1 ...) in full: the state the next program (or the expert) starts from.
     pad_rows_zero: zero the attention output of the S_pad padding rows (>= n) every layer, so those rows of the residual
     stream stay 0. Without it they get uniform attention like a padding query and evolve as garbage tokens (at 65
-    tokens, 63 such rows, they overflow fp16 by layer 5 and the masked keys' 0 x inf turns every row into NaN)."""
+    tokens, 63 such rows, they overflow fp16 by layer 5 and the masked keys' 0 x inf turns every row into NaN).
+    Spatial split / pipelining over chunks (frontend.smolvla_split; all off by default):
+      hbm_base  first HBM offset of this program's buffers (default HBM_DATA_START)
+      vis_off   the SigLIP outputs vis<c> are read at vis_off + c * T * 768 * 2 (written by the vision program in the same
+                binary) instead of being allocated + preloaded here
+      x_reset   the initial residual stream (language / state rows, zero padding) is kept in a preloaded copy and copied
+                into x at the start, so the program body can run once per chunk
+      kv_buf    an `index` SSA value (defined by the caller) selecting one of two KV regions: layer L's K / V go to KV slot
+                L + kv_buf * layers (the region holds 2 * layers slots: double-buffered across chunks)"""
     data = np.load(npz) if isinstance(npz, (str, Path)) else npz
     P = {k[2:]: data[k] for k in data if k.startswith("p_")}
     n, npz_layers, n_cams = int(data["meta"][0]), int(data["meta"][1]), int(data["meta"][2])
@@ -799,11 +809,11 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     has_img = "x_img" in data            # connector output handed over by a previous program
     S = ((n + 127) // 128) * 128
     e = _Emitter()
-    e.next_off = HBM_DATA_START
+    e.next_off = HBM_DATA_START if hbm_base is None else hbm_base
     T: dict[str, str] = {}
     pre: dict[int, np.ndarray] = {}
-    cl = f"cluster = {cluster} : i32"
-    hc = f"cluster = {attn} : i32"
+    cl = cl_attr(cluster)       # an id, -1 = SH_ALL, or a cluster set (frontend.clusters)
+    hc = cl_attr(attn)
     hv = lambda rows, cols, ld, eoff: f'memref<{rows}x{cols}xf16, strided<[{ld}, 1], offset: {eoff}>, "{e.space}">'  # noqa: E731
 
     def alloc(rows, cols, at=None):
@@ -822,7 +832,7 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
 
     def mark(tag, idx=None):
         if marks:
-            e.op(f'softhier.mark {idx + " " if idx else ""}{{tag = "{tag}"}}')
+            e.op(f'softhier.mark {idx + " " if idx else ""}{{tag = "{tag}"{set_attr(cluster)}}}')
 
     def dump(tag, name, seed, view=None, idx=None, out_tag=None):
         if tag in dumps:
@@ -833,7 +843,7 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
 
     def dump_mark(tag, dumped, idx=None):
         if dumped and marks:
-            e.op("softhier.group_barrier {grid_x = 4 : i32, grid_y = 4 : i32}")
+            e.op(barrier_op(cluster))
             mark(tag, idx)
 
     gem = lambda nm, M: (lambda t: f"tile_m = {min(t[0], M)} : i32, tile_n = {t[1]} : i32, tile_k = {t[2]} : i32, pipeline")(VLM_TILES[nm])  # noqa: E731
@@ -850,9 +860,16 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     tok = np.full(S, TOK_PAD, np.uint16); tok[:n] = data["tok"]
     rope = np.zeros((S, TDH), np.float16); rope[:n] = P["rope"]
     for c in range(n_cams):
+        if vis_off is not None:     # written by the vision program of the same binary
+            vrows = img_tok * PIX_SCALE * PIX_SCALE
+            T[f"vis{c}"] = f'memref<{vrows}x{D}xf16, "{e.space}">'
+            e.op(f"%vis{c} = softhier.hbm_buffer {{offset = {vis_off + c * vrows * D * 2} : i32}} : {T[f'vis{c}']}")
+            continue
         B(f"vis{c}", img_tok * PIX_SCALE * PIX_SCALE, D, data["vis_out"][c] if layer0 == 0 and not has_img else None)
     B("ps", n_img, D * PIX_SCALE * PIX_SCALE)
-    B("x", S, TD, x0)
+    B("x", S, TD, None if x_reset else x0)
+    if x_reset:
+        B("x_init", S, TD, x0)
     pre[e.next_off] = tok; T["tok"] = f'memref<{S}xi16, "{e.space}">'
     e.op(f"%tok = softhier.hbm_buffer {{offset = {e.next_off} : i32}} : {T['tok']}"); e.next_off += (S * 2 + 4095) & ~4095
     B("rope", S, TDH, rope)
@@ -862,7 +879,7 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     # KV cache: [K_L | V_L] per layer, contiguous family
     kv_base = e.next_off
     kv_stride = 2 * S * TKVD * 2
-    e.next_off += layers * kv_stride
+    e.next_off += layers * kv_stride * (2 if kv_buf else 1)
     T["kc"] = T["vc"] = f'memref<{S}x{TKVD}xf16, "{e.space}">'
     # ---- parameters: connector + final norm in the west region, the per-layer family split over west / south
     B("wc", D * PIX_SCALE * PIX_SCALE, TD, P["wc"] if layer0 == 0 and not has_img else None); B("gfin", 1, TD, P["gfin"])
@@ -894,6 +911,8 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
 
     # ---- connector: pixel shuffle + projection per camera, then the sqrt(960) scaling of image + language rows
     mark("start")
+    if x_reset:
+        e.op(f"softhier.copy %x_init -> %x {{{cl}}} : {T['x_init']} -> {T['x']}")
     if layer0 == 0 and not has_img:
         for c in range(n_cams):
             psv = hv(img_tok, D * PIX_SCALE * PIX_SCALE, D * PIX_SCALE * PIX_SCALE, c * img_tok * D * PIX_SCALE * PIX_SCALE)
@@ -928,8 +947,14 @@ def emit_vlm(npz: str | Path | dict, layers: int | None = None, cluster: int = -
     e.op("%Le = arith.addi %Lo, %Lg : index")
     for nm, r, c in VLM_PARAMS:
         e.op(f"%{nm} = softhier.hbm_buffer %Le {{offset = {fam_base + layer0_off[nm]} : i32, stride = 1 : i32}} : {T[nm]}")
-    e.op(f"%kc = softhier.hbm_buffer %L {{offset = {kv_base} : i32, stride = {kv_stride} : i32}} : {T['kc']}")
-    e.op(f"%vc = softhier.hbm_buffer %L {{offset = {kv_base + S * TKVD * 2} : i32, stride = {kv_stride} : i32}} : {T['vc']}")
+    kvi = "%L"
+    if kv_buf:      # double-buffered KV region: slot L + kv_buf * layers
+        e.op(f"%cKVL = arith.constant {layers} : index")
+        e.op(f"%Lkb = arith.muli {kv_buf}, %cKVL : index")
+        e.op("%Lk = arith.addi %L, %Lkb : index")
+        kvi = "%Lk"
+    e.op(f"%kc = softhier.hbm_buffer {kvi} {{offset = {kv_base} : i32, stride = {kv_stride} : i32}} : {T['kc']}")
+    e.op(f"%vc = softhier.hbm_buffer {kvi} {{offset = {kv_base + S * TKVD * 2} : i32, stride = {kv_stride} : i32}} : {T['vc']}")
     e.op(f"softhier.rmsnorm %x, %g1 -> %ln1 {{eps = {RMS_EPS:.1e} : f32, {cl}}} : {T['x']}, {T['g1']} -> {T['ln1']}")
     for dst, w in (("q", "wq"), ("kc", "wk"), ("vc", "wv")):
         e.op(f"softhier.gemm %ln1, %{w} into %{dst} {{fmt = \"fp16\", {gem(w, S)}, {cl}}} : {T['ln1']}, {T[w]}, {T[dst]}")

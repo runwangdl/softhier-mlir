@@ -29,8 +29,8 @@ static void sh_llm_rowop(const sh_lrowop_args *a, sh_lrowfn_t fn, const void *ar
     const uint32_t p0b = (a->p0 ? a->p0n * 2 + 63 : 0) & ~63u, p1b = (a->p1 ? a->p1n * 2 + 63 : 0) & ~63u;
     const uint32_t scr = (a->scratch + 63) & ~63u, fixed = p0b + p1b + scr * ARCH_NUM_CORE_PER_CLUSTER;
     uint32_t rpb = (SH_LLM_L1_BYTES - fixed) / ((2 * rowb + rowbb) * 2); if (rpb == 0) rpb = 1; if (rpb > rows) rpb = rows;
-    if (cluster == SH_ALL) {
-        const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, want = (rows + P - 1) / P;
+    if (sh_set_multi(cluster)) {
+        const uint32_t P = sh_set_P(cluster), want = (rows + P - 1) / P;
         if (rpb > want) rpb = want ? want : 1;
     }
     const uint32_t setb = rpb * (2 * rowb + rowbb);
@@ -257,7 +257,7 @@ void sh_softmax_masked(uint64_t y, uint64_t x, uint32_t rows, uint32_t cols, uin
  * per core. */
 int sh_attention_head_masked(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, uint32_t dh,
                              uint32_t ldq, uint32_t ldk, uint32_t ldv, uint32_t ldo, float scale, uint64_t tok, uint32_t cluster) {
-    if (cluster != SH_ALL && flex_get_cluster_id() != cluster) return 0;
+    if (cluster != SH_ALL && sh_set_r(cluster) == SH_SET_NONE) return 0;
     const int first = flex_is_first_core(), dm = flex_is_dm_core();
     const uint32_t core = flex_get_core_id(), NC = ARCH_NUM_CORE_PER_CLUSTER;
     const sh_attn_l1 l = sh_attn_layout(S, dh, S, SH_ATTN_L1_BASE);   /* whole head resident (sq = S) */
@@ -322,7 +322,7 @@ int sh_attention_head_masked(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uin
 /* Grouped-query attention: H query heads (columns [h*dh, (h+1)*dh) of q / o, dh = D / H) over Hkv key/value
  * heads (columns [(h / (H/Hkv))*dh, ...) of k / v), optional token mask. cluster == SH_ALL deals head h to
  * cluster h % P and ends with a global barrier. */
-int sh_attention_gqa(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, uint32_t D, uint32_t H, uint32_t Hkv,
+SH_FAR int sh_attention_gqa(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S, uint32_t D, uint32_t H, uint32_t Hkv,
                      uint32_t ldq, uint32_t ldk, uint32_t ldv, uint32_t ldo, float scale, uint64_t tok, uint32_t cluster) {
     const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, dh = H ? D / H : 0;
     int rc = 0;
@@ -332,12 +332,12 @@ int sh_attention_gqa(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S,
     }
     const uint32_t grp = H / Hkv;
     for (uint32_t h = 0; h < H; ++h) {
-        const uint32_t cl = (cluster == SH_ALL) ? h % P : cluster;
+        const uint32_t cl = sh_set_nth(cluster, h);   /* SH_ALL: h % P; a set: its (h mod size)-th member */
         const uint64_t qo = (uint64_t)h * dh * 2, kvo = (uint64_t)(h / grp) * dh * 2;
         int r = sh_attention_head_masked(q + qo, k + kvo, v + kvo, o + qo, S, dh, ldq, ldk, ldv, ldo, scale, tok, cl);
         if (r) rc = r;
     }
-    if (cluster == SH_ALL) flex_global_barrier_xy();
+    sh_set_end(cluster);
     return rc;
 }
 
@@ -345,11 +345,11 @@ int sh_attention_gqa(uint64_t q, uint64_t k, uint64_t v, uint64_t o, uint32_t S,
  * output token (gr, gb) = the s x s block of patches rows gr*s.., cols gb*s.., row-major, each D wide
  * (== SmolVLMConnector.pixel_shuffle). Pure data movement: per token s 1-D loads of s*D elements into TCDM
  * and one store; tokens dealt round-robin over clusters. ------------------------------------------------ */
-void sh_pixel_shuffle(uint64_t dst, uint64_t src, uint32_t grid, uint32_t D, uint32_t s, uint32_t cluster) {
-    const uint32_t g = grid / s, ntok = g * g, chunk = s * D * 2, P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, cid = flex_get_cluster_id();
-    if (flex_is_dm_core()) {
+SH_FAR void sh_pixel_shuffle(uint64_t dst, uint64_t src, uint32_t grid, uint32_t D, uint32_t s, uint32_t cluster) {
+    const uint32_t g = grid / s, ntok = g * g, chunk = s * D * 2, P = sh_set_P(cluster), cid = sh_set_r(cluster);
+    if (flex_is_dm_core() && cid != SH_SET_NONE) {
         for (uint32_t t = 0; t < ntok; ++t) {
-            if (cluster == SH_ALL ? (t % P) != cid : cid != cluster) continue;
+            if ((t % P) != cid) continue;
             const uint32_t gr = t / g, gb = t % g;
             for (uint32_t i = 0; i < s; ++i)
                 bare_dma_start_1d(local(SH_LLM_L1_BASE + i * chunk), src + ((uint64_t)((gr * s + i) * grid + gb * s) * D) * 2, chunk);

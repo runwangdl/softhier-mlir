@@ -134,7 +134,7 @@ static inline float sh_x_softmax_row(sh_v4h *x, const sh_v4h *vld, const sh_v4h 
 int sh_x_attention_head_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
                           uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t dh, uint32_t ldq, uint32_t ldkp, uint32_t ldvp,
                           uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster) {
-    if (cluster != SH_ALL && flex_get_cluster_id() != cluster) return 0;
+    if (cluster != SH_ALL && sh_set_r(cluster) == SH_SET_NONE) return 0;
     const int first = flex_is_first_core(), dm = flex_is_dm_core();
     const uint32_t core = flex_get_core_id(), NC = ARCH_NUM_CORE_PER_CLUSTER, L = Lp + So;
     if (nb == 0) nb = 1;
@@ -240,7 +240,7 @@ int sh_x_attention_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint6
     return sh_x_attention_head_n(q, kp, vp, ko, vo, tok, o, Sq, Lp, So, 1, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, scale, cluster);
 }
 
-int sh_x_attention_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
+SH_FAR int sh_x_attention_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
                      uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t nb, uint32_t H, uint32_t Hkv, uint32_t dh,
                      uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo,
                      float scale, uint32_t cluster) {
@@ -252,13 +252,13 @@ int sh_x_attention_n(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t
     }
     const uint32_t grp = H / Hkv;
     for (uint32_t h = 0; h < H; ++h) {
-        const uint32_t cl = (cluster == SH_ALL) ? h % P : cluster, kvh = h / grp;
+        const uint32_t cl = sh_set_nth(cluster, h), kvh = h / grp;   /* SH_ALL: h % P; a set: its (h mod size)-th member */
         const uint64_t qo = (uint64_t)h * dh * 2, ko_ = (uint64_t)kvh * dh * 2;
         int r = sh_x_attention_head_n(q + qo, kp + ko_, vp + ko_, ko ? ko + ko_ : 0, vo ? vo + ko_ : 0, tok, o + qo,
                                       Sq, Lp, So, nb, dh, ldq, ldkp, ldvp, ldko, ldvo, ldo, scale, cl);
         if (r) rc = r;
     }
-    if (cluster == SH_ALL) flex_global_barrier_xy();
+    sh_set_end(cluster);
     return rc;
 }
 int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
@@ -269,7 +269,7 @@ int sh_x_attention(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t v
 }
 
 /* ---- test helper: print every element of an HBM fp16 matrix ("<tag> r c hex"), first core of cluster 0 -------- */
-void sh_test_dump_all(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag) {
+SH_FAR void sh_test_dump_all(uint64_t a, uint32_t rows, uint32_t cols, uint32_t ld, const char *tag) {
     for (uint32_t i = 0; i < rows; ++i) {
         const volatile uint16_t *row = (const volatile uint16_t *)(uintptr_t)(a + (uint64_t)i * ld * 2);
         for (uint32_t j = 0; j < cols; ++j) sh_printf("%s %u %u %04x\n", tag, i, j, (uint32_t)row[j]);

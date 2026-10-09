@@ -38,6 +38,38 @@ void     sh_preload_wait(uint64_t sentinel);  /* all cores: block until the HBM 
 
 #define SH_ALL 0xFFFFFFFFu   /* `cluster` argument: split the work over all clusters (global barrier at the end) */
 
+/* ---- cluster sets (spatial split, docs/SPATIAL_SPLIT.md) ------------------------------------------------------------
+ * `cluster` = SH_GROUP(mask): the clusters whose bit is set in the 16-bit mask (bit i = cluster id i; any subset of
+ * the mesh: rectangular or not, any size, power of two or not). Every op that accepts SH_ALL accepts a set: the work
+ * is dealt over the set's clusters only (the member of rank r takes what cluster r takes under SH_ALL with P = the
+ * set's size), clusters outside the set return at once, and the op ends with the set's barrier instead of the global
+ * one, so ops on DISJOINT sets may run at the same time. The set barrier is an AMO counter + iteration word in the
+ * sync memory of the set's lowest cluster (offsets 64 / 68: the SDK's barriers use 0..39), polled by the DM cores;
+ * the SDK's wake-up barriers (flex_global_barrier_xy, grid_sync_group_*) broadcast with row/column bit masks and so
+ * only cover aligned power-of-two sub-grids. SH_GROUP(0xFFFF) deals exactly like SH_ALL on a 4 x 4 mesh. */
+#define SH_GROUP(mask) (0x80000000u | ((uint32_t)(mask) & 0xFFFFu))
+#define SH_IS_GROUP(c) (((uint32_t)(c) & 0xFFFF0000u) == 0x80000000u)
+uint32_t sh_set_size(uint32_t cluster);        /* clusters in the set (SH_ALL: all; an id: 1) */
+int      sh_set_member(uint32_t cluster);      /* is the calling cluster in the set */
+uint32_t sh_set_leader(uint32_t cluster);      /* lowest cluster id of the set (prints marks / dumps) */
+void     sh_set_barrier(uint32_t cluster);     /* SH_ALL: global barrier; a set: the set's barrier (members only); an id: intra-cluster */
+
+/* Far code (-DSH_FAR_CODE; docs/SPATIAL_SPLIT.md): functions marked SH_FAR go to the .data section, which the SDK linker
+ * script places in HBM (0xC0000000); the cores fetch them over the NoC. Only control code is marked (the generated
+ * kernel, op wrappers, init, printing), so programs whose library footprint exceeds the 64 KB instruction memory (several
+ * model stages in one binary) still fit. SH_FAR_CODE implies SH_NO_ALLOC: sh_init skips the SDK HBM allocator, whose
+ * state lives at the start of HBM where the far code now is (sh_hbm_malloc is then unavailable).
+ * -DSH_TINY_PRINTF replaces the SDK printf behind sh_printf by a small formatter (%s %c %u %d %x, zero-padded width,
+ * %f as fixed point), dropping ~8 KB of instruction memory when nothing else prints. */
+#ifdef SH_FAR_CODE
+#define SH_FAR __attribute__((section(".data.sh_far"), noinline))
+#ifndef SH_NO_ALLOC
+#define SH_NO_ALLOC 1
+#endif
+#else
+#define SH_FAR
+#endif
+
 /* Run fn() on a private per-core stack of `bytes_per_core` bytes carved from the top of the cluster's 128 KB stack
  * memory (below the 4 KB the SDK start code uses). flex_start.s spaces the three harts' initial stacks only 1 KB
  * apart (`sll t0, a0, 0xa`), so a function with a few hundred bytes of spilled locals that calls printf (the generated

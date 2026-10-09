@@ -32,9 +32,12 @@ from xdsl.irdl import (
     opt_operand_def,
     opt_prop_def,
     prop_def,
+    region_def,
     result_def,
+    traits_def,
     var_operand_def,
 )
+from xdsl.traits import NoTerminator
 
 # --------------------------------------------------------------------------- #
 # Memory-space conventions
@@ -124,12 +127,13 @@ class DmaReduceOp(IRDLOperation):
 
 @irdl_op_definition
 class GroupBarrierOp(IRDLOperation):
-    """Two-phase X-then-Y barrier scoped to a ``grid_x`` x ``grid_y`` group."""
+    """Two-phase X-then-Y barrier scoped to a ``grid_x`` x ``grid_y`` group (the backend emits the global barrier), or,
+    with a ``cluster_set`` mask attribute, the barrier of that cluster set (members only, ``sh_set_barrier``)."""
 
     name = "softhier.group_barrier"
     irdl_options = (ParsePropInAttrDict(),)
-    grid_x = prop_def(IntegerAttr)
-    grid_y = prop_def(IntegerAttr)
+    grid_x = opt_prop_def(IntegerAttr)
+    grid_y = opt_prop_def(IntegerAttr)
     assembly_format = "attr-dict"
 
 
@@ -315,6 +319,9 @@ class L1BufferOp(IRDLOperation):
 # HBM tensor ops (fp16, row-major, strided views allowed). These lower 1:1 to the
 # softhier-ops library (runtime/sh_ops.h). Optional attribute on every one of them:
 #   cluster = <i32>   executing cluster, -1 = split over all clusters (SH_ALL); default 0
+#   cluster_set = <i32>  a 16-bit cluster mask (bit i = cluster i): split over THAT set of clusters (SH_GROUP(mask),
+#                     any subset of the mesh) and end with the set's barrier; takes precedence over `cluster`. Ops on
+#                     disjoint sets run concurrently inside `softhier.on_clusters` regions (docs/SPATIAL_SPLIT.md).
 # --------------------------------------------------------------------------- #
 @irdl_op_definition
 class ViewOp(IRDLOperation):
@@ -785,9 +792,25 @@ class CallOp(IRDLOperation):
     assembly_format = "$operands_ attr-dict `:` type($operands_)"
 
 
+@irdl_op_definition
+class OnClustersOp(IRDLOperation):
+    """Spatial split: the body runs only on the clusters of ``cluster_set`` (a 16-bit mask, bit i = cluster i); the
+    other clusters skip it. Two ``on_clusters`` regions over disjoint sets placed one after the other run AT THE SAME
+    TIME (each set runs its own body; nothing synchronises the sets until a global ``softhier.group_barrier`` after
+    both). Ops inside should carry the same ``cluster_set`` so their work is dealt over the set and their barriers stay
+    inside it; ``softhier.mark`` / ``group_barrier`` with ``cluster_set`` are printed by / scoped to the set."""
+    name = "softhier.on_clusters"
+    irdl_options = (ParsePropInAttrDict(),)
+    cluster_set = prop_def(IntegerAttr)
+    body = region_def("single_block")
+    traits = traits_def(NoTerminator())
+    assembly_format = "attr-dict-with-keyword $body"
+
+
 SoftHier = Dialect(
     "softhier",
     [
+        OnClustersOp,
         CallOp,
         MarkOp,
         PreloadWaitOp,
