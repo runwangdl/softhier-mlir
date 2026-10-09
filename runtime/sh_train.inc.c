@@ -698,7 +698,7 @@ SH_T_COLD int sh_t_allreduce(uint64_t dst, uint64_t src, uint32_t src_stride, ui
     const uint32_t slots = SH_T_L1_BASE, lslots = slots + P * CH, rhi = lslots + (mode ? P * CH : 0), rlo = rhi + CH, rout = rlo + CH;
     const uint32_t rmax = rout + 2 * CH;
     const uint32_t nchunk = (n + ce - 1) / ce, rounds = (nchunk + P - 1) / P;
-    float qscale = 1.f, iq = 1.f;
+    float iq = 1.f; int32_t emax = 15;
     if (mode == 1) {
         /* pass 1: local max |g| (fp16 SIMD on the staged rounds, all cores), as fp16 into a 64 B slot of every
          * cluster, one REDMAX_FP_16 at cluster 0, result through HBM (`scal`, 64 B) */
@@ -729,12 +729,10 @@ SH_T_COLD int sh_t_allreduce(uint64_t dst, uint64_t src, uint32_t src_stride, ui
             bare_dma_start_1d(scal, local(rmax + 128), 64); bare_dma_wait_all();
         }
         flex_global_barrier_xy();
-        const float gmax = sh_h2f(((const volatile uint16_t *)(uintptr_t)scal)[0]) * 1.0009765625f;   /* the NoC truncates: <= 1 ulp low */
-        /* 2^e with 2^e gmax <= 2^19: e = 19 - ex, gmax < 2^ex from the exponent bits */
-        union { float f; uint32_t u; } u; u.f = gmax > 0.f ? gmax : 1.f;
-        int e = 19 - ((int)((u.u >> 23) & 0xFF) - 127 + 1); if (e > 100) e = 100; if (e < -100) e = -100;
-        union { float f; uint32_t u; } s; s.u = (uint32_t)(e + 127) << 23; qscale = s.f;
-        s.u = (uint32_t)(127 - e) << 23; iq = s.f;
+        /* scale 2^e from the max's fp16 exponent Emax: |g| < 2^(Emax - 14), so q = g 2^e with e = 33 - Emax stays below
+         * 2^19 (the NoC's truncation can only lower the max by one ulp, inside the same binade or the one below) */
+        emax = (int32_t)((((const volatile uint16_t *)(uintptr_t)scal)[0] >> 10) & 31u) + 1; if (emax > 31) emax = 31;
+        union { float f; uint32_t u; } s; s.u = (uint32_t)(127 - (33 - emax)) << 23; iq = s.f;
     }
     for (uint32_t rd = 0; rd < rounds; ++rd) {
         /* stage: chunk rd P + r into slot r (all clusters) */
@@ -744,10 +742,14 @@ SH_T_COLD int sh_t_allreduce(uint64_t dst, uint64_t src, uint32_t src_stride, ui
             const uint32_t nloc = (rd * P + P <= nchunk ? P : nchunk - rd * P) * ce;
             uint32_t lo, hi; sh_share(nloc, 4, &lo, &hi);
             uint16_t *hp = (uint16_t *)local(slots), *lp = (uint16_t *)local(lslots);
+            /* integer only, from the fp16 bits (no FP <-> int moves, each a ~15-cycle round trip on these cores):
+             * |g| = M 2^(E - 25), M = 1024 + mant (E > 0) or mant (E = 0, E taken as 1); q = M 2^(E - 25 + e), and with
+             * e = 33 - emax the shift E - emax + 8 is <= 8; right shifts round half up */
             for (uint32_t i = lo; i < hi; ++i) {
-                const float v = sh_h2f(hp[i]) * qscale;
-                int32_t qv;
-                __asm__ volatile ("fcvt.w.s %0, %1, rne" : "=r"(qv) : "f"(v));
+                const uint32_t b = hp[i], E = (b >> 10) & 31u, M = (b & 1023u) | (E ? 1024u : 0u);
+                const int32_t sh = (int32_t)(E ? E : 1u) - emax + 8;
+                int32_t qv = sh >= 0 ? (int32_t)(M << sh) : (sh > -12 ? (int32_t)((M + (1u << (-sh - 1))) >> -sh) : 0);
+                if (b & 0x8000u) qv = -qv;
                 hp[i] = (uint16_t)(qv >> 12); lp[i] = (uint16_t)(qv & 0xFFF);
             }
         }
