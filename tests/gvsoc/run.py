@@ -541,6 +541,310 @@ def run_smolvla_vlm(npz: str, layers: int | None, attn: int, cluster: int, nsamp
     return ok
 
 
+E2E_TRACES = ("redmule", "idma", "cluster_registers")
+
+
+def _e2e_phase(app: Path, name: str, emit, timeout: int, trace: bool, reuse: bool) -> str:
+    """One program of the chain: emit -> preload ELF (arrays freed before the simulator starts: host memory) -> C ->
+    build -> gvsoc with the log streamed to <app>/<name>.log. reuse: a finished log of the same phase is re-read."""
+    import gc
+    import json
+    import resource
+    from softhier_mlir.sim.preload import make_preload_elf
+    log = app / f"{name}.log"
+    meta = app / f"{name}.json"
+    if reuse and log.exists() and meta.exists() and json.loads(meta.read_text()).get("ok"):
+        print(f"[e2e] {name}: re-using {log}")
+        from softhier_mlir.sim.trace import program_lines
+        return "".join(program_lines(log))
+    app.mkdir(parents=True, exist_ok=True)
+    rt = (HERE / "../../runtime").resolve()
+    (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c PARENT_SCOPE)\n"
+                                        f"set(INCLUDE_DIRS {rt} PARENT_SCOPE)\n")
+    mlir, pre = emit()
+    (app / f"{name}.mlir").write_text(mlir)
+    elf = make_preload_elf(app / f"{name}_preload.elf", pre)
+    image = sum(a.nbytes for a in pre.values())
+    del pre
+    gc.collect()
+    (app / "main.c").write_text(lower_and_translate(app / f"{name}.mlir", None))
+    build_sw(app, build_dir=app / f"build_{name}")
+    text = sum(sz for _, sz in _elf_load_segments(build_sw.last_elf) if sz)
+    print(f"[e2e] {name}: preload {image / 2 ** 20:.1f} MiB, program {text / 1024:.1f} KB; simulating{' with traces' if trace else ''}...", flush=True)
+    r = run_sim(preload=elf, timeout=timeout, log=log, traces=E2E_TRACES if trace else (), program_output_only=trace)
+    rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024
+    print(f"{'PASS' if r['ok'] else 'FAIL'} e2e {name}: roi={r['roi_ns']} ns wall={r['wall_s']}s (max child RSS so far {rss:.0f} MB)", flush=True)
+    meta.write_text(json.dumps({"ok": r["ok"], "roi_ns": r["roi_ns"], "wall_s": r["wall_s"], "image_bytes": image, "program_bytes": text,
+                                "max_child_rss_mb": rss, "trace": trace}))
+    if not r["ok"]:
+        print(r["stdout"][-3000:])
+        raise RuntimeError(f"e2e phase {name} failed (returncode {r['returncode']}; a death without output is an OOM kill)")
+    return r["stdout"]
+
+
+def run_smolvla_e2e(npz: str, steps: int = 10, app_dir: Path | None = None, trace: bool = False, reuse: bool = True,
+                    nsamples: int = 128, timeout: int = 48 * 3600, split: int = 8) -> bool:
+    """One SmolVLA inference chained over four programs (frontend.smolvla_e2e: vision + connector, prefix layers
+    1..split, prefix layers split+1..16, expert flow); each phase's HBM hand-over is dumped in full by the device and
+    preloaded into the next one. Validates every hand-over and the final action chunk against lerobot and writes
+    <app>/summary.json (per-segment simulated time; with trace=True also HBM bytes and RedMulE / iDMA busy time per
+    segment and cluster, softhier_mlir.sim.trace.segment_stats)."""
+    import json
+    from softhier_mlir.frontend import smolvla, smolvla_e2e as E, smolvla_expert as XE
+    from softhier_mlir.testing import lcg
+    e2e = dict(np.load(npz))
+    it = E.info(e2e)
+    n, cams, T, n_img, S_pad = it["n"], it["cams"], it["T"], it["n_img"], it["S_pad"]
+    app = Path(app_dir) if app_dir else HERE / "smolvla_e2e_app" / f"c{cams}_t{T}{'_trace' if trace else ''}"
+    app.mkdir(parents=True, exist_ok=True)
+    valid = smolvla.prefix_layout(cams, e2e["lang_mask"], it["img_tok"])["pad"]
+    summ: dict = {"npz": str(npz), "cams": cams, "tokens_per_camera": T, "prefix_tokens": n, "valid_tokens": it["n_valid"], "S_pad": S_pad,
+                  "steps": steps, "chunk": int(e2e["x_x0"].shape[0]), "phases": {}, "acc": {}}
+    ok = True
+
+    def err(name, got, ref, rows=None):
+        got, ref = np.asarray(got, np.float32), np.asarray(ref, np.float32)
+        if rows is not None:
+            got, ref = got[rows], ref[rows]
+        d = np.abs(got - ref)
+        summ["acc"][name] = {"max_abs": float(d.max()), "median": float(np.median(d)), "ref_max": float(np.abs(ref).max())}
+        print(f"     {name:<10} max abs {d.max():.4f} median {np.median(d):.5f} (|ref| max {np.abs(ref).max():.3f})")
+        return float(d.max())
+
+    def phase_record(name, stdout, seg_tags):
+        """per-phase marks + (trace) segment statistics"""
+        rec = {"marks": parse_marks(stdout), **json.loads((app / f"{name}.json").read_text())}
+        if trace:
+            from softhier_mlir.sim.trace import segment_stats
+            rec["segments"] = segment_stats(app / f"{name}.log")
+        summ["phases"][name] = rec
+        return rec
+
+    # ---- V: vision tower per camera + connector
+    out = _e2e_phase(app, "vision", lambda: E.emit_vision(e2e, nsamples=nsamples), timeout, trace, reuse)
+    phase_record("vision", out, None)
+    got = lcg.parse_samples(out)
+    print(f"[e2e] vision + connector ({cams} camera(s) x {T} tokens):")
+    vis_ref = np.concatenate([e2e[f"ref_vis_out_{c}"] for c in range(cams)])
+    vals = np.array([v for _, _, v in got["VIS"]]); want = np.array([vis_ref[r_, c] for r_, c, _ in got["VIS"]])
+    d = np.abs(vals - want)
+    summ["acc"]["VIS"] = {"max_abs": float(d.max()), "median": float(np.median(d)), "ref_max": float(np.abs(vis_ref).max()), "samples": len(vals)}
+    print(f"     VIS        {len(vals)} samples: max abs {d.max():.4f} median {np.median(d):.5f} (|ref| max {np.abs(vis_ref).max():.2f})")
+    x_img = E.full_dump(got["IMG"], n_img, smolvla.TD)
+    err("IMG", x_img, np.concatenate([e2e[f"ref_img_emb_{c}"] for c in range(cams)]))
+    del got, out
+
+    # ---- Pa / Pb: the 16-layer prefix writing the KV cache
+    kv: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    x_hand = None
+    for name, l0, nl in (("prefix_a", 0, split), ("prefix_b", split, smolvla.TLAYERS - split)):
+        def emit(l0=l0, nl=nl, x_hand=x_hand):
+            d = E.vlm_data(e2e, x_img=x_img if l0 == 0 else None, x_init=x_hand, layers_from=l0, layers=nl)
+            d["meta"][1] = smolvla.TLAYERS                     # no final norm after a partial tower
+            mlir, pre = smolvla.emit_vlm(d, nl, -1, -1, dumps=(), layer0=l0, dump_state=True, pad_rows_zero=True)
+            print(f"[e2e] {name}: KV cache at 0x{smolvla.emit_vlm.last_info['kv_base']:x} stride 0x{smolvla.emit_vlm.last_info['kv_stride']:x}, "
+                  f"S_pad {smolvla.emit_vlm.last_info['S_pad']}")
+            return mlir, pre
+        out = _e2e_phase(app, name, emit, timeout, trace, reuse)
+        phase_record(name, out, None)
+        got = lcg.parse_samples(out)
+        print(f"[e2e] {name}: layers {l0 + 1}..{l0 + nl} (rows compared: the {int(valid.sum())} valid tokens)")
+        x_hand = E.full_dump(got["XS"], n, smolvla.TD)
+        for L in range(l0 + 1, l0 + nl + 1):
+            k, v = E.full_dump(got[f"KC{L}"], n, smolvla.TKVD), E.full_dump(got[f"VC{L}"], n, smolvla.TKVD)
+            kv[L - 1] = (k, v)
+            err(f"K{L}", k, e2e[f"ref_kv_k_{L - 1}"], valid); err(f"V{L}", v, e2e[f"ref_kv_v_{L - 1}"], valid)
+        del got, out
+
+    # ---- X: the expert's flow loop on the device's KV cache
+    xd = E.expert_data(e2e, kv)
+    def emit_x():
+        return XE.emit_flow(xd, steps, XE.LAYERS, -1, None, False, ("X", "A"), nsamples, kv_base=None,
+                            kv_stride=2 * S_pad * XE.DKV * 2, s_pad=S_pad, num_steps=10)
+    out = _e2e_phase(app, "expert", emit_x, timeout, trace, reuse)
+    phase_record("expert", out, None)
+    got = lcg.parse_samples(out)
+    P = {k[2:]: xd[k] for k in xd if k.startswith("p_")}
+    floor_xt, _ = XE.np_flow(P, steps, XE.LAYERS)
+    print(f"[e2e] expert: {steps} flow steps on the device's KV ({n} prefix tokens)")
+    ref_xt = e2e["ref_xt"]
+    xs = []
+    for s in range(steps):
+        x = E.full_dump(got[f"X{s}"], *ref_xt.shape[1:]).astype(np.float32)
+        xs.append(x)
+        d_ref, d_fl = np.abs(x - ref_xt[s + 1]).max(), np.abs(x - floor_xt[s + 1]).max()
+        summ["acc"][f"X{s}"] = {"max_abs": float(d_ref), "vs_floor": float(d_fl), "ref_max": float(np.abs(ref_xt[s + 1]).max())}
+    print("     x_t per step vs lerobot (max abs): " + " ".join(f"{summ['acc'][f'X{s}']['max_abs']:.4f}" for s in range(steps)))
+    a = E.full_dump(got["A"], *ref_xt.shape[1:]).astype(np.float32)
+    want = ref_xt[steps]
+    da = np.abs(a - want)
+    summ["acc"]["actions"] = {"max_abs": float(da.max()), "mean_abs": float(da.mean()), "ref_max": float(np.abs(want).max()),
+                              "vs_floor": float(np.abs(a - floor_xt[steps]).max()), "floor_vs_lerobot": float(np.abs(floor_xt[steps] - want).max())}
+    print(f"     action chunk x_{steps} (all {a.size} elements) vs lerobot fp32: max abs {da.max():.4f} mean {da.mean():.5f} (|a| max {np.abs(want).max():.3f}); "
+          f"vs the expert's fp16 floor on the same KV: {summ['acc']['actions']['vs_floor']:.4f}; that floor vs lerobot: {summ['acc']['actions']['floor_vs_lerobot']:.4f}")
+    np.savez(app / "chain_outputs.npz", actions=a, xt=np.stack(xs), x_img=x_img, x_hand=x_hand,
+             **{f"kv_k_{L}": k for L, (k, v) in kv.items()}, **{f"kv_v_{L}": v for L, (k, v) in kv.items()})
+    ok &= bool(da.max() < 0.1) if steps == 10 else True
+
+    # ---- per-segment simulated time
+    seg = e2e_segments(summ, steps)
+    summ["segments_ms"] = seg
+    print("[e2e] simulated time (ms, 1 GHz, ideal HBM; preload waits and hand-over dumps excluded):")
+    for k, v in seg.items():
+        print(f"     {k:<22} {v:9.3f}" if isinstance(v, float) else f"     {k:<22} {v}")
+    (app / "summary.json").write_text(json.dumps(summ, indent=1, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)))
+    print(f"{'PASS' if ok else 'FAIL'} smolvla-e2e cams={cams} tokens/camera={T} prefix={n} steps={steps}: actions max abs {da.max():.4f} "
+          f"vs lerobot; total {seg['total']:.3f} ms simulated; summary {app / 'summary.json'}")
+    return ok
+
+
+def run_expert_cost(kv_src: str, chunk: int = 50, steps: int = 10, trace: bool = True, app_dir: Path | None = None,
+                    reuse: bool = True, timeout: int = 48 * 3600) -> bool:
+    """The expert phase alone for the cost table: a prefix length / chunk point that the chained runs do not cover.
+    kv_src: an e2e npz whose chain already ran (its device KV from <app>/chain_outputs.npz; validated against lerobot,
+    first `chunk` action rows), `expert` (expert.npz: lerobot's 241-token KV), `vlm_c1` (vlm_c1.npz: the fp32 113-token
+    prefix reference's KV). Writes <app>/summary.json (per-step times, KV projection, trace segments)."""
+    import json
+    from softhier_mlir.frontend import smolvla, smolvla_e2e as E, smolvla_expert as XE
+    from softhier_mlir.testing import lcg
+    ref_xt = None
+    if kv_src.endswith(".npz") and "e2e_" in kv_src:
+        e2e = dict(np.load(kv_src))
+        it = E.info(e2e)
+        chain = HERE / "smolvla_e2e_app" / f"c{it['cams']}_t{it['T']}_trace" / "chain_outputs.npz"
+        co = np.load(chain)
+        d = E.expert_data(e2e, {L: (co[f"kv_k_{L}"], co[f"kv_v_{L}"]) for L in range(16)})
+        ref_xt, lp, tag = e2e["ref_xt"], it["n"], f"c{it['cams']}_t{it['T']}"
+    elif kv_src == "expert":
+        d = dict(np.load(E.EXPERT_NPZ))
+        ref_xt, lp, tag = d["ref_xt"], int(d["p_tok"].shape[1]), "expert241"
+    elif kv_src == "vlm_c1":
+        v = np.load(E.VLM_NPZ)
+        lp = int(v["meta"][0])
+        lay = smolvla.prefix_layout(int(v["meta"][2]), v["lang_mask"])
+        n_valid = int(lay["pad"].sum())
+        w = np.load(E.EXPERT_NPZ)
+        d = {k: w[k] for k in w.files if k.startswith("p_") and not k.startswith(("p_kp", "p_vp"))}
+        d["p_tok"] = XE.prefix_tok(lay["pad"].astype(np.float32))
+        d["p_rq_self"] = XE.rope_table(n_valid + np.arange(XE.S))
+        for L in range(16):
+            d[f"p_kp{L}"], d[f"p_vp{L}"] = v[f"ref_K{L + 1}"].astype(np.float16), v[f"ref_V{L + 1}"].astype(np.float16)
+        tag = "vlm113"
+    else:
+        raise ValueError(kv_src)
+    S_pad = ((lp + 127) // 128) * 128
+    app = Path(app_dir) if app_dir else HERE / "smolvla_e2e_app" / f"expert_{tag}_chunk{chunk}{'_trace' if trace else ''}"
+    out = _e2e_phase(app, "expert", lambda: XE.emit_flow(d, steps, XE.LAYERS, -1, None, False, ("A",), 64, kv_base=None,
+                                                          kv_stride=2 * S_pad * XE.DKV * 2, s_pad=S_pad, chunk=chunk), timeout, trace, reuse)
+    marks = parse_marks(out)
+    kvp = (marks["kvproj"] - marks["start"]) / 1e6
+    st, prev = [], marks["kvproj"]
+    for s in range(steps):
+        st.append((marks[f"step{s}"] - prev) / 1e6)
+        prev = marks[f"step{s}"]
+    summ = {"kv_src": kv_src, "prefix_tokens": lp, "S_pad": S_pad, "chunk": chunk, "steps": steps, "marks": marks,
+            "segments_ms": {"expert_kv_projection": kvp, "expert_per_step": st, "expert_step_mean": float(np.mean(st)), "expert_total": kvp + sum(st)},
+            **json.loads((app / "expert.json").read_text())}
+    if trace:
+        from softhier_mlir.sim.trace import segment_stats
+        summ["phases"] = {"expert": {"marks": marks, "segments": segment_stats(app / "expert.log")}}
+    got = lcg.parse_samples(out)
+    a = E.full_dump(got["A"], chunk, XE.AD).astype(np.float32)
+    P = {k[2:]: d[k] for k in d if k.startswith("p_")}
+    P["x0"], P["rq_self"], P["rq_cross"] = P["x0"][:chunk], P["rq_self"][:chunk], P["rq_cross"][:chunk]
+    floor_xt, _ = XE.np_flow(P, steps, XE.LAYERS)
+    summ["acc"] = {"actions_vs_floor": float(np.abs(a - floor_xt[steps]).max())}
+    msg = f"vs the fp16-floor twin {summ['acc']['actions_vs_floor']:.4f}"
+    if ref_xt is not None:
+        summ["acc"]["actions_vs_lerobot"] = float(np.abs(a - ref_xt[steps][:chunk]).max())
+        msg += f", vs lerobot (first {chunk} rows of the 50-row chunk: causal own keys) {summ['acc']['actions_vs_lerobot']:.4f}"
+    (app / "summary.json").write_text(json.dumps(summ, indent=1))
+    print(f"PASS expert-cost {tag} Lp={lp} chunk={chunk}: {np.mean(st):.3f} ms/step, KV projection {kvp:.3f} ms; actions {msg}")
+    return True
+
+
+def run_vision_cost(T: int = 1024, layers: int = 1, trace: bool = True, app_dir: Path | None = None, reuse: bool = True,
+                    timeout: int = 48 * 3600) -> bool:
+    """The chain's vision phase (frontend.smolvla_e2e.emit_vision: SigLIP layers + post-LN + pixel shuffle + connector)
+    for one camera at T SigLIP tokens with `layers` layers, on vision_s<T>.npz's test image (T = 1024: the full
+    512 x 512 image, position rows 0..1023): the per-layer cost the composed full-resolution numbers multiply by 12."""
+    import json
+    from softhier_mlir.frontend import smolvla, smolvla_e2e as E
+    from softhier_mlir.testing import lcg
+    src = np.load(f"/app/models/smolvla_base/vision_s{T}.npz")
+    img_tok = T // E.PS
+    n = img_tok + smolvla.LANG_LEN + 1
+    e2e = {"xp": src["xp"][None], "vis_pos_ids": smolvla.token_ids_for(T), "meta": np.array([n, 16, 1, T, n], dtype=np.int64)}
+    app = Path(app_dir) if app_dir else HERE / "smolvla_e2e_app" / f"vision_t{T}_L{layers}{'_trace' if trace else ''}"
+    out = _e2e_phase(app, "vision", lambda: E.emit_vision(e2e, layers=layers, nsamples=64), timeout, trace, reuse)
+    marks = parse_marks(out)
+    got = lcg.parse_samples(out)
+    ref = src[f"np_L{layers}"] if layers < smolvla.LAYERS else src["np_OUT"]
+    if layers < smolvla.LAYERS:   # the program ends with the post-LN: compare against the fp16 floor's post-LN of layer `layers`
+        x = src[f"np_L{layers}"].astype(np.float32)
+        mu, var = x.mean(1, keepdims=True), x.var(1, keepdims=True)
+        ref = ((x - mu) / np.sqrt(var + smolvla.LN_EPS) * src["p_gpost"].astype(np.float32) + src["p_bepost"].astype(np.float32))
+    vals = np.array([v for _, _, v in got["VIS"]]); want = np.array([ref[r_, c] for r_, c, _ in got["VIS"]])
+    summ = {"T": T, "layers": layers, "marks": marks, **json.loads((app / "vision.json").read_text()),
+            "acc": {"VIS_vs_floor_max_abs": float(np.abs(vals - want).max()), "ref_max": float(np.abs(ref).max())}}
+    lt = layer_times(marks)
+    summ["segments_ms"] = {"embed": (marks["vemb0"] - marks["start"]) / 1e6, "attention_per_layer": [v[0] / 1e6 for v in lt.values()],
+                           "mlp_per_layer": [v[1] / 1e6 for v in lt.values()], "post_ln": (marks["vis0"] - marks[f"layer{layers}"]) / 1e6,
+                           "connector": (marks["conn"] - marks["vis0"]) / 1e6}
+    if trace:
+        from softhier_mlir.sim.trace import segment_stats
+        summ["phases"] = {"vision": {"marks": marks, "segments": segment_stats(app / "vision.log")}}
+    (app / "summary.json").write_text(json.dumps(summ, indent=1))
+    print(f"PASS vision-cost T={T} layers={layers}: {summ['segments_ms']}; VIS vs fp16 floor max abs {summ['acc']['VIS_vs_floor_max_abs']:.4f}")
+    return True
+
+
+def run_prefix_cost(cams: int, layers: int = 8, trace: bool = True, app_dir: Path | None = None, reuse: bool = True,
+                    timeout: int = 48 * 3600) -> bool:
+    """The full-resolution prefix for the cost table: vlm_c<cams>.npz (1024 SigLIP tokens per camera -> 113 / 241
+    prefix tokens) through emit_vlm: pixel shuffle + connector + scaling + the first `layers` decoder layers (the
+    per-layer time of layers 9-16 equals 1-8 within 2 %, docs/SMOLVLA.md), traced for bytes / utilisation."""
+    import json
+    from softhier_mlir.frontend import smolvla
+    data = dict(np.load(f"/app/models/smolvla_base/vlm_c{cams}.npz"))
+    app = Path(app_dir) if app_dir else HERE / "smolvla_e2e_app" / f"prefix_c{cams}_t1024_L{layers}{'_trace' if trace else ''}"
+    out = _e2e_phase(app, "prefix_a", lambda: smolvla.emit_vlm(data, layers, -1, -1, dumps=(), layer0=0), timeout, trace, reuse)
+    marks = parse_marks(out)
+    lt = layer_times(marks)
+    summ = {"cams": cams, "prefix_tokens": int(data["meta"][0]), "layers": layers, "marks": marks, **json.loads((app / "prefix_a.json").read_text()),
+            "segments_ms": {"connector": (marks["emb"] - marks["start"]) / 1e6, "prefix_per_layer": [sum(v) / 1e6 for v in lt.values()],
+                            "attention_per_layer": [v[0] / 1e6 for v in lt.values()]}}
+    if trace:
+        from softhier_mlir.sim.trace import segment_stats
+        summ["phases"] = {"prefix_a": {"marks": marks, "segments": segment_stats(app / "prefix_a.log")}}
+    (app / "summary.json").write_text(json.dumps(summ, indent=1))
+    print(f"PASS prefix-cost cams={cams} n={summ['prefix_tokens']}: connector {summ['segments_ms']['connector']:.3f} ms, "
+          f"{np.mean(summ['segments_ms']['prefix_per_layer']):.3f} ms/layer")
+    return True
+
+
+def e2e_segments(summ: dict, steps: int) -> dict:
+    """Segment times (ms) from the marks of the four phases."""
+    ph = summ["phases"]
+    mv, ma, mb, mx = (ph[k]["marks"] for k in ("vision", "prefix_a", "prefix_b", "expert"))
+    cams = summ["cams"]
+    vis, prev = [], mv["start"]
+    for c in range(cams):
+        vis.append((mv[f"vis{c}"] - prev) / 1e6)
+        prev = mv[f"vis{c}"]
+    conn = (mv["conn"] - mv[f"vis{cams - 1}"]) / 1e6 + (ma["emb"] - ma["start"]) / 1e6       # shuffle + GEMM, then the scaling
+    pre_l = [sum(v) / 1e6 for v in layer_times(ma).values()] + [sum(v) / 1e6 for v in layer_times(mb).values()]
+    kvp = (mx["kvproj"] - mx["start"]) / 1e6
+    st, prev = [], mx["kvproj"]
+    for s in range(steps):
+        st.append((mx[f"step{s}"] - prev) / 1e6)
+        prev = mx.get(f"xdump{s}", mx[f"step{s}"])
+    out = {"vision_per_camera": vis, "vision": sum(vis), "connector": conn, "prefix_per_layer": pre_l, "prefix": sum(pre_l),
+           "expert_kv_projection": kvp, "expert_per_step": st, "expert_step_mean": float(np.mean(st)), "expert_total": kvp + sum(st)}
+    out["total"] = out["vision"] + out["connector"] + out["prefix"] + out["expert_total"]
+    return out
+
+
 def report_smolvla(data: dict, stdout: str, layers: int, dumps: tuple, ok: bool, valid_rows=None) -> bool:
     """Timing (marks) + accuracy of the sampled tensors. A tensor passes when every sample is within
     atol = 3% of the tensor's max |ref| (+ 5% relative) of the HF fp32 reference: the program is fp16 end
@@ -746,7 +1050,7 @@ def run_mlir(files: list[str], passes: str | None) -> bool:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("test", choices=["gemm", "gemm-seq", "mlir", "rowops", "fp16cvt", "siglip", "siglip-mlir", "mesh", "attention", "preload", "smolvla",
-                                     "llmops", "smolvla-vlm"])
+                                     "llmops", "smolvla-vlm", "smolvla-e2e"])
     ap.add_argument("--data", choices=["preload", "device"], default="preload",
                     help="test inputs: generated on the host into the HBM preload image (default) or on the device")
     ap.add_argument("--kv-heads", type=int, default=5, help="llmops: key/value heads (GQA)")
@@ -781,6 +1085,15 @@ if __name__ == "__main__":
     ap.add_argument("--trace", help="siglip-mlir: record the RedMulE/iDMA/barrier activity into this log (softhier_mlir.sim.trace)")
     ap.add_argument("--tiles", default="model", help="siglip-mlir: GEMM tile policy, 'model' (softhier_mlir.dse.tiling) or 'tm,tn,tk'")
     ap.add_argument("--hbm-split", action="store_true", help="siglip-mlir: parameters in HBM node 1, activations in node 0")
+    ap.add_argument("--steps", type=int, default=10, help="smolvla-e2e: flow steps simulated (of the 10-step schedule)")
+    ap.add_argument("--e2e-trace", action="store_true", help="smolvla-e2e: record RedMulE / iDMA / barrier traces (HBM bytes, utilisation per segment)")
+    ap.add_argument("--fresh", action="store_true", help="smolvla-e2e: re-simulate phases that already have a finished log")
+    ap.add_argument("--split", type=int, default=8, help="smolvla-e2e: prefix layers in the first prefix program")
+    ap.add_argument("--expert-only", help="smolvla-e2e: only the expert phase for the cost table; KV from an e2e npz whose chain ran, "
+                                          "'expert' (241-token lerobot KV) or 'vlm_c1' (113-token prefix reference KV)")
+    ap.add_argument("--prefix-only", type=int, help="smolvla-e2e: only the full-resolution prefix (vlm_c<N>.npz), --layers layers")
+    ap.add_argument("--vision-only", type=int,help="smolvla-e2e: only the vision phase, 1 camera at this many SigLIP tokens, --layers layers")
+    ap.add_argument("--chunk", type=int, default=50,help="smolvla-e2e --expert-only: action rows (25 = the first 25 of the 50-row chunk)")
     a = ap.parse_args()
     DATA = a.data
     if a.cluster is None:
@@ -796,6 +1109,15 @@ if __name__ == "__main__":
         ok = run_fp16cvt()
     elif a.test == "llmops":
         ok = run_llmops(a.rows, a.cols or 960, a.heads or 15, a.kv_heads, "SH_ALL" if a.cluster == "all" else "0", a.nsamples)
+    elif a.test == "smolvla-e2e" and a.prefix_only:
+        ok = run_prefix_cost(a.prefix_only, a.layers, a.e2e_trace, Path(a.app_dir) if a.app_dir else None, not a.fresh)
+    elif a.test == "smolvla-e2e" and a.vision_only:
+        ok = run_vision_cost(a.vision_only, a.layers, a.e2e_trace, Path(a.app_dir) if a.app_dir else None, not a.fresh)
+    elif a.test == "smolvla-e2e" and a.expert_only:
+        ok = run_expert_cost(a.expert_only, a.chunk, a.steps, a.e2e_trace, Path(a.app_dir) if a.app_dir else None, not a.fresh)
+    elif a.test == "smolvla-e2e":
+        ok = run_smolvla_e2e(a.npz, a.steps, Path(a.app_dir) if a.app_dir else None, a.e2e_trace, not a.fresh, min(a.nsamples, 128),
+                             split=a.split)
     elif a.test == "smolvla-vlm":
         ok = run_smolvla_vlm(a.npz, None if a.all_layers else a.layers, a.attn, -1 if a.cluster == "all" else int(a.cluster),
                              a.nsamples, a.dumps, Path(a.log) if a.log else None, app_dir=a.app_dir,

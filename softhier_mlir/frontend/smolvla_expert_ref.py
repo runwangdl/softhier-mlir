@@ -91,10 +91,14 @@ def materialise(policy, ckpt: str, want, dtype_of) -> None:
                 raise RuntimeError(f"meta buffer left: {name}.{bname} {tuple(buf.shape)}")
 
 
-def inputs(cfg, tok, seed: int, prompt: str):
+def inputs(cfg, tok, seed: int, prompt: str, cams: int = 3, size: int = 512):
+    """cams camera images of size x size (SigLIP's [-1, 1] range, fp16-representable), the tokenized prompt, state, noise.
+    size 512 = lerobot's resize_imgs_with_padding (1024 SigLIP tokens -> 64 image tokens per camera); 256 = 256 SigLIP
+    tokens -> 16 image tokens (SmolVLM's bucketed position ids: patch (i, j) of the 16 x 16 grid takes the position row
+    of the 32 x 32 table that `vision_position_ids` gives)."""
     g = torch.Generator().manual_seed(seed)
-    images = [(torch.rand(1, 3, 512, 512, generator=g) * 2 - 1).half().float() for _ in range(3)]
-    img_masks = [torch.ones(1, dtype=torch.bool) for _ in range(3)]
+    images = [(torch.rand(1, 3, size, size, generator=g) * 2 - 1).half().float() for _ in range(cams)]
+    img_masks = [torch.ones(1, dtype=torch.bool) for _ in range(cams)]
     enc = tok(prompt, padding="max_length", padding_side="right", max_length=cfg.tokenizer_max_length, truncation=True, return_tensors="pt")
     lang_tokens, lang_masks = enc["input_ids"], enc["attention_mask"].bool()
     state = torch.zeros(1, 32); state[0, :6] = torch.randn(6, generator=g)
@@ -102,18 +106,36 @@ def inputs(cfg, tok, seed: int, prompt: str):
     return images, img_masks, lang_tokens, lang_masks, state, noise
 
 
+def vision_position_ids(size: int, patch: int = 16, image_size: int = 512) -> np.ndarray:
+    """The position-table rows SmolVLM's vision embeddings use for a full (unpadded) size x size image: the code of
+    SmolVLMVisionEmbeddings.forward (bucketize of the fractional patch coordinates into the 32 x 32 grid)."""
+    side, n = image_size // patch, size // patch
+    boundaries = torch.arange(1 / side, 1.0, 1 / side)
+    idx = torch.arange(n, dtype=torch.float32)
+    frac = idx / n * (1 - 1e-6)
+    b = torch.bucketize(frac, boundaries, right=True)
+    return (b[:, None] * side + b[None, :]).flatten().numpy()
+
+
 def phase_kv(a) -> dict:
     from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
     cfg, policy = build_policy(a.ckpt)
     m = policy.model; we = m.vlm_with_expert
     vlm_dtype = torch.float32 if a.vlm_dtype == "fp32" else torch.bfloat16
-    images, img_masks, lang_tokens, lang_masks, state, noise = inputs(cfg, we.processor.tokenizer, a.seed, a.prompt)
-    out = {"images": torch.cat(images).half().numpy(), "lang_tokens": lang_tokens[0].numpy(), "lang_mask": lang_masks[0].numpy(),
+    images, img_masks, lang_tokens, lang_masks, state, noise = inputs(cfg, we.processor.tokenizer, a.seed, a.prompt,
+                                                                      getattr(a, "cams", 3), getattr(a, "img_size", 512))
+    out = {"images": torch.cat(images).half().numpy(), "vis_pos_ids": vision_position_ids(images[0].shape[-1]), "lang_tokens": lang_tokens[0].numpy(), "lang_mask": lang_masks[0].numpy(),
            "state": state[0].numpy(), "noise": noise[0].numpy(), "prompt": np.array(a.prompt), "vlm_dtype": np.array(a.vlm_dtype)}
     # 1. vision tower + connector -> image embeddings (then freed: the host has no room for both halves of the VLM)
     materialise(policy, a.ckpt, lambda k: ".vlm.model.vision_model." in k or ".vlm.model.connector." in k, lambda k: vlm_dtype)
     with torch.no_grad():
-        img_embs = [we.embed_image(img).clone() for img in images]
+        img_embs = []
+        for c, img in enumerate(images):      # == we.embed_image(img) (patch_attention_mask None), keeping the SigLIP output
+            vis = we.get_vlm_model().vision_model(pixel_values=img.to(vlm_dtype), patch_attention_mask=None).last_hidden_state
+            img_embs.append(we.get_vlm_model().connector(vis).clone())
+            out[f"vis_out_{c}"] = vis[0].float().numpy().copy()          # post-LN SigLIP output [tokens, 768]
+            out[f"img_emb_{c}"] = img_embs[-1][0].float().numpy().copy()   # connector output (before the sqrt(960) scaling)
+        assert torch.equal(img_embs[0], we.embed_image(images[0])), "manual vision + connector path != embed_image"
     print(f"[ref] image embeddings {tuple(img_embs[0].shape)} (vision+connector {vlm_dtype})", flush=True)
     vm = we.get_vlm_model()
     vm.vision_model = torch.nn.Identity(); vm.connector = torch.nn.Identity(); gc.collect()
@@ -129,6 +151,7 @@ def phase_kv(a) -> dict:
         _, pkv = we.forward(attention_mask=prefix_att_2d, position_ids=prefix_pos, past_key_values=None,
                             inputs_embeds=[prefix_embs, None], use_cache=cfg.use_cache, fill_kv_cache=True)
     Lp = prefix_pad_masks.shape[1]
+    out["prefix_embs"] = prefix_embs[0].float().numpy()
     out["prefix_valid"] = prefix_pad_masks[0].float().numpy()
     out["n_valid"] = np.array(int(prefix_pad_masks.sum()))
     for l in range(we.num_vlm_layers):
@@ -205,6 +228,8 @@ def main() -> None:
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--vlm-dtype", default="fp32", choices=["fp32", "bf16"], help="dtype of the frozen VLM (prefix KV producer); the expert is always fp32")
     ap.add_argument("--phase", default="all", choices=["kv", "expert", "all"])
+    ap.add_argument("--cams", type=int, default=3, help="cameras (the end-to-end chain also runs 1)")
+    ap.add_argument("--img-size", type=int, default=512, help="camera image side: 512 (1024 SigLIP tokens) or 256 (256 tokens)")
     a = ap.parse_args()
     torch.manual_seed(a.seed)
     kv = phase_kv(a) if a.phase in ("kv", "all") else None

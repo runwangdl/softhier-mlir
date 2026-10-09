@@ -198,3 +198,15 @@ python3 -m softhier_mlir.frontend.smolvla prepare-vlm --cams 3 --out /app/models
 .venv/bin/python tests/gvsoc/run.py smolvla-vlm --npz /app/models/smolvla_base/vlm_c3.npz --all-layers
 .venv/bin/python tests/gvsoc/run.py llmops --cluster all                                                     # the ops alone
 ```
+
+### One SmolVLA inference end to end + the cost table
+
+Vision per camera -> connector -> 16-layer prefix writing the KV cache -> 10-step expert flow reading it, chained as four
+gvsoc programs with an exact HBM hand-over (the fp16 weights, 674 MiB, exceed the chip's 512 MiB HBM). 1 camera x 256
+tokens: actions within 0.032 of lerobot, 119.1 ms simulated; 3 cameras: 0.067, 178.7 ms; 3 x 512x512 composed: 659 ms.
+Ledger [`docs/SMOLVLA_E2E.md`](docs/SMOLVLA_E2E.md); 32-configuration cost table `docs/dse/e2e_cost.{md,csv}`.
+
+```bash
+.venv/bin/python tests/gvsoc/run.py smolvla-e2e --npz /app/models/smolvla_base/e2e_c1_t256.npz --e2e-trace
+python -m softhier_mlir.dse.e2e_cost --collect
+```
