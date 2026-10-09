@@ -87,14 +87,15 @@ on sh_gemm. Program 60.5 KB (sh_gemm only: 56.9 KB) of the 64 KB instruction mem
 |---|---|---|---|---|---|---|---|
 | N=1, 4 layers, 2 steps | 2.884 | 2.590 | -10.2 % | - | - | - | step 2: 0.0044 / 0.0006 both |
 | N=1, 16 layers, 10 steps | 9.963 (FLOW_DATAFLOW.md; 1-step rerun 9.902) | **9.338** | **-6.3 %** | 345.7 -> **237.1** (-31 %, trace) | 22.7 both | 0 -> 7.3 | x_10: 0.0093 / 0.0009 both (twin 0.0107) |
-| N=4, 4 layers, 2 steps | 7.903 | 6.625 | -16.2 % | 4 L, 1 step: see below | | | every cand within 0.0044-0.0059 of its twin, both |
-| N=4, 16 layers | 28.92 (WORLD_MODEL.md) | **24.90** (3 steps) | **-13.9 %** | 840 -> **406** (-52 %, program count) | 103 both | - | cand 0 vs lerobot per step 0.0029 / 0.0032 / 0.0042, as sh_gemm |
+| N=4, 4 layers, 2 steps (bytes: 1-step trace) | 7.903 | 6.625 | -16.2 % | 197.2 -> **82.4** (-58 %, trace) | 24.5 both | 0 -> 8.0 | every cand within 0.0044-0.0059 of its twin, both |
+| N=4, 16 layers | 28.92 (WORLD_MODEL.md) | **24.90** (3 steps) | **-13.9 %** | read + write: 840 -> **406** (-52 %, program count) | (in the total) | ~29 (4 x the N=1 trace) | cand 0 vs lerobot per step 0.0029 / 0.0032 / 0.0042, as sh_gemm |
 
 Accuracy is unchanged to the bit level that matters: the per-step x_t errors against lerobot and the fp16-floor twin
 are identical to the sh_gemm runs (each output element is still one RedMulE accumulation over the same K order).
 Per-step HBM read is from the iDMA trace of a 1-step 16-layer run (both programs, excluding the once-per-chunk KV
 projection's 15.6 MB); `cost.expert_step_traffic` counts 368 / 259 MB (read + write) for the same programs, within
-0.3 % of the trace (368.4 / 259.8 MB), so the N = 4 column uses the program count.
+0.3 % of the trace (368.4 / 259.8 MB); at N = 4 and 4 layers the trace gives 221.7 / 106.9 MB against the count's 221.4 /
+106.6 MB, so the 16-layer N = 4 column uses the program count.
 
 Per-op, per layer call, 16 layers (us; the GEMM entries include their rmsnorm / residual add):
 
@@ -118,7 +119,7 @@ with the GEMMs at zero time the step would still be 5.6 ms (N = 1) / 18.4 ms (N 
 
 Multicasting the activation panel instead of re-reading it per output tile removes the term of the GEMM traffic that
 grows with the number of candidates: a flow step reads 31 % fewer HBM bytes at N = 1 (346 -> 237 MB, measured) and
-52 % fewer at N = 4 (840 -> 406 MB), and the step's HBM traffic now grows by ~49 MB per extra candidate instead of
+52 % less read + write traffic at N = 4 (840 -> 406 MB, program count; the 4-layer trace reads 58 % less), and the step's HBM traffic now grows by ~49 MB per extra candidate instead of
 ~157 MB. Single GEMMs get 1.2-1.7x faster at 50 rows and 1.6-3.1x at 200-400 rows, at the exact X + W byte floor and
 bit-identical numbers. The step itself gains less: -6.3 % at N = 1 (9.96 -> 9.34 ms) and -13.9 % at N = 4
 (28.92 -> 24.90 ms), because GEMMs were only 43 % / 36 % of the step and are now 40 % / 26 %, the rest being the fp16
