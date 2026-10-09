@@ -386,6 +386,11 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             rows, cols, ld, _ = bufs.geom(op.x)
             b(f"{ind}sh_gelu({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {rows}, {cols}, {ld}, {_cluster(op)});")
 
+        elif isinstance(op, AddOp) and "train" in op.attributes:
+            rows, cols, lda, _ = bufs.geom(op.a)
+            b(f"{ind}sh_t_add({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {bufs.geom(op.y)[2]}, {lda}, "
+              f"{bufs.geom(op.b)[2]}, {_cluster(op)});")
+
         elif isinstance(op, AddOp):
             rows, cols, ld, _ = bufs.geom(op.a)
             b(f"{ind}sh_add({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {ld}, {_cluster(op)});")

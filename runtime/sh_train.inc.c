@@ -154,12 +154,19 @@ static void sh_tk_rmsnorm_bwd(const sh_tblk *k) {
         }
         const float rs = sh_rsqrtf(((s0 + s1) + (s2 + s3)) * invC + eps);
         const float c = ((d0 + d1) + (d2 + d3)) * rs * rs * rs * invC;
+#ifdef SH_T_RMSBWD_F32
         for (uint32_t i = 0; i < C; i += 4) {
             float x0, x1, x2, x3, y0, y1, y2, y3, g0, g1, g2, g3, e0 = 0.f, e1 = 0.f, e2 = 0.f, e3 = 0.f;
             sh_h2f4(x + i, &x0, &x1, &x2, &x3); sh_h2f4(dy + i, &y0, &y1, &y2, &y3); sh_h2f4(g + i, &g0, &g1, &g2, &g3);
             if (dr) sh_h2f4(dr + i, &e0, &e1, &e2, &e3);
             sh_f2h4(dx + i, rs * g0 * y0 - c * x0 + e0, rs * g1 * y1 - c * x1 + e1, rs * g2 * y2 - c * x2 + e2, rs * g3 * y3 - c * x3 + e3);
         }
+#else   /* output pass in fp16 SIMD (4 lanes per instruction; the statistics above stay fp32): (dy rs) g - c x (+ dres) */
+        const sh_v4h rs4 = sh_v4_splat(rs), c4 = sh_v4_splat(c);
+        const sh_v4h *xv = SH_V4CP(x), *yv = SH_V4CP(dy), *gv = SH_V4CP(g), *rv = dr ? SH_V4CP(dr) : 0; sh_v4h *ov = SH_V4P(dx);
+        if (rv) for (uint32_t j = 0; j < (C >> 2); ++j) ov[j] = sh_v4_add(sh_v4_sub(sh_v4_mul(sh_v4_mul_r(yv[j], rs4), gv[j]), sh_v4_mul_r(xv[j], c4)), rv[j]);
+        else    for (uint32_t j = 0; j < (C >> 2); ++j) ov[j] = sh_v4_sub(sh_v4_mul(sh_v4_mul_r(yv[j], rs4), gv[j]), sh_v4_mul_r(xv[j], c4));
+#endif
     }
 }
 SH_T_COLD void sh_t_rmsnorm_bwd(uint64_t dx, uint64_t x, uint64_t dy, uint64_t dres, uint64_t gamma, uint32_t rows, uint32_t cols,
@@ -372,6 +379,19 @@ SH_T_COLD static void sh_t_scale(uint64_t y, uint64_t x, uint32_t rows, uint32_t
     sh_t_args a; sh_t_clear(&a);
     a.rows = rows; a.in[0] = sh_t_s16(x, cols, ld); a.out[0] = sh_t_s16(y, cols, ld);
     sh_t_rowop(&a, sh_tk_scale, &s, cluster);
+}
+/* y = a + b (per-operand leading dims; cols % 4 == 0). The residual add of the training forward: seeding the residual into
+ * the accumulating GEMM instead would round every one of its K fp16 FMAs at |h| (v error 3x the inference program's). */
+static void sh_tk_add(const sh_tblk *k) {
+    uint32_t lo, hi; sh_share(k->nr * k->a->in[0].cols, 4, &lo, &hi);
+    const sh_v4h *a = SH_V4CP(k->in[0]), *b = SH_V4CP(k->in[1]); sh_v4h *y = SH_V4P(k->out[0]);
+    for (uint32_t i = lo >> 2; i < (hi >> 2); ++i) y[i] = sh_v4_add(a[i], b[i]);
+}
+SH_T_COLD void sh_t_add(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, uint32_t cluster) {
+    if (sh_t_bad(cols & 3, "add: cols % 4 != 0")) return;
+    sh_t_args s; sh_t_clear(&s);
+    s.rows = rows; s.in[0] = sh_t_s16(a, cols, lda); s.in[1] = sh_t_s16(b, cols, ldb); s.out[0] = sh_t_s16(y, cols, ldy);
+    sh_t_rowop(&s, sh_tk_add, 0, cluster);
 }
 
 /* ---- LoRA forward and the backward of a (LoRA-)linear layer -------------------------------------------------------

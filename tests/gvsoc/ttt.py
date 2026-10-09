@@ -135,6 +135,54 @@ def run_layer(seed: int, nsamples: int, opt: str, lr: float) -> bool:
     return ok
 
 
+def run_expert(npz: str, layers: int, nsamples: int, opt: str, lr: float, profile: bool, seed: int, loss_scale: float | None,
+               dump_layers=(0, 7, 15)) -> bool:
+    """Step 3: one TTT step of the full expert on the real weights: x_t = noise at t = 1 (flow step 0), loss = MSE between the
+    predicted velocity and the target u = noise - a (a = lerobot's action chunk for this observation: self-distillation on
+    the policy's own sample), backward through `layers` layers into the LoRA, one optimizer step."""
+    from softhier_mlir.frontend import smolvla_ttt as TT
+    data = np.load(npz)
+    W = {k[2:]: data[k] for k in data.files if k.startswith("p_")}
+    x0 = W["x0"].astype(np.float16)
+    act = data["ref_actions"].reshape(TT.S, TT.AD)
+    tgt = (x0.astype(np.float32) - act).astype(np.float16)
+    lora = TT.lora_init(layers, seed)
+    ref = TT.torch_ttt(W, layers, True, lora, lr=lr, opt=opt, x_in=x0, target=tgt)
+    gmax = float(np.abs(ref["grad"]).max())
+    if loss_scale is None:     # largest power of two keeping every activation gradient and LoRA gradient below 2^12
+        loss_scale = float(2.0 ** np.floor(np.log2(1024.0 / max(gmax, max(ref["dh_max"])))))
+    print(f"[ttt] torch float64: loss {ref['loss']:.6f}; max |dL/dLoRA| {gmax:.3e}; max |dL/dh| per layer "
+          f"{' '.join(f'{v:.1e}' for v in ref['dh_max'])}; loss scale {loss_scale:g}")
+    ref["w0"] = lora.astype(np.float64)
+    app = _app(HERE / "ttt_app")
+    dl = tuple(L for L in dump_layers if L < layers)
+    mlir, pre, info = TT.emit_ttt(W, layers, True, lora, lr=lr, opt=opt, loss_scale=loss_scale, nsamples=nsamples, profile=profile,
+                                  dump_layers=dl, x_in=x0, target=tgt)
+    r = _build_and_run(app, mlir, pre, 48 * 3600, app / "run.log")
+    ok = r["ok"]
+    print(f"{'PASS' if ok else 'FAIL'} ttt expert layers={layers} opt={opt} lr={lr} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[sh_"):
+            print("     " + ln)
+    tm = timing(r["stdout"])
+    agg: dict = {}
+    for t, dt in tm:
+        k = re.sub(r"\d+$", "", t)
+        agg.setdefault(k, [0, 0]); agg[k][0] += dt; agg[k][1] += 1
+    for k, (t, n) in agg.items():
+        print(f"     time {k:<8} {t / 1e3:10.1f} us  ({n} x {t / n / 1e3:.1f})")
+    got = parse_all(r["stdout"])
+    if "V" in got:
+        cmp("V", got["V"], ref["v"], 5e-2)
+    if "LOSS" in got:
+        lr_ = np.zeros((TT.S, 1))
+        dev = sum(v for _, _, v in got["LOSS"]) / len(got["LOSS"]) * TT.S / (TT.S * TT.AD)
+        print(f"     loss (device, sampled rows) ~{dev:.6f} vs torch {ref['loss']:.6f}")
+        del lr_
+    ok &= _grad_report(got, ref, dl, loss_scale, lr, 5e-2)
+    return ok
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("test", choices=["ops", "layer", "expert", "reduce"])
@@ -142,11 +190,17 @@ if __name__ == "__main__":
     ap.add_argument("--nsamples", type=int, default=128)
     ap.add_argument("--opt", default="sgd")
     ap.add_argument("--lr", type=float, default=1e-2)
+    ap.add_argument("--npz", default="/app/models/smolvla_base/expert.npz")
+    ap.add_argument("--layers", type=int, default=16)
+    ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--loss-scale", type=float)
     a = ap.parse_args()
     if a.test == "ops":
         ok = run_ops(a.seed, a.nsamples)
     elif a.test == "layer":
         ok = run_layer(a.seed, a.nsamples, a.opt, a.lr)
+    elif a.test == "expert":
+        ok = run_expert(a.npz, a.layers, a.nsamples, a.opt, a.lr, a.profile, a.seed, a.loss_scale)
     else:
         raise SystemExit("not yet")
     sys.exit(0 if ok else 1)

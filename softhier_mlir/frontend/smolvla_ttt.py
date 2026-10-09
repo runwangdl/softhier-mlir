@@ -114,7 +114,7 @@ class TProg(_Prog):
         self.op(f"softhier.scale %{x} -> %{y} {{scale = {s!r} : f32, {self.cl}}} : {self.T[x]} -> {self.T[y]}")
 
     def add(self, a, b, y):
-        self.op(f"softhier.add %{a}, %{b} -> %{y} {{{self.cl}}} : {self.T[a]}, {self.T[b]} -> {self.T[y]}")
+        self.op(f"softhier.add %{a}, %{b} -> %{y} {{train, {self.cl}}} : {self.T[a]}, {self.T[b]} -> {self.T[y]}")
 
     def rms(self, x, g, y):
         self.op(f"softhier.rmsnorm %{x}, %{g} -> %{y} {{eps = {RMS_EPS:.1e} : f32, {self.cl}}} : {self.T[x]}, {self.T[g]} -> {self.T[y]}")
@@ -176,15 +176,15 @@ def _layer_fwd(P: TProg, kind: str, sl: dict, nxt_hin: str, W: dict, Lw: dict, k
         op(f"softhier.cross_attention %{sl['q']}, %{kv['kx']}, %{kv['vx']} mask %tok -> %{sl['o']} "
            f"{{train, scale = {SCALE!r} : f32, heads = {H} : i32, kv_heads = {HKV} : i32, {cl}}} : {T[sl['q']]}, {T[kv['kx']]}, {T[kv['vx']]} "
            f"mask {T['tok']} -> {T[sl['o']]}")
-    P.copy(sl["hin"], sl["h1"])                                   # h1 = h + o Wo + LoRA: the residual seeds the GEMM
-    P.g(sl["o"], W["wo"], sl["h1"], E.TILES["o"], acc=True)
-    P.lora_fwd(sl["o"], Lw["ao"], Lw["bo"], sl["h1"], sl["to"], DQ)
+    P.g(sl["o"], W["wo"], "ao", E.TILES["o"])
+    P.lora_fwd(sl["o"], Lw["ao"], Lw["bo"], "ao", sl["to"], DQ)
+    P.add(sl["hin"], "ao", sl["h1"])
     P.rms(sl["h1"], W["g2"], "xn2")
     P.g("xn2", W["wgu"], sl["gu"], E.TILES["gu"])
     op(f"softhier.silu_mul %{sl['ga']}, %{sl['up']} -> %{sl['m']} {{{cl}}} : {T[sl['ga']]}, {T[sl['up']]} -> {T[sl['m']]}")
-    P.copy(sl["h1"], nxt_hin)
-    P.g(sl["m"], W["wd"], nxt_hin, E.TILES["d"], acc=True)
-    P.lora_fwd(sl["m"], Lw["ad"], Lw["bd"], nxt_hin, sl["td"], 512)
+    P.g(sl["m"], W["wd"], "ao", E.TILES["d"])
+    P.lora_fwd(sl["m"], Lw["ad"], Lw["bd"], "ao", sl["td"], 512)
+    P.add(sl["h1"], "ao", nxt_hin)
 
 
 def _layer_bwd(P: TProg, kind: str, sl: dict, W: dict, Lw: dict, Gw: dict, kv: dict, dh_out: str, dh_in: str, marks: bool = False, pidx=None):
@@ -280,7 +280,7 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     N = layers * LAYER_N
     rows = N // ARENA_COLS
     # ---- buffers: activations shared between layers, backward scratch, LoRA arenas, tables, weights, slabs
-    for nm, r, c in [("xn2", S, D), ("dhB", S, D)]:
+    for nm, r, c in [("xn2", S, D), ("ao", S, D), ("dhB", S, D)]:
         P.B(nm, r, c)
     P.B("dhA", S, D, None if head else (dh_in.astype(np.float32) * loss_scale).astype(np.float16))
     _bwd_buffers(P)
@@ -406,7 +406,7 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     P.mark("opt")
     # ---- dumps (after the timed region where possible: they read buffers nothing writes later)
     if head:
-        P.dump("vt", 0, "V", all_=True)
+        P.dumps("vt", 3, "V", n=512)
         P.dumps("lrows", 5, "LOSS", n=64)
     for L in dump_layers:
         for i, (nm, r, c) in enumerate(LORA):
@@ -493,6 +493,7 @@ def torch_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: floa
         h = e1 @ t(Wt["wto"]) + t(Wt["bto"])
     else:
         h = t(h_in)
+    hs = []
     for L in range(layers):
         g = lambda nm: t(Wt[f"{nm}{L}"])  # noqa: E731
         xn = rms(h, g("g1"))
@@ -509,6 +510,7 @@ def torch_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: floa
         gu = rms(h1, g("g2")) @ g("wgu")
         m = torch.nn.functional.silu(gu[:, :FF]) * gu[:, FF:]
         h = h1 + m @ g("wd") + LS * (m @ lv(L, "ad")) @ lv(L, "bd")
+        h.retain_grad(); hs.append(h)
     out = {}
     if head:
         v = rms(h, t(Wt["gf"])) @ t(Wt["wout"]) + t(Wt["bout"])
@@ -520,6 +522,7 @@ def torch_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: floa
     loss.backward()
     gr = lora.grad.detach().numpy()
     out["grad"] = gr
+    out["dh_max"] = [float(x.grad.abs().max()) for x in hs]          # |dL/dh| after each layer (loss-scale choice)
     w = lora16.astype(np.float64)
     if opt == "adam":
         m_, v_ = 0.1 * gr, 0.001 * gr * gr

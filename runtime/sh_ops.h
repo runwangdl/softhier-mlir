@@ -279,6 +279,8 @@ int sh_t_attention_bwd_head(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, u
 int sh_t_attention_fwd(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64_t vo, uint64_t tok, uint64_t o,
                        uint32_t Sq, uint32_t Lp, uint32_t So, uint32_t H, uint32_t Hkv, uint32_t dh,
                        uint32_t ldq, uint32_t ldkp, uint32_t ldvp, uint32_t ldko, uint32_t ldvo, uint32_t ldo, float scale, uint32_t cluster);
+/* y = a + b with per-operand leading dims (fp16 SIMD on the multi-stream driver; cols % 4 == 0) */
+void sh_t_add(uint64_t y, uint64_t a, uint64_t b, uint32_t rows, uint32_t cols, uint32_t ldy, uint32_t lda, uint32_t ldb, uint32_t cluster);
 /* dst = src (HBM rows, 1-D DMA on the DM cores, rows dealt over the clusters for SH_ALL) */
 void sh_t_copy(uint64_t dst, uint64_t src, uint32_t rows, uint32_t cols, uint32_t ldd, uint32_t lds, uint32_t cluster);
 uint32_t sh_t_attention_bwd_l1_bytes(uint32_t Sq, uint32_t L, uint32_t So, uint32_t dh);

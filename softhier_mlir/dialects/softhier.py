@@ -369,7 +369,7 @@ class GeluOp(IRDLOperation):
 
 @irdl_op_definition
 class AddOp(IRDLOperation):
-    """``y = a + b`` elementwise."""
+    """``y = a + b`` elementwise (unit attribute ``train``: ``sh_t_add``, the training library's kernel)."""
     name = "softhier.add"
     a = operand_def(MemRefType)
     b = operand_def(MemRefType)
