@@ -506,22 +506,35 @@ EXPERT_OP_US = {
 EXPERT_LAYER_OPS = ("attn", "gateup", "down", "silu", "qkv", "oproj", "rope")
 
 
-def expert_step_est(nb: int, layers: int = 16) -> dict:
+# The same per-op table with every step GEMM as sh_gemm_xmcast_ex (emit_flow(gemm="xmcast"), docs/XPANEL_MCAST.md):
+# 16-layer runs, N = 1 (10 steps) and N = 4 (3 steps), 2026-10-09. Attention / silu / rope are unchanged by construction.
+EXPERT_OP_US_XMCAST = {
+    1: {"attn": 238.9, "gateup": 90.7, "down": 53.0, "silu": 78.5, "qkv": 57.7, "oproj": 32.4, "rope": 22.5, "emb": 116.1, "step": 44.3},
+    4: {"attn": 813.9, "gateup": 155.8, "down": 80.1, "silu": 257.9, "qkv": 115.5, "oproj": 53.0, "rope": 59.2, "emb": 223.7, "step": 107.0},
+}
+
+
+def expert_step_est(nb: int, layers: int = 16, gemm: str = "tiles") -> dict:
     """Per flow step of the expert with nb candidates: cycles (1 GHz) from the measured per-op table, the
-    attention / GEMM / row-op split, HBM bytes (expert_step_traffic) and per-candidate figures."""
-    pts = sorted(EXPERT_OP_US)
+    attention / GEMM / row-op split, HBM bytes (expert_step_traffic) and per-candidate figures.
+    gemm="xmcast": the X-multicast step GEMMs (measured at N = 1 and 4; linear in between, scaled beyond)."""
+    tab = EXPERT_OP_US_XMCAST if gemm.startswith("xmcast") else EXPERT_OP_US
+    pts = sorted(tab)
     lo = max(p for p in pts if p <= nb) if nb >= pts[0] else pts[0]
     hi = min((p for p in pts if p >= nb), default=pts[-1])
     w = 0.0 if hi == lo else (nb - lo) / (hi - lo)
-    us = {k: EXPERT_OP_US[lo][k] + w * (EXPERT_OP_US[hi][k] - EXPERT_OP_US[lo][k]) for k in EXPERT_OP_US[1]}
+    us = {k: tab[lo][k] + w * (tab[hi][k] - tab[lo][k]) for k in tab[1]}
     if nb > pts[-1]:
-        us = {k: EXPERT_OP_US[pts[-1]][k] * nb / pts[-1] for k in us}     # beyond the table: linear in N (row-op bound)
+        us = {k: tab[pts[-1]][k] * nb / pts[-1] for k in us}     # beyond the table: linear in N (row-op bound)
+        if tab is EXPERT_OP_US_XMCAST:   # extrapolated: only the GEMMs scale from N = 4; every other op as measured at nb
+            base = expert_step_est(nb, layers)["us"]
+            us = {k: (us[k] if k in ("gateup", "down", "qkv", "oproj", "emb") else base[k]) for k in us}
     split = {"attention": layers * us["attn"],
              "gemm": layers * (us["gateup"] + us["down"] + us["qkv"] + us["oproj"]),
              "rowops": layers * (us["silu"] + us["rope"]) + us["emb"] + us["step"]}
     tot = sum(split.values())
-    tr = expert_step_traffic(nb, layers)
-    return {"cycles": tot * 1e3, "split_us": split, "hbm_bytes": tr["total"], "traffic": tr,
+    tr = expert_step_traffic(nb, layers, gemm=gemm)
+    return {"cycles": tot * 1e3, "split_us": split, "us": us, "hbm_bytes": tr["total"], "traffic": tr,
             "per_cand_cycles": tot * 1e3 / nb, "per_cand_bytes": tr["total"] / nb}
 
 
