@@ -40,14 +40,21 @@ def kind(src: int, dst: int) -> str:
     return "local"
 
 
+_TRACE_START = re.compile(r"^(.*?)(\d+)000: \2: ")     # a trace line "<t>000: <t>: [...]", possibly after program chars
+_MARK = re.compile(r"\[mark\] (\S+?) (\d+)")
+
+
 def parse(stdout: str):
-    """-> (marks [(tag, ns)], txns [(end_ns, kind, bytes)])"""
-    marks, txns = [], []
+    """-> (marks [(tag, ns)], txns [(end_ns, kind, bytes)]). With traces on, gvsoc interleaves the program's printf output
+    character-wise with the trace lines (the program's characters end up in front of trace lines); the program stream is
+    reassembled from those fragments before the marks are read."""
+    prog, txns = [], []
     for ln in stdout.splitlines():
-        if ln.startswith("[mark] "):
-            _, tag, c = ln.split()
-            marks.append((tag, int(c)))
+        m = _TRACE_START.match(ln)
+        if not m:
+            prog.append(ln + "\n")
             continue
+        prog.append(m[1])
         if "[iDMA] Finished" not in ln:
             continue
         ln = _ANSI.sub("", ln)
@@ -57,6 +64,7 @@ def parse(stdout: str):
             src, dst, size = int(t[2], 16), int(t[3], 16), int(t[5], 16)
             reps = int(t[4], 16) if t[1] == "2D" else 1
             txns.append((t1, kind(src, dst), size * reps))
+    marks = [(t, int(c)) for t, c in _MARK.findall("".join(prog))]
     return marks, txns
 
 

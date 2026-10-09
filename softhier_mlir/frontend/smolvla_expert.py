@@ -394,7 +394,7 @@ def _layer_ops(P: _Prog, L_tag: str, kind: str, names: dict, step=None, fmt_step
     def G(x, w, z, fam):
         if "fp8" in flow:
             table, mode = flow["fp8"]
-            P.gemm_step(x, names[w], names[w + "8"], names.get(w + "q", names[w]), names[w + "k"], z, *tiles[fam], step, table, mode)
+            P.gemm_step(x, names[w], names.get(w + "8", names[w]), names.get(w + "q", names[w]), names[w + "k"], z, *tiles[fam], step, table, mode)
         else:
             P.gemm(x, names[w], z, *tiles[fam], step=step, fmt_steps=fmt_steps)
 
@@ -658,25 +658,30 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     SELF = [("wqkv", D, DQ + 2 * DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D)]
     CROSS = [("wq", D, DQ), ("wkx", DKV, DKV), ("wvx", DKV, DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D),
              ("kx", LP, DKV), ("vx", LP, DKV)]
-    # fp8 steps (docs/FLOW_DATAFLOW.md): per layer GEMM weight an e4m3 byte copy <w>8, its k = 8 + e_w (<w>k, int16) and,
-    # for mode 2, the host-expanded fp16 copy <w>q
+    # fp8 steps (docs/FLOW_DATAFLOW.md): per layer GEMM weight its k = 8 + e_w (<w>k, int16) and either the e4m3 byte
+    # copy <w>8 (modes 0 / 1) or the host-expanded fp16 copy <w>q (mode 2). They live in a second parameter region in the
+    # south HBM edge (offset 768 MB; the flex_cluster map has HBM channels only on the west [0, 256 MB) and south
+    # [768 MB, 1 GB) edges with hbm_chan_placement (4, 0, 0, 4)), with their own per-pair stride.
     f8 = {}
+    R2, R2_END = 0x30000000, 0x40000000
     if fp8_mode is not None:
         from softhier_mlir.frontend import fp8 as F8
         q8 = quantize_expert(W, layers)
         for spec in (SELF, CROSS):
             for nm, r, c in list(spec):
                 if nm in FP8_FAMILIES:
-                    spec.append((nm + "8", r, c)); spec.append((nm + "k", 1, 32))
-                    f8[nm + "8"], f8[nm + "k"] = (nm, "code"), (nm, "kexp")
+                    spec.append((nm + "k", 1, 32)); f8[nm + "k"] = (nm, "kexp")
                     if fp8_mode == 2:
                         spec.append((nm + "q", r, c)); f8[nm + "q"] = (nm, "wq")
-    pair0, stride = {}, 0
+                    else:
+                        spec.append((nm + "8", r, c)); f8[nm + "8"] = (nm, "code")
+    pair0, stride, cur2, stride_of = {}, 0, R2, {}
     for p in range(layers // 2):
-        begin = P.e.next_off
+        begin, begin2 = P.e.next_off, cur2
         for L, spec, sfx in ((2 * p, SELF, "s"), (2 * p + 1, CROSS, "c")):
             for nm, r, c in spec:
                 if nm in f8:
+                    keep, P.e.next_off = P.e.next_off, cur2
                     fam, what = f8[nm]
                     code, e_w = q8[f"{fam}{L}"]
                     if what == "code":
@@ -685,12 +690,18 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
                         off = P.slot_raw(f"{nm}_{sfx}", r, c, np.full((1, 32), 8 + e_w, np.int16), "i16")
                     else:
                         off = P.slot(f"{nm}_{sfx}", r, c, F8.w_prime(code))
+                    cur2, P.e.next_off = P.e.next_off, keep
+                    stride_of[f"{nm}_{sfx}"] = "r2"
                 else:
                     off = P.slot(f"{nm}_{sfx}", r, c, W.get(f"{nm}{L}"))
                 if p == 0:
                     pair0[f"{nm}_{sfx}"] = off
         if p == 0:
-            stride = P.e.next_off - begin
+            stride, stride2 = P.e.next_off - begin, cur2 - begin2
+    stride_of = {k: stride2 for k in stride_of}
+    assert P.e.next_off <= 0x10000000 and cur2 <= R2_END, ("HBM image does not fit the west / south regions", P.e.next_off, cur2)
+    if f8:
+        P.e.next_off = cur2        # the sentinel must be the image's last (highest) segment
     sent = sentinel_array(); P.B("sentinel", *sent.shape, sent)
     op(f"softhier.preload_wait %sentinel : {T['sentinel']}")
     op("%c0 = arith.constant 0 : index"); op("%c1 = arith.constant 1 : index"); op("%c2 = arith.constant 2 : index")
@@ -703,7 +714,7 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
             if nm in kvoff:   # prefix K / V of layer 2p (self) or 2p + 1 (cross) in the VLM's KV region
                 op(f"%{nm} = softhier.hbm_buffer %p {{offset = {kvoff[nm]} : i32, stride = {2 * kv_stride} : i32}} : {T[nm]}")
             else:
-                op(f"%{nm} = softhier.hbm_buffer %p {{offset = {pair0[nm]} : i32, stride = {stride} : i32}} : {T[nm]}")
+                op(f"%{nm} = softhier.hbm_buffer %p {{offset = {pair0[nm]} : i32, stride = {stride_of.get(nm, stride)} : i32}} : {T[nm]}")
     P.mark("start")
     # once per chunk: the cross layers' prefix KV through their 320 -> 320 k/v projections (step-invariant)
     if layers:

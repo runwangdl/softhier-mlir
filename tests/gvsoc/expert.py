@@ -52,7 +52,12 @@ def _build_and_run(app: Path, mlir: str, pre: dict, timeout: int, log: Path | No
 def marks_seq(stdout: str) -> list[tuple[str, int]]:
     """[(tag, ns since the first mark)] in order, unwrapping the 32-bit mcycle."""
     out, prev, acc = [], None, 0
-    for ln in stdout.splitlines():
+    if "[iDMA] Finished" in stdout:      # traced run: program output interleaved with trace lines (tests/gvsoc/dma_bytes.py)
+        from tests.gvsoc.dma_bytes import parse
+        lines = [f"[mark] {t} {c}" for t, c in parse(stdout)[0]]
+    else:
+        lines = stdout.splitlines()
+    for ln in lines:
         if ln.startswith("[mark] "):
             _, tag, c = ln.split()
             c = int(c)
