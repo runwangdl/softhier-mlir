@@ -1,7 +1,7 @@
 // RUN: softhier-translate %s | filecheck %s
 // SmolVLA action-expert ops: rmsnorm / rope lower to the sh_llm kernels, silu_mul to sh_silu_mul (equal leading dims) or
 // sh_x_silu_mul (strided views, plain SiLU), axpy / cross_attention (prefix KV + optional own causal keys + optional
-// i16 token-class mask) to the sh_x_* calls; a gemm with `step` + `fmt_steps` picks the
+// i16 token-class mask; n_batch = N candidate blocks with per-block causal own keys -> sh_x_attention_n) to the sh_x_* calls; a gemm with `step` + `fmt_steps` picks the
 // RedMulE format per loop iteration (flow-matching steps of different precision); dump_all prints a whole tensor.
 builtin.module {
   func.func @expert() {
@@ -37,6 +37,9 @@ builtin.module {
           own memref<50x320xf16, strided<[1600, 1], offset: 960>, "hbm_west">, memref<50x320xf16, strided<[1600, 1], offset: 1280>, "hbm_west"> mask memref<1x241xi16, "hbm_west"> -> memref<50x960xf16, "hbm_west">
     softhier.cross_attention %q, %kp, %vp -> %o {scale = 0.125 : f32, heads = 15 : i32, kv_heads = 5 : i32, cluster = 2 : i32}
         : memref<50x960xf16, strided<[1600, 1], offset: 0>, "hbm_west">, memref<241x320xf16, "hbm_west">, memref<241x320xf16, "hbm_west"> -> memref<50x960xf16, "hbm_west">
+    softhier.cross_attention %q, %kp, %vp own %k, %vv mask %m -> %o {scale = 0.125 : f32, heads = 15 : i32, kv_heads = 5 : i32, n_batch = 2 : i32, cluster = -1 : i32}
+        : memref<50x960xf16, strided<[1600, 1], offset: 0>, "hbm_west">, memref<241x320xf16, "hbm_west">, memref<241x320xf16, "hbm_west">
+          own memref<50x320xf16, strided<[1600, 1], offset: 960>, "hbm_west">, memref<50x320xf16, strided<[1600, 1], offset: 1280>, "hbm_west"> mask memref<1x241xi16, "hbm_west"> -> memref<50x960xf16, "hbm_west">
     %ga = softhier.view %gu : memref<50x4096xf16, "hbm_west"> -> memref<50x2048xf16, strided<[4096, 1], offset: 0>, "hbm_west">
     %up = softhier.view %gu : memref<50x4096xf16, "hbm_west"> -> memref<50x2048xf16, strided<[4096, 1], offset: 2048>, "hbm_west">
     softhier.silu_mul %ga, %up -> %mm {cluster = -1 : i32} : memref<50x2048xf16, strided<[4096, 1], offset: 0>, "hbm_west">, memref<50x2048xf16, strided<[4096, 1], offset: 2048>, "hbm_west"> -> memref<50x2048xf16, "hbm_west">
@@ -56,6 +59,7 @@ builtin.module {
 // CHECK: sh_rope((hb4 + 1920), (hb4 + 1920), hb6, 50, 320, 1600, 64, 64, SH_ALL);
 // CHECK: sh_x_attention(hb4, hb7, hb8, (hb4 + 1920), (hb4 + 2560), hb9, hb10, 50, 241, 50, 15, 5, 64, 1600, 320, 320, 1600, 1600, 960, 0.125f, SH_ALL);
 // CHECK: sh_x_attention(hb4, hb7, hb8, 0, 0, 0, hb10, 50, 241, 0, 15, 5, 64, 1600, 320, 320, 0, 0, 960, 0.125f, 2);
+// CHECK: sh_x_attention_n(hb4, hb7, hb8, (hb4 + 1920), (hb4 + 2560), hb9, hb10, 25, 241, 25, 2, 15, 5, 64, 1600, 320, 320, 1600, 1600, 960, 0.125f, SH_ALL);
 // CHECK: sh_x_silu_mul(hb12, hb11, (hb11 + 4096), 50, 2048, 2048, 4096, 4096, SH_ALL);
 // CHECK: sh_silu_mul(hb11, hb11, (hb11 + 4096), 50, 2048, 4096, SH_ALL);
 // CHECK: sh_x_silu_mul(hb3, hb3, 0, 50, 720, 720, 720, 0, 0);

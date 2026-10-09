@@ -124,6 +124,27 @@ def pack(c: Cfg, sd: dict, posterior: bool = True) -> tuple[np.ndarray, dict[str
     return blob, off
 
 
+
+def entry_shapes(c: Cfg) -> dict[str, tuple[int, ...]]:
+    """shape of every blob entry (TABLE order)"""
+    S, D, Hd, U = c.S, c.deter, c.hidden, c.units
+    sh = {"w_in": (S + c.AP, Hd), "g_in": (Hd,), "b_in": (Hd,), "w_g": (Hd + D, 3 * D), "g_g": (3 * D,), "b_g": (3 * D,),
+          "w_io": (D, Hd), "g_io": (Hd,), "b_io": (Hd,), "w_is": (Hd, S), "b_is": (S,), "w_a1": (S + D, U), "g_a1": (U,),
+          "b_a1": (U,), "w_a2": (U, U), "g_a2": (U,), "b_a2": (U,), "w_ao": (U, c.AO), "b_ao": (c.AO,),
+          "w_e1": (c.OP, U), "g_e1": (U,), "b_e1": (U,), "w_e2": (U, U), "g_e2": (U,), "b_e2": (U,),
+          "w_oo": (D + U, Hd), "g_oo": (Hd,), "b_oo": (Hd,), "w_os": (Hd, S), "b_os": (S,)}
+    return sh
+
+
+def pack_bytes(c: Cfg, posterior: bool = True) -> int:
+    """size of pack()'s blob without building it"""
+    cur = 128
+    for name, shp in entry_shapes(c).items():
+        if not posterior and name in POSTERIOR_ONLY:
+            continue
+        cur += (int(np.prod(shp)) * 2 + 63) & ~63
+    return cur
+
 # ----------------------------------------------------------------------------- numpy twins
 def _r16(a):
     return np.asarray(a, np.float32).astype(np.float16).astype(np.float32)

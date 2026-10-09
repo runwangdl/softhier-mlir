@@ -365,6 +365,133 @@ def params_from_json(path: str) -> CostParams:
     return prm
 
 
+# ----------------------------------------------------------------------------------------
+# world-model kernels (docs/WORLD_MODEL.md): SmolVLA expert with N candidate chunks, on-chip RSSM
+# ----------------------------------------------------------------------------------------
+def gemm_traffic(M: int, N: int, K: int, tm: int, tn: int, tk: int) -> dict:
+    """HBM bytes of one sh_gemm (no accumulate): every output tile streams its X row panel and W column panel."""
+    MT, NT = M // tm, N // tn
+    return {"x": NT * M * K * ELEM, "w": MT * K * N * ELEM, "z": M * N * ELEM}
+
+
+def expert_step_traffic(nb: int = 1, layers: int = 16, tiles: dict | None = None) -> OrderedDict:
+    """HBM bytes per flow step of the SmolVLA expert program (frontend.smolvla_expert.emit_flow) with nb candidate
+    chunks (S_q = 50 nb): weights (W panels), activations through the GEMMs (X panels, Z), attention staging
+    (q, prefix K/V per query head, own K/V, o) and the row ops (rmsnorm / rope / silu_mul / adds / embedding / tail).
+    The prefix K/V and the weights do not grow with nb; everything else does."""
+    from softhier_mlir.frontend import smolvla_expert as E
+    t = E.batch_tiles(nb, tiles or E.TILES)
+    R, D, DQ, DKV, FF, AD, LP, H, DH = E.S * nb, E.D, E.DQ, E.DKV, E.FF, E.AD, E.LP, E.H, E.DH
+    out = OrderedDict((k, 0) for k in ("weights", "gemm_act", "attn_kv", "attn_qo", "rowops"))
+
+    def gm(M, N, K, fam):
+        tr = gemm_traffic(M, N, K, *t[fam])
+        out["weights"] += tr["w"]; out["gemm_act"] += tr["x"] + tr["z"]
+
+    def rows(nread, nwrite, cols, params=0):
+        out["rowops"] += (nread + nwrite) * R * cols * ELEM + params * cols * ELEM
+
+    gm(R, D, AD, "a"); gm(R, D, D, "t"); gm(R, D, D, "t")                      # suffix embedding
+    rows(1, 1, D, 1); rows(1, 1, D, 1); rows(1, 1, D); rows(1, 1, D, 1)        # 3 biases + SiLU
+    for L in range(layers):
+        self_l = L % 2 == 0
+        rows(1, 1, D, 1)                                                       # rmsnorm
+        gm(R, DQ + 2 * DKV if self_l else DQ, D, "qkv")
+        rows(1, 1, DQ, 0); out["rowops"] += R * DH * ELEM                      # rope q (+ table)
+        if self_l:
+            rows(1, 1, DKV, 0)                                                 # rope own k
+        # attention: per query head: q, prefix K + V (Lp rows of dh), own K + V (self), o; the token mask
+        own = 2 * R * DH * ELEM if self_l else 0
+        out["attn_kv"] += H * (2 * LP * DH * ELEM + LP * 2)
+        out["attn_qo"] += H * (2 * R * DH * ELEM + own)
+        gm(R, D, DQ, "o"); rows(2, 1, D)                                       # o_proj + residual
+        rows(1, 1, D, 1); gm(R, 2 * FF, D, "gu")                               # rmsnorm + gate/up
+        rows(2, 1, FF)                                                         # silu * up
+        gm(R, D, FF, "d"); rows(2, 1, D)                                       # down + residual
+    rows(1, 1, D, 1); gm(R, AD, D, "out"); rows(1, 1, AD, 1); rows(2, 1, AD)    # final norm, out proj, bias, axpy
+    out["total"] = sum(out.values())
+    return out
+
+
+# Per-op gvsoc time of the expert at full depth (us per layer call; emb / step per flow step; the GEMM entries include
+# their rmsnorm / residual add), 16 clusters, ideal HBM, 1 GHz, tests/gvsoc/expert.py flow --profile --cands N
+# (2026-10-08/09, docs/WORLD_MODEL.md). N = 1 and N = 4: 16-layer 10-step runs. N = 2 and N = 8: 4-layer 2-step runs
+# with their GEMM entries scaled by the 16-layer / 4-layer ratio measured at N = 1 and N = 4 (interpolated for
+# N = 2, the N = 4 ratio for N = 8; attention / silu / rope / emb / step agree within 1 % between the depths).
+# The analytic GEMM / row-op models above do not cover the expert's fused attention and the fetch-bound SIMD row
+# kernels, so the expert curve is this measured table (linear in N between the points).
+EXPERT_OP_US = {
+    1: {"attn": 242.0, "gateup": 96.0, "down": 66.0, "silu": 78.0, "qkv": 64.0, "oproj": 41.0, "rope": 22.0, "emb": 143.0, "step": 42.0},
+    2: {"attn": 432.1, "gateup": 124.9, "down": 101.3, "silu": 138.2, "qkv": 95.5, "oproj": 61.0, "rope": 33.5, "emb": 200.7, "step": 59.7},
+    4: {"attn": 813.8, "gateup": 187.7, "down": 184.0, "silu": 257.9, "qkv": 169.3, "oproj": 109.3, "rope": 59.1, "emb": 319.9, "step": 100.1},
+    8: {"attn": 1584.3, "gateup": 311.0, "down": 326.9, "silu": 750.5, "qkv": 305.9, "oproj": 189.3, "rope": 112.4, "emb": 562.5, "step": 179.8},
+}
+EXPERT_LAYER_OPS = ("attn", "gateup", "down", "silu", "qkv", "oproj", "rope")
+
+
+def expert_step_est(nb: int, layers: int = 16) -> dict:
+    """Per flow step of the expert with nb candidates: cycles (1 GHz) from the measured per-op table, the
+    attention / GEMM / row-op split, HBM bytes (expert_step_traffic) and per-candidate figures."""
+    pts = sorted(EXPERT_OP_US)
+    lo = max(p for p in pts if p <= nb) if nb >= pts[0] else pts[0]
+    hi = min((p for p in pts if p >= nb), default=pts[-1])
+    w = 0.0 if hi == lo else (nb - lo) / (hi - lo)
+    us = {k: EXPERT_OP_US[lo][k] + w * (EXPERT_OP_US[hi][k] - EXPERT_OP_US[lo][k]) for k in EXPERT_OP_US[1]}
+    if nb > pts[-1]:
+        us = {k: EXPERT_OP_US[pts[-1]][k] * nb / pts[-1] for k in us}     # beyond the table: linear in N (row-op bound)
+    split = {"attention": layers * us["attn"],
+             "gemm": layers * (us["gateup"] + us["down"] + us["qkv"] + us["oproj"]),
+             "rowops": layers * (us["silu"] + us["rope"]) + us["emb"] + us["step"]}
+    tot = sum(split.values())
+    tr = expert_step_traffic(nb, layers)
+    return {"cycles": tot * 1e3, "split_us": split, "hbm_bytes": tr["total"], "traffic": tr,
+            "per_cand_cycles": tot * 1e3 / nb, "per_cand_bytes": tr["total"] / nb}
+
+
+# On-chip RSSM (runtime/sh_wm.inc.c). Row-kernel costs fitted on gvsoc (2026-10-08, tests/gvsoc/wm.py): cycles per
+# output element of the cluster, independent of the rows per cluster from 8 to 32 (fetch-bound cores, SIMULATOR_NOTES #7).
+WM_ELEM = {"ln": 11.0, "gru": 27.5, "softmax": 21.5}
+WM_HEAD_ROW = 64.0          # actor tanh head per row
+
+
+def wm_gemms(c, posterior: bool = False) -> list[tuple[int, int]]:
+    """(contraction, output columns) of the RedMulE calls of one RSSM step (frontend.wm_rssm.Cfg)."""
+    S, D, Hd, U = c.S, c.deter, c.hidden, c.units
+    g = [(S + c.AP, Hd), (Hd + D, 3 * D)]
+    g += [(D + U, Hd), (Hd, S)] if posterior else [(D, Hd), (Hd, S)]
+    if posterior:
+        g += [(c.OP, U), (U, U)]
+    g += [(S + D, U), (U, U), (U, c.AO)]
+    return g
+
+
+def wm_rssm_est(c, K: int, H: int, clusters: int = 1, arch: Arch | None = None, prm: CostParams | None = None,
+                posterior: bool = False) -> dict:
+    """Cycles of sh_wm_rssm: weight staging + H steps of the busiest cluster (ceil(K / clusters) rows); GEMMs with
+    redmule_cycles (m = rows), row kernels with the fitted per-element costs. No HBM traffic inside the steps."""
+    arch = arch or Arch()
+    prm = prm or CostParams()
+    m = math.ceil(K / clusters)
+    gemm = sum(redmule_cycles(arch, prm, m, k, n) + prm.dma_fixed + m * k * ELEM / prm.l1_zero_bw + 2 * prm.cluster_sync
+               for n, k in wm_gemms(c, posterior))
+    lncols = c.hidden * 3 + 3 * c.deter + c.units * 2 + (2 * c.units if posterior else 0)    # img_in, GRU, head, actor x2 (+ enc x2)
+    ln = WM_ELEM["ln"] * m * lncols
+    gru = WM_ELEM["gru"] * m * c.deter
+    sm = WM_ELEM["softmax"] * m * c.S
+    head = WM_HEAD_ROW * m
+    step = gemm + ln + gru + sm + head
+    from softhier_mlir.frontend.wm_rssm import pack_bytes
+    blob = pack_bytes(c, posterior)
+    load = dma_load(arch, prm, 1, blob // ELEM, clusters)
+    macs = K * H * _wm_macs(c, posterior)
+    return {"cycles": load + H * step, "load": load, "step": step, "gemm": gemm, "ln": ln, "gru": gru, "softmax": sm,
+            "head": head, "rows_per_cluster": m, "macs": macs, "mac_per_cycle": macs / (load + H * step)}
+
+
+def _wm_macs(c, posterior: bool) -> int:
+    return sum(n * k for n, k in wm_gemms(c, posterior))
+
+
 if __name__ == "__main__":
     import argparse
     from softhier_mlir.dse import workload as wlm
