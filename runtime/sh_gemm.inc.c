@@ -115,6 +115,7 @@ int sh_gemm(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t
     if (cluster == SH_ALL) flex_global_barrier_xy();
     return 0;
 }
+#ifndef SH_NO_GEMM_MESH   /* programs that never call it can drop it (64 KB instruction memory; see sh_ops_lean) */
 
 /* ---- mesh-wide output-stationary SUMMA ---------------------------------------------------------
  * Cluster (px,py) owns output tile Z[py*T .. , px*T ..] (T = tm = tn). Diagonal clusters load the
@@ -186,3 +187,4 @@ int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uin
     flex_global_barrier_xy();
     return 0;
 }
+#endif /* SH_NO_GEMM_MESH */

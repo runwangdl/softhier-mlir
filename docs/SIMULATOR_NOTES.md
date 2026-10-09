@@ -22,6 +22,16 @@ removed from `gvsoc-pulp` in 2026-01 and the public SDK (2026-06) only ships the
 
 | 11 | `Executing illegal instruction (pc: 0xc0059000 / 0x0 / 0x10 ...)` on `cluster_0/pe1` at a data address, late in a long program (the SmolVLA expert flow); the layer alone passes | not a model bug: the SDK start code (`flex_start.s`, `sll t0, a0, 0xa`) spaces the three harts' stacks **1 KB** apart in the 128 KB stack memory. The generated kernel function keeps one 64-bit address per HBM buffer (70+ spills) and core 0 then calls `sh_printf` (256 B buffer + vsnprintf) for marks / dumps: > 1 KB of stack, overrunning core 1's stack top and its saved return address (the pc is one of core 0's spilled buffer addresses) | `sh_call_on_core_stack` (`runtime/sh_rt.inc.c`): the generated `main` runs the inputs / kernel / checks phases on private per-core stacks of `SH_CORE_STACK_BYTES` (40 KB) carved from the top of the stack memory |
 
+Findings from the TTT backward work (docs/TTT.md, 2026-10-09), not patched:
+
+| # | Symptom | Root cause | Workaround |
+|---|---|---|---|
+| 12 | `Executing illegal instruction (pc: <memset / memcpy>, opcode: 0x...433d)` | the toolchain's newlib is built with the C extension; the cores do not execute compressed instructions. GCC calls `memset` / `memcpy` for struct zeroing (`= { 0 }`) and struct / compound-literal copies (always at -Os) | `runtime/sh_train.inc.c` defines plain-RV32 `memcpy` / `memset` (the linker takes them before libc's) |
+| 13 | in-network REDADD returns sum + garbage, but only after a few reductions in a run (constant per-cluster data: first rounds exact) | `floonoc_router.cpp collective_generate` / `floonoc.cpp process_collective_operations`: the pulled data are added INTO the root request's data buffer, which for a read is one of the iDMA AXI back-end's static read-burst buffers (`idma_be_axi.cpp`: `ARCH_IDMA_OUTSTAND_BURST` = 256 x 4 KB, FIFO-reused, never cleared); every intermediate router's kid copies that stale content too | `sh_t_red_flush`: read 256 x 4 KB from the cluster's zero memory (same AXI back-end) right before the reduction so its bursts hold zeros |
+| 14 | fp16 REDADD of 16 operands: rel-L2 1.0e-3 vs the exact sum (fp16 rounding of the exact sum: 2.1e-4) | `floonoc.cpp float_to_fp16` truncates the mantissa (and `fp16_to_float` reads subnormals as ~0), applied after every pairwise add | use it for gradients (their own error is ~1e-2); `sh_t_allreduce` mode 1 is exact (integer limbs) but core-bound |
+| - | a library function built with `__attribute__((optimize("Os")))` fails to link: `undefined reference to bare_dma_wait_all` | the SDK's `bare_dma_*` are C99 `inline` without `static`: -O3 always inlined them, -Os emits calls | `extern inline` declarations in the unity build emit the external definitions |
+| - | `--gc-sections` keeps `sh_gemm_mesh` (and what it calls) although nothing references it (4.5 KB of the 64 KB instruction memory) | not investigated | `SH_NO_GEMM_MESH` guard |
+
 Findings from the fused attention kernel (`runtime/sh_attention.inc.c`, 2026-10-08), not patched:
 
 | # | Symptom | Root cause | Workaround |

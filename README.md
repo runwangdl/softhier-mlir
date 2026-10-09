@@ -210,3 +210,14 @@ Ledger [`docs/SMOLVLA_E2E.md`](docs/SMOLVLA_E2E.md); 32-configuration cost table
 .venv/bin/python tests/gvsoc/run.py smolvla-e2e --npz /app/models/smolvla_base/e2e_c1_t256.npz --e2e-trace
 python -m softhier_mlir.dse.e2e_cost --collect
 ```
+
+### Test-time adaptation: one LoRA step on the action expert (backward on SoftHier)
+
+Backward primitives (`runtime/sh_train.inc.c`: rmsnorm / silu_mul / softmax / attention backward, transposed-operand
+GEMMs, MSE, SGD / Adam on fp32 masters, data-parallel REDADD gradient sum) and the full 16-layer TTT step with LoRA r=16
+on q / o / down, every gradient checked against float64 torch on gvsoc; numbers and the deployment gaps in
+[`docs/TTT.md`](docs/TTT.md).
+
+```bash
+.venv/bin/python tests/gvsoc/ttt.py ops | layer | expert --layers 16 --profile | reduce | dp --layers 4
+```

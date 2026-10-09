@@ -369,7 +369,7 @@ class GeluOp(IRDLOperation):
 
 @irdl_op_definition
 class AddOp(IRDLOperation):
-    """``y = a + b`` elementwise."""
+    """``y = a + b`` elementwise (unit attribute ``train``: ``sh_t_add``, the training library's kernel)."""
     name = "softhier.add"
     a = operand_def(MemRefType)
     b = operand_def(MemRefType)
@@ -493,7 +493,9 @@ class CrossAttentionOp(IRDLOperation):
     Each head runs inside one cluster's TCDM; ``cluster = -1`` deals head h to cluster h % P.
     ``n_batch = N``: the rows of ``q`` / ``ko`` / ``vo`` / ``o`` are N candidate blocks (N x Sq query tokens that
     share the prefix KV); candidate c's queries attend the prefix and, causally, only their own block c
-    (``sh_x_attention_n``, docs/WORLD_MODEL.md)."""
+    (``sh_x_attention_n``, docs/WORLD_MODEL.md). With the unit attribute ``train`` (single candidate) it lowers to
+    ``sh_t_attention_fwd`` (same result, the backward kernel's staging code: training programs keep one attention
+    implementation in the 64 KB instruction memory)."""
     name = "softhier.cross_attention"
     irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
     q = operand_def(MemRefType)
@@ -573,6 +575,202 @@ class MarkOp(IRDLOperation):
     assembly_format = "($index^)? attr-dict"
 
 
+# --------------------------------------------------------------------------- #
+# Training ops (test-time adaptation of a LoRA adapter; runtime/sh_train.inc.c, docs/TTT.md). Same conventions as
+# the HBM tensor ops; ``cluster = -2`` = the calling cluster (data-parallel programs: every cluster runs its own copy
+# on its own buffers, addressed with ``softhier.cluster_id``).
+# --------------------------------------------------------------------------- #
+@irdl_op_definition
+class ClusterIdOp(IRDLOperation):
+    """This cluster's id as an ``index`` (per-cluster buffers: ``softhier.hbm_buffer %cid {offset, stride}``)."""
+    name = "softhier.cluster_id"
+    result = result_def(IndexType)
+    assembly_format = "attr-dict `:` type($result)"
+
+
+@irdl_op_definition
+class GemmTransOp(IRDLOperation):
+    """``z (+)= op(x) op(w)`` with physically transposed operands: with ``trans_x`` ``x`` is stored as ``K x M``
+    (``x^T``), with ``trans_w`` ``w`` is stored as ``N x K``. RedMulE reads row-major operands only, so the library
+    first transposes each marked operand into ``scratch`` (HBM, ``(trans_x ? M K : 0) + (trans_w ? K N : 0)``
+    elements) and then runs the plain tiled GEMM (``sh_t_gemm_tr``). Tile / pipeline / accumulate / cluster attributes
+    as for ``softhier.gemm``."""
+    name = "softhier.gemm_t"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    w = operand_def(MemRefType)
+    z = operand_def(MemRefType)
+    scratch = operand_def(MemRefType)
+    assembly_format = "$x `,` $w `into` $z `scratch` $scratch attr-dict `:` type($x) `,` type($w) `,` type($z) `,` type($scratch)"
+
+
+@irdl_op_definition
+class RmsNormBwdOp(IRDLOperation):
+    """Backward of ``softhier.rmsnorm`` w.r.t. its input: ``dx = d rmsnorm(x, gamma) / dx ^T dy`` (+ ``res %dres``: the
+    residual stream's gradient added in the same pass). fp32 statistics."""
+    name = "softhier.rmsnorm_bwd"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    gamma = operand_def(MemRefType)
+    dy = operand_def(MemRefType)
+    dres = opt_operand_def(MemRefType)
+    dx = operand_def(MemRefType)
+    eps = prop_def(FloatAttr)
+    assembly_format = ("$x `,` $gamma `,` $dy (`res` $dres^)? `->` $dx attr-dict `:` type($x) `,` type($gamma) `,` type($dy) "
+                       "(`res` type($dres)^)? `->` type($dx)")
+
+
+@irdl_op_definition
+class SiluMulBwdOp(IRDLOperation):
+    """Backward of ``y = silu(a) * b``: ``da = dy b silu'(a)``, ``db = dy silu(a)`` (fp16 SIMD; strided views allowed)."""
+    name = "softhier.silu_mul_bwd"
+    irdl_options = (ParsePropInAttrDict(),)
+    a = operand_def(MemRefType)
+    b = operand_def(MemRefType)
+    dy = operand_def(MemRefType)
+    da = operand_def(MemRefType)
+    db = operand_def(MemRefType)
+    assembly_format = "$a `,` $b `,` $dy `->` $da `,` $db attr-dict `:` type($a) `,` type($b) `,` type($dy) `->` type($da) `,` type($db)"
+
+
+@irdl_op_definition
+class SoftmaxBwdOp(IRDLOperation):
+    """Backward of ``y = softmax(scale x)`` per row: ``dx = scale y (dy - rowdot(y, dy))``."""
+    name = "softhier.softmax_bwd"
+    irdl_options = (ParsePropInAttrDict(),)
+    y = operand_def(MemRefType)
+    dy = operand_def(MemRefType)
+    dx = operand_def(MemRefType)
+    scale = prop_def(FloatAttr)
+    assembly_format = "$y `,` $dy `->` $dx attr-dict `:` type($y) `,` type($dy) `->` type($dx)"
+
+
+@irdl_op_definition
+class MseGradOp(IRDLOperation):
+    """MSE loss gradient: ``dy = gscale (pred - tgt)`` (``gscale`` = 2 / numel x the loss scale); ``loss %l`` (rows x 1
+    f32): per-row sums of squares."""
+    name = "softhier.mse_grad"
+    irdl_options = (ParsePropInAttrDict(),)
+    pred = operand_def(MemRefType)
+    tgt = operand_def(MemRefType)
+    dy = operand_def(MemRefType)
+    loss = opt_operand_def(MemRefType)
+    gscale = prop_def(FloatAttr)
+    assembly_format = "$pred `,` $tgt `->` $dy (`loss` $loss^)? attr-dict `:` type($pred) `,` type($tgt) `->` type($dy) (`loss` type($loss)^)?"
+
+
+@irdl_op_definition
+class OptimStepOp(IRDLOperation):
+    """One optimizer step on a flat parameter arena: fp32 master ``w32`` (updated in place) and its fp16 copy ``w16``
+    (the forward's operand), gradient ``g`` (f16 or f32) times ``inv_scale``. ``kind = "sgd"``: ``w -= lr g``;
+    ``kind = "adam"`` with ``moments %m, %v`` (f32): bias corrections ``bc1 = 1 - b1^t``, ``bc2 = 1 - b2^t``."""
+    name = "softhier.optim_step"
+    irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
+    g = operand_def(MemRefType)
+    w32 = operand_def(MemRefType)
+    w16 = operand_def(MemRefType)
+    m = opt_operand_def(MemRefType)
+    v = opt_operand_def(MemRefType)
+    kind = prop_def(StringAttr)
+    lr = prop_def(FloatAttr)
+    inv_scale = prop_def(FloatAttr)
+    assembly_format = ("$g `,` $w32 `->` $w16 (`moments` $m^ `,` $v)? attr-dict `:` type($g) `,` type($w32) `->` type($w16) "
+                       "(`moments` type($m)^ `,` type($v))?")
+
+
+@irdl_op_definition
+class AttentionBwdOp(IRDLOperation):
+    """Backward of ``softhier.cross_attention`` (the prefix ``kp``/``vp`` are frozen): ``dq`` for every query head from
+    the forward's ``q``, ``o`` and the output gradient ``do``; with ``own %ko, %vo`` also ``grads %dko, %dvo`` (summed
+    over each kv group; ``scratch %s``: Sq x 2 heads dh per-head partials). Scores are recomputed in TCDM."""
+    name = "softhier.attention_bwd"
+    irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
+    q = operand_def(MemRefType)
+    kp = operand_def(MemRefType)
+    vp = operand_def(MemRefType)
+    ko = opt_operand_def(MemRefType)
+    vo = opt_operand_def(MemRefType)
+    mask = opt_operand_def(MemRefType)
+    o = operand_def(MemRefType)
+    do = operand_def(MemRefType)
+    dq = operand_def(MemRefType)
+    dko = opt_operand_def(MemRefType)
+    dvo = opt_operand_def(MemRefType)
+    scratch = opt_operand_def(MemRefType)
+    scale = prop_def(FloatAttr)
+    heads = prop_def(IntegerAttr)
+    kv_heads = prop_def(IntegerAttr)
+    assembly_format = ("$q `,` $kp `,` $vp (`own` $ko^ `,` $vo)? (`mask` $mask^)? `,` $o `,` $do `->` $dq "
+                       "(`grads` $dko^ `,` $dvo `scratch` $scratch)? attr-dict `:` type($q) `,` type($kp) `,` type($vp) "
+                       "(`own` type($ko)^ `,` type($vo))? (`mask` type($mask)^)? `,` type($o) `,` type($do) `->` type($dq) "
+                       "(`grads` type($dko)^ `,` type($dvo) `scratch` type($scratch))?")
+
+
+@irdl_op_definition
+class GradAllReduceOp(IRDLOperation):
+    """Data-parallel gradient sum over all clusters with the NoC's in-network REDADD: cluster c's gradients are the
+    ``src`` buffer shifted by ``c * src_stride`` bytes, ``dst`` receives the sum. ``mode = 0``: fp16 REDADD (dst f16);
+    ``mode = 1``: exact two-limb integer REDADD with one global power-of-two scale (dst f32, ``scal`` = 64 B scratch)."""
+    name = "softhier.grad_allreduce"
+    irdl_options = (ParsePropInAttrDict(),)
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    scal = operand_def(MemRefType)
+    src_stride = prop_def(IntegerAttr)
+    mode = prop_def(IntegerAttr)
+    assembly_format = "$src `->` $dst `,` $scal attr-dict `:` type($src) `->` type($dst) `,` type($scal)"
+
+
+@irdl_op_definition
+class LoraFwdOp(IRDLOperation):
+    """LoRA branch of a linear layer, accumulated into its output: ``y += s (x A) B`` with ``t = s x A`` (M x r) kept for
+    the backward (``sh_t_lora_fwd``; ``scale`` = s, ``tile_k`` = the K tile of x A)."""
+    name = "softhier.lora_fwd"
+    irdl_options = (ParsePropInAttrDict(),)
+    x = operand_def(MemRefType)
+    a = operand_def(MemRefType)
+    b = operand_def(MemRefType)
+    y = operand_def(MemRefType)
+    t = operand_def(MemRefType)
+    scale = prop_def(FloatAttr)
+    assembly_format = "$x `,` $a `,` $b `->` $y `,` $t attr-dict `:` type($x) `,` type($a) `,` type($b) `->` type($y) `,` type($t)"
+
+
+@irdl_op_definition
+class LinearBwdOp(IRDLOperation):
+    """Backward of ``y = x W`` (W: K x N, [in, out]) w.r.t. x, plus with ``lora %a, %b, %t, %x grads %da, %db`` the LoRA
+    ``y[:, :nl] += s (x A) B`` (nl = columns of B, ``t`` = the forward's s x A): ``dx = dy W^T + s (dy B^T) A^T``,
+    ``dB = t^T dy``, ``dA = s x^T (dy B^T)``. The frozen-weight product is formed transposed (``dx^T = W dy^T``) so W is
+    read in its stored layout; ``scratch`` holds the transposed activations (``sh_t_linear_bwd``). ``tile_m`` / ``tile_k``:
+    tiles of ``W dy^T`` (K and N)."""
+    name = "softhier.linear_bwd"
+    irdl_options = (ParsePropInAttrDict(), AttrSizedOperandSegments(as_property=True))
+    dy = operand_def(MemRefType)
+    w = operand_def(MemRefType)
+    a = opt_operand_def(MemRefType)
+    b = opt_operand_def(MemRefType)
+    t = opt_operand_def(MemRefType)
+    x = opt_operand_def(MemRefType)
+    da = opt_operand_def(MemRefType)
+    db = opt_operand_def(MemRefType)
+    dx = operand_def(MemRefType)
+    scratch = operand_def(MemRefType)
+    assembly_format = ("$dy `,` $w (`lora` $a^ `,` $b `,` $t `,` $x `grads` $da `,` $db)? `->` $dx `scratch` $scratch attr-dict `:` "
+                       "type($dy) `,` type($w) (`lora` type($a)^ `,` type($b) `,` type($t) `,` type($x) `grads` type($da) `,` type($db))? "
+                       "`->` type($dx) `scratch` type($scratch)")
+
+
+@irdl_op_definition
+class CopyOp(IRDLOperation):
+    """``dst = src`` for HBM tensors (strided views allowed): per-row 1-D DMA on the DM cores, rows dealt over the
+    clusters (``sh_t_copy``). Training programs seed an accumulating GEMM with it (residual / bias + x W)."""
+    name = "softhier.copy"
+    irdl_options = (ParsePropInAttrDict(),)
+    src = operand_def(MemRefType)
+    dst = operand_def(MemRefType)
+    assembly_format = "$src `->` $dst attr-dict `:` type($src) `->` type($dst)"
+
+
 SoftHier = Dialect(
     "softhier",
     [
@@ -614,6 +812,18 @@ SoftHier = Dialect(
         SiluMulOp,
         ScaleOp,
         PixelShuffleOp,
+        ClusterIdOp,
+        GemmTransOp,
+        RmsNormBwdOp,
+        SiluMulBwdOp,
+        SoftmaxBwdOp,
+        MseGradOp,
+        OptimStepOp,
+        AttentionBwdOp,
+        GradAllReduceOp,
+        LoraFwdOp,
+        LinearBwdOp,
+        CopyOp,
     ],
     [],
 )

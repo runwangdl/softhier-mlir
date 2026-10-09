@@ -58,6 +58,18 @@ from softhier_mlir.dialects.softhier import (
     SiluMulOp,
     ScaleOp,
     PixelShuffleOp,
+    ClusterIdOp,
+    GemmTransOp,
+    RmsNormBwdOp,
+    SiluMulBwdOp,
+    SoftmaxBwdOp,
+    MseGradOp,
+    OptimStepOp,
+    AttentionBwdOp,
+    GradAllReduceOp,
+    LoraFwdOp,
+    LinearBwdOp,
+    CopyOp,
 )
 
 _ELEM_BYTES = {"f16": 2, "bf16": 2, "f32": 4, "f64": 8, "i8": 1, "i16": 2, "i32": 4}
@@ -89,9 +101,14 @@ def _int_attr(op, name: str, default: int) -> int:
 
 
 def _cluster(op) -> str:
-    """The `cluster` attribute: -1 -> SH_ALL (split over all clusters), absent -> 0."""
+    """The `cluster` attribute: -1 -> SH_ALL (split over all clusters), -2 -> SH_SELF (the calling cluster), absent -> 0."""
     c = _int_attr(op, "cluster", 0)
-    return "SH_ALL" if c < 0 else str(c)
+    return "SH_SELF" if c == -2 else "SH_ALL" if c < 0 else str(c)
+
+
+def _float_attr(op, name: str, default: float) -> str:
+    a = op.attributes.get(name) or op.properties.get(name)
+    return _f(a) if isinstance(a, FloatAttr) else _f(default)
 
 
 def _f(x: FloatAttr | float) -> str:
@@ -127,6 +144,8 @@ class _Index:
         op = v.owner
         if isinstance(op, arith.ConstantOp):
             return str(op.value.value.data)
+        if isinstance(op, ClusterIdOp):
+            return "sh_cluster_id()"
         if isinstance(op, arith.AddiOp):
             return f"({self.expr(op.lhs)} + {self.expr(op.rhs)})"
         if isinstance(op, arith.SubiOp):
@@ -250,7 +269,7 @@ def _tagged(idx: _Index, tag: str, index) -> tuple[str, str]:
 
 def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
     for op in ops:
-        if isinstance(op, (L1BufferOp, func.ReturnOp, arith.ConstantOp, arith.AddiOp, arith.SubiOp, arith.MuliOp, arith.DivUIOp,
+        if isinstance(op, (L1BufferOp, ClusterIdOp, func.ReturnOp, arith.ConstantOp, arith.AddiOp, arith.SubiOp, arith.MuliOp, arith.DivUIOp,
                            arith.RemUIOp, scf.YieldOp)):
             continue
 
@@ -367,6 +386,11 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             rows, cols, ld, _ = bufs.geom(op.x)
             b(f"{ind}sh_gelu({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {rows}, {cols}, {ld}, {_cluster(op)});")
 
+        elif isinstance(op, AddOp) and "train" in op.attributes:
+            rows, cols, lda, _ = bufs.geom(op.a)
+            b(f"{ind}sh_t_add({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {bufs.geom(op.y)[2]}, {lda}, "
+              f"{bufs.geom(op.b)[2]}, {_cluster(op)});")
+
         elif isinstance(op, AddOp):
             rows, cols, ld, _ = bufs.geom(op.a)
             b(f"{ind}sh_add({bufs.haddr(op.y)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {rows}, {cols}, {ld}, {_cluster(op)});")
@@ -412,12 +436,105 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
                 So, ldko, ldvo, own = 0, 0, 0, "0, 0"
             tok = bufs.haddr(op.mask) if op.mask is not None else "0"
             if nb == 1:
-                b(f"{ind}sh_x_attention({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
+                fn = "sh_t_attention_fwd" if "train" in op.attributes else "sh_x_attention"
+                b(f"{ind}{fn}({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
                   f"{Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
             else:
                 assert Sq % nb == 0 and So % nb == 0, (Sq, So, nb)
                 b(f"{ind}sh_x_attention_n({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
                   f"{Sq // nb}, {Lp}, {So // nb}, {nb}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, {ldvo}, {ldo}, {_f(op.scale)}, {_cluster(op)});")
+
+        elif isinstance(op, GemmTransOp):
+            tx, tw = "trans_x" in op.attributes, "trans_w" in op.attributes
+            xr, xc, ldx, _ = bufs.geom(op.x)
+            wr, wc, ldw, _ = bufs.geom(op.w)
+            _m2, _n2, ldz, _ = bufs.geom(op.z)
+            m, k = (xc, xr) if tx else (xr, xc)
+            n = wr if tw else wc
+            cfg = (f"{{ .tm = {_int_attr(op, 'tile_m', 0)}, .tn = {_int_attr(op, 'tile_n', 0)}, .tk = {_int_attr(op, 'tile_k', 0)}, "
+                   f".pipeline = {1 if 'pipeline' in op.attributes else 0}, .accumulate = {1 if 'accumulate' in op.attributes else 0}, "
+                   f".fmt = SH_FP16, .l1_base = 0 }}")
+            b(f"{ind}{{ sh_gemm_cfg cfg = {cfg};")
+            b(f"{ind}  sh_t_gemm_tr({bufs.haddr(op.x)}, {bufs.haddr(op.w)}, {bufs.haddr(op.z)}, {m}, {n}, {k}, {ldx}, {ldw}, {ldz}, "
+              f"{int(tx)}, {int(tw)}, {bufs.haddr(op.scratch)}, &cfg, {_cluster(op)}); }}")
+
+        elif isinstance(op, RmsNormBwdOp):
+            rows, cols, ldx, _ = bufs.geom(op.x)
+            dres, ldr = (bufs.haddr(op.dres), bufs.geom(op.dres)[2]) if op.dres is not None else ("0", 0)
+            b(f"{ind}sh_t_rmsnorm_bwd({bufs.haddr(op.dx)}, {bufs.haddr(op.x)}, {bufs.haddr(op.dy)}, {dres}, {bufs.haddr(op.gamma)}, "
+              f"{rows}, {cols}, {bufs.geom(op.dx)[2]}, {ldx}, {bufs.geom(op.dy)[2]}, {ldr}, {_f(op.eps)}, {_cluster(op)});")
+
+        elif isinstance(op, SiluMulBwdOp):
+            rows, cols, lda, _ = bufs.geom(op.a)
+            b(f"{ind}sh_t_silu_mul_bwd({bufs.haddr(op.da)}, {bufs.haddr(op.db)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {bufs.haddr(op.dy)}, "
+              f"{rows}, {cols}, {bufs.geom(op.da)[2]}, {bufs.geom(op.db)[2]}, {lda}, {bufs.geom(op.b)[2]}, {bufs.geom(op.dy)[2]}, {_cluster(op)});")
+
+        elif isinstance(op, SoftmaxBwdOp):
+            rows, cols, ld, _ = bufs.geom(op.y)
+            b(f"{ind}sh_t_softmax_bwd({bufs.haddr(op.dx)}, {bufs.haddr(op.y)}, {bufs.haddr(op.dy)}, {rows}, {cols}, {ld}, {_f(op.scale)}, {_cluster(op)});")
+
+        elif isinstance(op, MseGradOp):
+            rows, cols, ld, _ = bufs.geom(op.pred)
+            loss = bufs.haddr(op.loss) if op.loss is not None else "0"
+            b(f"{ind}sh_t_mse_grad({bufs.haddr(op.dy)}, {loss}, {bufs.haddr(op.pred)}, {bufs.haddr(op.tgt)}, {rows}, {cols}, {ld}, "
+              f"{_f(op.gscale)}, {_cluster(op)});")
+
+        elif isinstance(op, OptimStepOp):
+            rows, cols, _, _ = bufs.geom(op.w32)
+            gesz = 4 if str(bufs.memref(op.g).element_type) == "f32" else 2
+            adam = op.kind.data == "adam"
+            mv = f"{bufs.haddr(op.m)}, {bufs.haddr(op.v)}" if op.m is not None else "0, 0"
+            b(f"{ind}sh_t_optim({bufs.haddr(op.w32)}, {bufs.haddr(op.w16)}, {mv}, {bufs.haddr(op.g)}, {gesz}, {rows}, {cols}, {int(adam)}, "
+              f"{_f(op.lr)}, {_f(op.inv_scale)}, {_float_attr(op, 'b1', 0.9)}, {_float_attr(op, 'b2', 0.999)}, {_float_attr(op, 'eps', 1e-8)}, "
+              f"{_float_attr(op, 'bc1', 1.0)}, {_float_attr(op, 'bc2', 1.0)}, {_cluster(op)});")
+
+        elif isinstance(op, AttentionBwdOp):
+            Sq, _, ldq, _ = bufs.geom(op.q)
+            Lp, _, ldkp, _ = bufs.geom(op.kp)
+            _, _, ldvp, _ = bufs.geom(op.vp)
+            heads, kvh = op.heads.value.data, op.kv_heads.value.data
+            dh = bufs.geom(op.q)[1] // heads
+            if op.ko is not None:
+                So, _, ldko, _ = bufs.geom(op.ko)
+                ldvo = bufs.geom(op.vo)[2]
+                own = f"{bufs.haddr(op.ko)}, {bufs.haddr(op.vo)}"
+                grads = f"{bufs.haddr(op.dko)}, {bufs.haddr(op.dvo)}, {bufs.haddr(op.scratch)}"
+                lddk, lddv = bufs.geom(op.dko)[2], bufs.geom(op.dvo)[2]
+            else:
+                So, ldko, ldvo, own, grads, lddk, lddv = 0, 0, 0, "0, 0", "0, 0, 0", 0, 0
+            tok = bufs.haddr(op.mask) if op.mask is not None else "0"
+            b(f"{ind}sh_t_attention_bwd({bufs.haddr(op.q)}, {bufs.haddr(op.kp)}, {bufs.haddr(op.vp)}, {own}, {tok}, {bufs.haddr(op.o)}, "
+              f"{bufs.haddr(op.do)}, {bufs.haddr(op.dq)}, {grads}, {Sq}, {Lp}, {So}, {heads}, {kvh}, {dh}, {ldq}, {ldkp}, {ldvp}, {ldko}, "
+              f"{ldvo}, {bufs.geom(op.o)[2]}, {bufs.geom(op.do)[2]}, {bufs.geom(op.dq)[2]}, {lddk}, {lddv}, {_f(op.scale)}, {_cluster(op)});")
+
+        elif isinstance(op, CopyOp):
+            rows, cols, lds, _ = bufs.geom(op.src)
+            b(f"{ind}sh_t_copy({bufs.haddr(op.dst)}, {bufs.haddr(op.src)}, {rows}, {cols}, {bufs.geom(op.dst)[2]}, {lds}, {_cluster(op)});")
+
+        elif isinstance(op, LoraFwdOp):
+            m, k, ldx, _ = bufs.geom(op.x)
+            _, r, _, _ = bufs.geom(op.a)
+            _, n, ldy, _ = bufs.geom(op.y)
+            b(f"{ind}sh_t_lora_fwd({bufs.haddr(op.y)}, {bufs.haddr(op.x)}, {bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {bufs.haddr(op.t)}, "
+              f"{m}, {k}, {n}, {r}, {ldy}, {ldx}, {_f(op.scale)}, {_int_attr(op, 'tile_k', k)}, {_cluster(op)});")
+
+        elif isinstance(op, LinearBwdOp):
+            m, n, lddy, _ = bufs.geom(op.dy)
+            k, _, ldw, _ = bufs.geom(op.w)
+            lddx = bufs.geom(op.dx)[2]
+            if op.a is not None:
+                r, nl, ldx = bufs.geom(op.a)[1], bufs.geom(op.db)[1], bufs.geom(op.x)[2]
+                lora = (f"{bufs.haddr(op.a)}, {bufs.haddr(op.b)}, {bufs.haddr(op.t)}, {bufs.haddr(op.x)}, {bufs.haddr(op.da)}, "
+                        f"{bufs.haddr(op.db)}, {r}, {nl}, {ldx}, {_float_attr(op, 'scale', 1.0)}")
+            else:
+                lora = "0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0f"
+            b(f"{ind}sh_t_linear_bwd({bufs.haddr(op.dx)}, {bufs.haddr(op.dy)}, {bufs.haddr(op.w)}, {m}, {k}, {n}, {lddx}, {lddy}, {ldw}, "
+              f"{lora}, {bufs.haddr(op.scratch)}, {_int_attr(op, 'tile_m', 0)}, {_int_attr(op, 'tile_k', 0)}, {_cluster(op)});")
+
+        elif isinstance(op, GradAllReduceOp):
+            n = _nelem(bufs.memref(op.src))
+            b(f"{ind}sh_t_allreduce({bufs.haddr(op.dst)}, {bufs.haddr(op.src)}, {op.src_stride.value.data}u, {n}, {op.mode.value.data}, "
+              f"{bufs.haddr(op.scal)});")
 
         elif isinstance(op, DumpAllOp):
             rows, cols, ld, _ = bufs.geom(op.buf)
@@ -436,6 +553,11 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             rows, cols, ld, _ = bufs.geom(op.buf)
             b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_test_fill_fp16({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
               f"{op.seed.value.data}, {op.lo.value.data}, {op.hi.value.data}, {_f(op.scale)});")
+
+        elif isinstance(op, DumpSamplesOp) and str(bufs.memref(op.buf).element_type) == "f32":
+            rows, cols, ld, _ = bufs.geom(op.buf)
+            b(f"{ind}if (sh_cluster_id() == 0 && sh_is_first_core()) sh_t_dump_samples_f32({bufs.haddr(op.buf)}, {rows}, {cols}, {ld}, "
+              f"{op.seed.value.data}, {op.n.value.data}, \"{op.tag.data}\");")
 
         elif isinstance(op, DumpSamplesOp):
             rows, cols, ld, _ = bufs.geom(op.buf)
@@ -466,7 +588,7 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
 _PROLOGUE_OPS = (HbmFillOp, HbmFillColParityOp, HbmFillLcgOp, PreloadWaitOp)   # test inputs / preload: before the timer
 _EPILOGUE_OPS = (HbmCheckConstOp,)   # whole-buffer checks: after the timer. Sample dumps stay IN PLACE: a
                                      # buffer may be reused later in the program (residual stream across layers)
-_STRUCTURAL_OPS = (HbmBufferOp, L1BufferOp, ViewOp, arith.ConstantOp, arith.AddiOp, arith.SubiOp, arith.MuliOp, func.ReturnOp)
+_STRUCTURAL_OPS = (HbmBufferOp, L1BufferOp, ViewOp, ClusterIdOp, arith.ConstantOp, arith.AddiOp, arith.SubiOp, arith.MuliOp, func.ReturnOp)
 
 
 def _phase_of(op, later_ops=()) -> str:
@@ -562,9 +684,13 @@ int main(void) {{
 
 
 def emit_c(module: ModuleOp) -> str:
-    """Emit a complete ``main.c`` from a module containing one softhier func."""
+    """Emit a complete ``main.c`` from a module containing one softhier func. A ``sh.optimize = "Os"`` attribute on the
+    func compiles the generated code (call sequences only; the library keeps its flags) for size: the 64 KB instruction
+    memory holds library + program (docs/SIMULATOR_NOTES.md, program size)."""
     fn = next(op for op in module.body.block.ops if isinstance(op, func.FuncOp))
-    return _MAIN_TEMPLATE.format(kernel_name=fn.sym_name.data,
+    optim = fn.attributes.get("sh.optimize")
+    head = f'#pragma GCC optimize ("{optim.data}")\n' if optim is not None else ""
+    return head + _MAIN_TEMPLATE.format(kernel_name=fn.sym_name.data,
                                  prologue_body=emit_kernel(fn, phase="prologue"),
                                  kernel_body=emit_kernel(fn, phase="kernel"),
                                  epilogue_body=emit_kernel(fn, phase="epilogue"))

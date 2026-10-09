@@ -20,3 +20,4 @@
 #include "sh_test.inc.c"
 #include "sh_llm.inc.c"
 #include "sh_wm.inc.c"
+#include "sh_train.inc.c"
