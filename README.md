@@ -52,7 +52,7 @@ Simulator setup (aarch64 host, x86 toolchain chroot, ideal HBM) is described in 
 
 **Docs:** [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — how to generate & run, and how to
 add a new op (step by step) · [`docs/DESIGN.md`](docs/DESIGN.md) — the dialect
-abstraction and lowering pipeline. · [`docs/WORLD_MODEL.md`](docs/WORLD_MODEL.md) — N expert candidates at once + on-chip RSSM imagination (cost curves).
+abstraction and lowering pipeline. · [`docs/WORLD_MODEL.md`](docs/WORLD_MODEL.md) — N expert candidates at once + on-chip RSSM imagination (cost curves). · [`docs/XPANEL_MCAST.md`](docs/XPANEL_MCAST.md) — small-M GEMM with the activation multicast once (`softhier.gemm {xmcast}`): flow step HBM read -31 % (N=1) / -52 % (N=4), time -6 % / -14 %.
 
 ## Working end-to-end pipeline
 
