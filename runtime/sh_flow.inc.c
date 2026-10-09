@@ -334,6 +334,10 @@ int sh_f_gemm_w8(uint64_t x, uint64_t w8, uint64_t z, uint32_t M, uint32_t N, ui
     const uint32_t X[2] = { c.l1_base, c.l1_base + xb }, B[2] = { X[1] + xb, X[1] + xb + bb }, W[2] = { B[1] + bb, B[1] + bb + wb };
     const uint32_t y = W[1] + wb, MT = M / c.tm, NT = N / c.tn, KT = K / c.tk;
     if (first) flex_redmule_config(c.tm, c.tk, c.tn);
+    /* expand == 0 (timing of a DMA-path cast): RedMulE reads W' tiles nobody writes; zero them once per call so the
+     * product is 0 and the activations stay finite (garbage would push the row ops into their slow overflow paths and
+     * distort the timing of everything after). Costs one ZOMEM clear of 2 W' tiles per call and cluster. */
+    if (!expand && dm) sh_l1_zero_dm(W[0], 2 * wb);
     for (uint32_t r = 0; r < MT; ++r)
     for (uint32_t col = 0; col < NT; ++col) {
         if (cluster == SH_ALL && ((r * NT + col) % P) != cid) continue;
@@ -364,13 +368,14 @@ int sh_f_gemm_w8(uint64_t x, uint64_t w8, uint64_t z, uint32_t M, uint32_t N, ui
 
 /* One weight GEMM of the flow loop at the step's format: fmt != SH_FP8 -> sh_gemm on the fp16 weights w16; SH_FP8 ->
  * x <- RN4(x) 2^k (k = the int16 at kexp), then mode 0 / 1: sh_f_gemm_w8 on the bytes w8 (expand / timing only),
- * mode 2: sh_gemm on the expanded copy wq16. */
+ * mode 2: sh_gemm on the expanded copy wq16; mode 3 = mode 1 without the activation cast pass (timing bound of a cast
+ * fused into the producing row op; numbers invalid). */
 int sh_f_gemm_step(uint64_t x, uint64_t w16, uint64_t w8, uint64_t wq16, uint64_t kexp, uint64_t z,
                    uint32_t M, uint32_t N, uint32_t K, uint32_t ldx, uint32_t ldw, uint32_t ldz,
                    const sh_gemm_cfg *cfg, uint32_t fmt, uint32_t mode, uint32_t cluster) {
     if (fmt != SH_FP8) return sh_gemm(x, w16, z, M, N, K, ldx, ldw, ldz, cfg, cluster);
     const int32_t k = *(const volatile int16_t *)(uintptr_t)kexp;
-    sh_f_rn4(x, M, K, ldx, k, cluster);
+    if (mode != 3) sh_f_rn4(x, M, K, ldx, k, cluster);   /* mode 3: no cast pass (bound of a cast fused into the producer) */
     if (mode == 2) return sh_gemm(x, wq16, z, M, N, K, ldx, ldw, ldz, cfg, cluster);
     return sh_f_gemm_w8(x, w8, z, M, N, K, ldx, ldw, ldz, cfg, mode == 0, cluster);
 }

@@ -197,8 +197,8 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
     # ---- accuracy: device x_t per step vs lerobot and vs the fp16-floor numpy model
     got = lcg.parse_samples(stdout)
     fp8 = fp8_mode is not None and fmt_steps is not None and "fp8" in fmt_steps
-    if fp8 and fp8_mode == 1:
-        print("     fp8 mode 1 (no expansion: timing of a DMA-path cast): the numbers are invalid by construction, not compared")
+    if fp8 and fp8_mode in (1, 3):
+        print(f"     fp8 mode {fp8_mode} (timing model, W' tiles zero): the numbers are invalid by construction, not compared")
         return ok
     floor_xt, floor_inter = E.np_flow(P, steps, layers, record=("H" in dumps or "O" in dumps), fmt_steps=fmt_steps if fp8 else None)
     if fp8:     # the reference of an fp8 schedule is its own fp16-floor twin; lerobot / all-fp16 are reported as distances
@@ -264,8 +264,9 @@ if __name__ == "__main__":
     ap.add_argument("--from-log")
     ap.add_argument("--tiles", help="flow: override tile shapes, e.g. qkv=50,240,720;o=50,240,960")
     ap.add_argument("--attn", default="stream", choices=["stream", "kvs"], help="flow: attention dataflow (kvs = KV-stationary)")
-    ap.add_argument("--fp8-mode", type=int, choices=[0, 1, 2], help="flow: real fp8 steps (--fmt fp8 entries) of the layer GEMMs: "
-                    "0 expand on the cores, 1 no expansion (timing of a DMA-path cast), 2 host-expanded copy (numbers)")
+    ap.add_argument("--fp8-mode", type=int, choices=[0, 1, 2, 3], help="flow: real fp8 steps (--fmt fp8 entries) of the layer GEMMs: "
+                    "0 expand on the cores, 1 no expansion (timing of a DMA-path cast), 2 host-expanded copy (numbers), "
+                    "3 = 1 without the activation cast pass (bound of a cast fused into the producer)")
     ap.add_argument("--save-x", help="flow: save the device x_t per step (npz)")
     ap.add_argument("--trace-dma", action="store_true", help="flow: gvsoc iDMA trace -> HBM / cluster-to-cluster bytes per segment")
     a = ap.parse_args()

@@ -533,6 +533,8 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
     if which.startswith("gemm8"):   # one fp8 weight GEMM (gate|up shape) in the three sh_f_gemm_step modes + fp16; docs/FLOW_DATAFLOW.md
         from softhier_mlir.frontend import fp8 as F8
         fam = which[len("gemm8"):] or "gu"
+        south = fam.endswith("_s")                 # gemm8<fam>_s: the e4m3 bytes in the south HBM region (as emit_flow puts them)
+        fam = fam[:-2] if south else fam
         K_, N_ = {"gu": (D, 2 * FF), "qkv": (D, DQ + 2 * DKV), "o": (DQ, D), "d": (FF, D)}[fam]
         rng = np.random.default_rng(seed)
         x = (rng.standard_normal((S, K_)) * 1.5).astype(np.float16)
@@ -541,10 +543,17 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
         for nm in ("x0", "x1", "x2"):
             P.B(nm, S, K_, x)
         P.B("w16", K_, N_, w); P.B("wq", K_, N_, F8.w_prime(code))
+        keep = P.e.next_off
+        if south:
+            P.e.next_off = 0x30000000
         P.at("w8", P.e.next_off, K_, N_, "i8"); P.pre[P.e.next_off] = code; P.e.next_off += (code.nbytes + 4095) & ~4095
         P.at("ke", P.e.next_off, 1, 32, "i16"); P.pre[P.e.next_off] = np.full((1, 32), 8 + e_w, np.int16); P.e.next_off += 4096
+        if south:
+            P.e.next_off, south_end = keep, P.e.next_off
         for nm in ("z16", "z0", "z1", "z2"):
             P.B(nm, S, N_)
+        if south:
+            P.e.next_off = south_end           # the sentinel stays the highest segment
         sent = sentinel_array(); P.B("sentinel", *sent.shape, sent)
         op(f"softhier.preload_wait %sentinel : {T['sentinel']}")
         op("%c0 = arith.constant 0 : index")
