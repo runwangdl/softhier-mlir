@@ -335,3 +335,12 @@ Two caveats for anyone measuring the host speed again: a `gdb -p` sampling loop 
 for ~1 s per attach (a sampled `attention` run took 41 s, unsampled 8 s), and the host was at times
 out of memory (OOM kills of other agents' `gvsoc_launcher`s in `dmesg`); one sampled `siglip-mlir`
 run under those conditions ended without a ROI and passed on every unsampled repeat.
+
+## #15 Multicast after the `extern inline` declarations (2026-10-09, coordinator)
+The SDK's `bare_dma_start_1d_broadcast` binds dst/src/size to register variables a0..a4 and only then calls
+`bare_dma_set_mask()`. Once `sh_train.inc.c` declared the SDK DMA helpers `extern inline` (to let `-Os` code call them
+out of line), that call is no longer guaranteed to be inlined; a real call clobbers a0..a4 and the DMA targets the mask
+value (gvsoc: `No entry found for burst (base: 0xfffc00000000fffc)`). It broke the KV-stationary expert (`--attn kvs`)
+after the W2/W4 merge. `sh_dma_bcast_1d` (runtime/sh_rt.inc.c) sets the mask first, then binds the registers; the
+KV-stationary attention and `sh_gemm_mesh` use it. `bare_dma_start_1d_reduction` has the same structure; the TTT
+reduction tests pass today, but if a reduction ever writes to a mask-shaped address, give it the same treatment.

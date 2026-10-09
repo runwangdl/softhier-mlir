@@ -159,7 +159,7 @@ int sh_f_attention_kvs(uint64_t q, uint64_t ko, uint64_t vo, uint64_t tok, uint6
         bare_dma_wait_all();
         const uint16_t rx = (uint16_t)~(ARCH_NUM_CLUSTER_X - 1u), ry = (uint16_t)~(ARCH_NUM_CLUSTER_Y - 1u);
         for (uint32_t b = 0; b < qbytes; b += CH) {
-            flex_dma_async_broadcast(a.qb + b, a.qb + b, qbytes - b < CH ? qbytes - b : CH, rx, ry);
+            sh_dma_bcast_1d(a.qb + b, a.qb + b, qbytes - b < CH ? qbytes - b : CH, rx, ry);
             flex_dma_async_wait_all();
         }
     }

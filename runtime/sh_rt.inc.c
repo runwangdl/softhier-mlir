@@ -96,3 +96,26 @@ void sh_call_on_core_stack(void (*fn)(void), uint32_t bytes_per_core) {
           "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "ft8", "ft9", "ft10", "ft11",
           "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7", "memory");
 }
+
+/* In-network multicast: the SDK's bare_dma_start_1d_broadcast loads dst/src/size into register variables a0..a4 and
+ * THEN calls bare_dma_set_mask(); when that call is not inlined (sh_train.inc.c declares the SDK helpers `extern inline`
+ * to keep -Os code small) the call clobbers a0..a4 and the DMA goes to the mask value (gvsoc: "No entry found for burst
+ * (base: 0xfffc00000000fffc)"). This version sets the mask first, then binds the registers. */
+static inline __attribute__((always_inline)) void sh_dma_bcast_1d(uint64_t dst_off, uint64_t src_off, uint32_t size,
+                                                                  uint16_t row_mask, uint16_t col_mask) {
+    {
+        register uint32_t reg_mask asm("a5") = ((uint32_t)col_mask << 16) | row_mask;
+        asm volatile(".word %0\n" ::"i"(R_TYPE_ENCODE(DMMASK_FUNCT7, 15, 15, XDMA_FUNCT3, 15, OP_CUSTOM1)), "r"(reg_mask) : "memory");
+    }
+    const uint64_t dst = remote_pos(get_pos(flex_get_cluster_id()), dst_off), src = local(src_off);
+    register uint32_t reg_dst_low asm("a0") = (uint32_t)(dst >> 0);
+    register uint32_t reg_dst_high asm("a1") = (uint32_t)(dst >> 32);
+    register uint32_t reg_src_low asm("a2") = (uint32_t)(src >> 0);
+    register uint32_t reg_src_high asm("a3") = (uint32_t)(src >> 32);
+    register uint32_t reg_size asm("a4") = size;
+    asm volatile(".word %0\n" ::"i"(R_TYPE_ENCODE(DMSRC_FUNCT7, 13, 12, XDMA_FUNCT3, 0, OP_CUSTOM1)), "r"(reg_src_high), "r"(reg_src_low));
+    asm volatile(".word %0\n" ::"i"(R_TYPE_ENCODE(DMDST_FUNCT7, 11, 10, XDMA_FUNCT3, 0, OP_CUSTOM1)), "r"(reg_dst_high), "r"(reg_dst_low));
+    register uint32_t reg_txid asm("a0");
+    asm volatile(".word %1\n" : "=r"(reg_txid) : "i"(R_TYPE_ENCODE(DMCPYC_FUNCT7, 0b00001, 14, XDMA_FUNCT3, 10, OP_CUSTOM1)), "r"(reg_size) : "memory");
+    (void)reg_txid;
+}

@@ -159,9 +159,9 @@ int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uin
         bare_dma_wait_all(); \
         /* one collective in flight at a time: two outstanding broadcasts from one DM core crash the \
            gvsoc NoC model (segfault, checked 2026-10-08) */ \
-        flex_dma_async_broadcast(local(xdst), local(xdst), xb, row_wild, col_exact);  /* along my row    */ \
+        sh_dma_bcast_1d(xdst, xdst, xb, row_wild, col_exact);  /* along my row    */ \
         flex_dma_async_wait_all(); \
-        flex_dma_async_broadcast(local(wdst), local(wdst), wb, row_exact, col_wild);  /* along my column */ \
+        sh_dma_bcast_1d(wdst, wdst, wb, row_exact, col_wild);  /* along my column */ \
         flex_dma_async_wait_all(); } while (0)
 
     flex_global_barrier_xy();
