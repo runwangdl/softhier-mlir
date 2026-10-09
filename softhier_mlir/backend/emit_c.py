@@ -20,7 +20,7 @@ deeper than a layer or two (an unrolled 12-layer SigLIP is ~140 KB of code).
 from __future__ import annotations
 
 from xdsl.dialects import arith, func, scf
-from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr, MemRefType, ModuleOp, StridedLayoutAttr
+from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr, MemRefType, ModuleOp, StridedLayoutAttr, StringAttr
 from xdsl.ir import Block, BlockArgument, Operation, SSAValue
 
 from softhier_mlir.dialects.softhier import (
@@ -99,6 +99,15 @@ def _space(memref: MemRefType) -> str:
 def _int_attr(op, name: str, default: int) -> int:
     a = op.attributes.get(name) or op.properties.get(name)
     return a.value.data if isinstance(a, IntegerAttr) else default
+
+
+_XM_MODE = {"auto": "SH_XM_AUTO", "panel": "SH_XM_PANEL", "whole": "SH_XM_WHOLE"}
+
+
+def _str_attr(op, name: str, default: str = "auto") -> str:
+    """A string attribute's value; a unit (or any non-string) attribute gives `default`."""
+    a = op.attributes.get(name) or op.properties.get(name)
+    return a.data if isinstance(a, StringAttr) else default
 
 
 def _cluster(op) -> str:
@@ -324,6 +333,10 @@ def _emit_ops(ops, bufs: _Buffers, idx: _Index, b, tag: str, ind: str) -> None:
             if "summa" in op.attributes:
                 b(f"{ind}{{ sh_gemm_cfg cfg = {cfg};  // mesh-wide SUMMA")
                 b(f"{ind}  sh_gemm_mesh({args}); }}")
+            elif "xmcast" in op.attributes:     # X crosses HBM once, multicast to all clusters (docs/XPANEL_MCAST.md)
+                mode = _XM_MODE[_str_attr(op, "xmcast")]
+                b(f"{ind}{{ sh_gemm_cfg cfg = {cfg};  // X-panel multicast, column slice per cluster")
+                b(f"{ind}  sh_gemm_xmcast_ex({args}, {mode}); }}")
             else:
                 b(f"{ind}{{ sh_gemm_cfg cfg = {cfg};")
                 b(f"{ind}  sh_gemm({args}, {_cluster(op)}); }}")

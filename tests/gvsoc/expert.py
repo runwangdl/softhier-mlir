@@ -157,7 +157,7 @@ def cand_seeds(n_cand: int, seeds=None) -> list:
 def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile: bool, dumps, nsamples: int = 64,
              app_dir=None, log: Path | None = None, from_log: Path | None = None, timeout: int = 48 * 3600, tiles=None,
              n_cand: int = 1, seeds=None, attn: str = "stream", fp8_mode: int | None = None, save_x=None,
-             trace_dma: bool = False) -> bool:
+             trace_dma: bool = False, gemm: str = "tiles") -> bool:
     from softhier_mlir.frontend import smolvla_expert as E
     data = dict(np.load(npz))
     P = {k[2:]: data[k] for k in data if k.startswith("p_")}
@@ -169,10 +169,10 @@ def run_flow(npz: str, steps: int, layers: int, cluster: int, fmt_steps, profile
     if from_log is None:
         app = _app(app_dir)
         mlir, pre = E.emit_flow(data, steps, layers, cluster, fmt_steps, profile, tuple(dumps), nsamples, tiles=tiles or E.TILES,
-                                n_cand=n_cand, x0=x0, attn=attn, fp8_mode=fp8_mode)
+                                n_cand=n_cand, x0=x0, attn=attn, fp8_mode=fp8_mode, gemm=gemm)
         r = _build_and_run(app, mlir, pre, timeout, log, ("idma",) if trace_dma else ())
         stdout, ok = r["stdout"], r["ok"]
-        print(f"{'PASS' if ok else 'FAIL'} expert flow steps={steps} layers={layers} cand={n_cand} cluster={cluster} fmt={fmt_steps} attn={attn} fp8_mode={fp8_mode} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+        print(f"{'PASS' if ok else 'FAIL'} expert flow steps={steps} layers={layers} cand={n_cand} cluster={cluster} fmt={fmt_steps} attn={attn} fp8_mode={fp8_mode} gemm={gemm} roi={r['roi_ns']} ns wall={r['wall_s']}s")
     else:
         stdout = Path(from_log).read_text()
         rois = [int(v) for v in PERF_RE.findall(stdout)]
@@ -317,6 +317,8 @@ if __name__ == "__main__":
     ap.add_argument("--fp8-mode", type=int, choices=[0, 1, 2, 3], help="flow: real fp8 steps (--fmt fp8 entries) of the layer GEMMs: "
                     "0 expand on the cores, 1 no expansion (timing of a DMA-path cast), 2 host-expanded copy (numbers), "
                     "3 = 1 without the activation cast pass (bound of a cast fused into the producer)")
+    ap.add_argument("--gemm", default="tiles", choices=["tiles", "xmcast", "xmcast-panel", "xmcast-whole"],
+                    help="flow: step GEMM dataflow (xmcast = X multicast once, W column slice per cluster; docs/XPANEL_MCAST.md)")
     ap.add_argument("--save-x", help="flow: save the device x_t per step (npz)")
     ap.add_argument("--trace-dma", action="store_true", help="flow: gvsoc iDMA trace -> HBM / cluster-to-cluster bytes per segment")
     a = ap.parse_args()
@@ -335,5 +337,5 @@ if __name__ == "__main__":
                 tiles[k] = tuple(int(x) for x in v.split(","))
         ok = run_flow(a.npz, a.steps, a.layers, a.cluster, fmt, a.profile, a.dumps, a.nsamples, a.app_dir,
                       Path(a.log) if a.log else None, Path(a.from_log) if a.from_log else None, tiles=tiles,
-                      n_cand=a.cands, seeds=a.seeds, attn=a.attn, fp8_mode=a.fp8_mode, save_x=a.save_x, trace_dma=a.trace_dma)
+                      n_cand=a.cands, seeds=a.seeds, attn=a.attn, fp8_mode=a.fp8_mode, save_x=a.save_x, trace_dma=a.trace_dma, gemm=a.gemm)
     sys.exit(0 if ok else 1)

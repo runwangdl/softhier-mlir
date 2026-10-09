@@ -214,6 +214,76 @@ def summa_est(arch: Arch, prm: CostParams, M: int, N: int, K: int, T: int, tk: i
                f"tile {comp:.0f} vs diag load+bcast {step_feed:.0f}")
 
 
+XM_L1_LIMIT = 0x90000          # runtime/sh_gemm.inc.c SH_XM_L1_LIMIT
+XM_CHUNK = 32768               # bytes per multicast collective
+
+
+def xmcast_plan(arch: Arch, M: int, N: int, K: int, tm: int = 0, tn: int = 0, tk: int = 0, mode: str = "auto",
+                l1_base: int = 0) -> dict | None:
+    """Python twin of sh_xm_make_plan (runtime/sh_gemm.inc.c): rows per block, column slice Nc per cluster, K-panel tk,
+    whole (X multicast once) or panel schedule, TCDM bytes. None when nothing fits."""
+    P = arch.n_clusters
+    g = tn or 4
+    rows = tm or M
+    if M % rows:
+        return None
+    Nc = -(-(-(-N // P)) // g) * g
+    lim = XM_L1_LIMIT - l1_base
+
+    def need(t, whole):
+        return (rows * K * ELEM if whole else 2 * rows * t * ELEM) + 2 * t * Nc * ELEM + rows * Nc * ELEM
+    for whole in ((False,) if mode == "panel" else (True,) if mode == "whole" else (True, False)):
+        if tk:
+            t = tk if K % tk == 0 and need(tk, whole) <= lim else 0
+        else:
+            t = next((d for d in range(min(K, 256), 0, -1) if K % d == 0 and need(d, whole) <= lim), 0)
+        if t:
+            nact = min(P, -(-N // Nc))
+            return {"rows": rows, "Nc": Nc, "tk": t, "KT": K // t, "whole": whole, "l1": l1_base + need(t, whole),
+                    "active": nact, "last_nc": N - (nact - 1) * Nc}
+    return None
+
+
+def gemm_xmcast_traffic(M: int, N: int, K: int, rows: int | None = None) -> dict:
+    """HBM bytes of sh_gemm_xmcast_ex: X once, W once per row block, Z once; NoC multicast bytes injected (X once)."""
+    MT = M // (rows or M)
+    return {"x": M * K * ELEM, "w": MT * K * N * ELEM, "z": M * N * ELEM, "mcast": M * K * ELEM}
+
+
+def gemm_xmcast_est(arch: Arch, prm: CostParams, M: int, N: int, K: int, tm: int = 0, tn: int = 0, tk: int = 0,
+                    mode: str = "auto", accumulate: int = 0) -> Est:
+    """sh_gemm_xmcast_ex. Per row block: Y clear; whole schedule = cluster 0 loads X (KT 2-D loads) while every active
+    cluster loads its W panel 0, multicast (32 KB collectives at line rate + fixed cost each), global barrier, then a
+    local double-buffered K loop max(RedMulE, W panel load); panel schedule = per K-panel max(RedMulE, source cluster's
+    X panel load + its W panel load + multicast) + a global barrier. W panels: `active` clusters stream at once."""
+    p = xmcast_plan(arch, M, N, K, tm, tn, tk, mode)
+    if p is None:
+        return Est(float("inf"), note="no xmcast plan fits TCDM")
+    rows, Nc, t, KT, n = p["rows"], p["Nc"], p["tk"], p["KT"], p["active"]
+    MT = M // rows
+    comp = redmule_cycles(arch, prm, rows, Nc, t)
+    wload = dma_load(arch, prm, t, Nc, n)
+    pre = (dma_load(arch, prm, rows, Nc, n) if accumulate else prm.dma_fixed + rows * Nc * ELEM / prm.l1_zero_bw)
+    store = dma_store(arch, prm, rows, Nc, n)
+
+    def mcast(b):
+        return math.ceil(b / XM_CHUNK) * prm.bcast_fixed + b / link_bw(arch)
+    if p["whole"]:
+        xload = KT * prm.dma_fixed + rows * K * ELEM / stream_bw(arch, prm, n)
+        head = max(xload + mcast(rows * K * ELEM), wload) + prm.barrier
+        loop = (KT - 1) * (max(comp, wload) + prm.cluster_sync) + comp + prm.cluster_sync
+    else:
+        xload = dma_load(arch, prm, rows, t, n)
+        head = xload + mcast(rows * t * ELEM) + wload + prm.barrier
+        feed = xload + wload + mcast(rows * t * ELEM)
+        loop = (KT - 1) * (max(comp, feed) + prm.barrier) + comp + prm.barrier
+    per_block = pre + head + loop + store + prm.cluster_sync
+    total = 2 * prm.barrier + MT * per_block + (MT - 1) * prm.barrier
+    c, d = MT * KT * comp, MT * (KT * wload + pre + store)
+    return Est(total, c, d, "compute" if c >= d else "dma",
+               f"{'whole' if p['whole'] else 'panel'} tk={t} KT={KT} Nc={Nc} x{n} clusters, tile {comp:.0f} vs W panel {wload:.0f}")
+
+
 def rowop_est(arch: Arch, prm: CostParams, kind: str, rows: int, cols: int, all_clusters: bool = True,
               n_lanes: int = 1) -> Est:
     """sh_rowop family + sh_transpose. Sequential load / scalar / store per block; blocks dealt
@@ -261,6 +331,10 @@ def op_est(arch: Arch, prm: CostParams, op: OpRec, n_lanes: int = 1) -> Est:
         if 2 * (tm * tk + tk * tn) * ELEM * (1 if op.pipeline else 0.5) + tm * tn * ELEM > arch.cluster_tcdm_size:
             return Est(float("inf"), note="tiles exceed TCDM")
         return gemm_est(arch, prm, M, N, K, tm, tn, tk, op.pipeline, op.accumulate, op.cluster < 0, n_lanes)
+    if op.kind == "xmcast":
+        M, N, K = op.shape
+        tm, tn, tk = (tuple(op.tile) + (0, 0, 0))[:3]
+        return gemm_xmcast_est(arch, prm, M, N, K, tm, tn, tk, accumulate=op.accumulate)
     if op.kind == "summa":
         M, N, K = op.shape
         return summa_est(arch, prm, M, N, K, op.tiles[0], op.tiles[2], op.pipeline, op.accumulate)
@@ -276,7 +350,7 @@ def regions(wl: Workload) -> list[list[OpRec]]:
     out: list[list[OpRec]] = []
     cur: list[OpRec] = []
     for op in wl:
-        if op.kind in ("barrier", "summa") or op.cluster < 0:
+        if op.kind in ("barrier", "summa", "xmcast") or op.cluster < 0:
             if cur:
                 out.append(cur)
                 cur = []
@@ -296,7 +370,7 @@ def compose(wl: Workload, cost_of, prm: CostParams | None = None) -> dict:
     by_kind: dict[str, float] = OrderedDict()
     per_op: list[tuple[OpRec, float, float]] = []    # (op, own cycles, contribution to total)
     for reg in regions(wl):
-        if len(reg) == 1 and (reg[0].kind in ("barrier", "summa") or reg[0].cluster < 0):
+        if len(reg) == 1 and (reg[0].kind in ("barrier", "summa", "xmcast") or reg[0].cluster < 0):
             op = reg[0]
             c = cost_of(op, 1)
             total += c
@@ -374,18 +448,19 @@ def gemm_traffic(M: int, N: int, K: int, tm: int, tn: int, tk: int) -> dict:
     return {"x": NT * M * K * ELEM, "w": MT * K * N * ELEM, "z": M * N * ELEM}
 
 
-def expert_step_traffic(nb: int = 1, layers: int = 16, tiles: dict | None = None) -> OrderedDict:
+def expert_step_traffic(nb: int = 1, layers: int = 16, tiles: dict | None = None, gemm: str = "tiles") -> OrderedDict:
     """HBM bytes per flow step of the SmolVLA expert program (frontend.smolvla_expert.emit_flow) with nb candidate
     chunks (S_q = 50 nb): weights (W panels), activations through the GEMMs (X panels, Z), attention staging
     (q, prefix K/V per query head, own K/V, o) and the row ops (rmsnorm / rope / silu_mul / adds / embedding / tail).
-    The prefix K/V and the weights do not grow with nb; everything else does."""
+    The prefix K/V and the weights do not grow with nb; everything else does.
+    gemm="xmcast": the step GEMMs as sh_gemm_xmcast_ex (X read once per GEMM; docs/XPANEL_MCAST.md)."""
     from softhier_mlir.frontend import smolvla_expert as E
     t = E.batch_tiles(nb, tiles or E.TILES)
     R, D, DQ, DKV, FF, AD, LP, H, DH = E.S * nb, E.D, E.DQ, E.DKV, E.FF, E.AD, E.LP, E.H, E.DH
     out = OrderedDict((k, 0) for k in ("weights", "gemm_act", "attn_kv", "attn_qo", "rowops"))
 
     def gm(M, N, K, fam):
-        tr = gemm_traffic(M, N, K, *t[fam])
+        tr = gemm_xmcast_traffic(M, N, K) if gemm.startswith("xmcast") else gemm_traffic(M, N, K, *t[fam])
         out["weights"] += tr["w"]; out["gemm_act"] += tr["x"] + tr["z"]
 
     def rows(nread, nwrite, cols, params=0):

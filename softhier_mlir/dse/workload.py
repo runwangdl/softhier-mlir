@@ -28,13 +28,13 @@ from softhier_mlir.dialects import softhier as sh
 ROW_OPS = {sh.LayerNormOp: "layernorm", sh.SoftmaxOp: "softmax", sh.GeluOp: "gelu",
            sh.AddOp: "add", sh.AddBiasOp: "add_bias"}
 ELEM = 2  # fp16 everywhere in the library today
-SYNC_KINDS = ("barrier", "summa")   # plus any op with cluster == -1
+SYNC_KINDS = ("barrier", "summa", "xmcast")   # plus any op with cluster == -1
 
 
 @dataclass(frozen=True)
 class OpRec:
     """One library call. ``shape`` is (M, N, K) for gemm/summa, (rows, cols) otherwise."""
-    kind: str                       # gemm | summa | layernorm | softmax | gelu | add | add_bias | transpose | barrier
+    kind: str                       # gemm | summa | xmcast | layernorm | softmax | gelu | add | add_bias | transpose | barrier
     shape: tuple = ()
     tile: tuple = ()                # (tm, tn, tk) for gemm/summa (0 = library default 256)
     pipeline: int = 1
@@ -46,7 +46,7 @@ class OpRec:
     # ---- derived ---------------------------------------------------------------------
     @property
     def is_gemm(self) -> bool:
-        return self.kind in ("gemm", "summa")
+        return self.kind in ("gemm", "summa", "xmcast")
 
     @property
     def tiles(self) -> tuple[int, int, int]:
@@ -78,6 +78,10 @@ class OpRec:
             ntiles = (m // tm) * (n // tn)
             per_tile = (tm * k + k * tn) * ELEM + tm * tn * ELEM * (2 if self.accumulate else 1)
             return ntiles * per_tile
+        if self.kind == "xmcast":                      # X once, W once per row block (tile_m), Z once
+            m, n, k = self.shape
+            mt = m // (self.tile[0] if self.tile and self.tile[0] else m)
+            return (m * k + mt * k * n) * ELEM + m * n * ELEM * (2 if self.accumulate else 1)
         if self.kind == "summa":
             m, n, k = self.shape
             t = self.tiles[0]
@@ -200,7 +204,8 @@ def extract(module: ModuleOp, name: str = "") -> Workload:
         if isinstance(op, sh.GemmOp):
             m, k, _, _ = bufs.geom(op.x)
             _, n, _, _ = bufs.geom(op.w)
-            ops.append(OpRec(kind="summa" if "summa" in op.attributes else "gemm", shape=(m, n, k),
+            kind = "summa" if "summa" in op.attributes else "xmcast" if "xmcast" in op.attributes else "gemm"
+            ops.append(OpRec(kind=kind, shape=(m, n, k),
                              tile=(_int_attr(op, "tile_m", 0), _int_attr(op, "tile_n", 0), _int_attr(op, "tile_k", 0)),
                              pipeline=1 if "pipeline" in op.attributes else 0,
                              accumulate=1 if "accumulate" in op.attributes else 0,

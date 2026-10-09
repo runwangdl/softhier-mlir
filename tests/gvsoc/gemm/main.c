@@ -30,13 +30,20 @@ int main(void) {
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
         sh_printf("[gemm] %ux%ux%u tile %ux%ux%u pipeline=%d acc=%d cluster=%s l1=%u B\n", M, N, K, TILE_M ? TILE_M : 256, TILE_N ? TILE_N : 256, TILE_K ? TILE_K : 256,
                   PIPELINE, ACCUMULATE, CLUSTER == SH_ALL ? "all" : "0", sh_gemm_l1_bytes(M, N, K, &cfg));
+#ifdef XMCAST
+        sh_printf("[gemm] xmcast mode %d l1=%u B\n", XMCAST, sh_gemm_xmcast_l1_bytes(M, N, K, &cfg, XMCAST));
+#endif
     }
     /* The printf and the timer register share the slow virtual interconnect: starting the timer
      * right after a printf lands the start stamp late and shortens the ROI (256^3: 9.9 us instead
      * of 14.7 us). Drain with a barrier first. */
     sh_barrier_global();
     if (sh_cluster_id() == 0 && sh_is_first_core()) sh_timer_start();
+#ifdef XMCAST      /* run.py gemm ...:xm|xmp|xmw: sh_gemm_xmcast_ex (all clusters), mode XMCAST */
+    int rc = sh_gemm_xmcast_ex(x, w, z, M, N, K, K, N, N, &cfg, XMCAST);
+#else
     int rc = sh_gemm(x, w, z, M, N, K, K, N, N, &cfg, CLUSTER);
+#endif
     sh_barrier_global();
     if (sh_cluster_id() == 0 && sh_is_first_core()) {
         sh_timer_end();
@@ -44,6 +51,9 @@ int main(void) {
         else {
             bad = sh_test_check_gemm(x, w, z, M, N, K, K, N, N, NSAMPLES, 0.5f, ACCUMULATE ? 3.0f : 0.0f, "[gemm]");
             sh_printf("[gemm] %s\n", bad ? "GEMM_FAIL" : "GEMM_PASS");
+#ifdef DUMP_Z      /* sampled Z for the host-side numpy comparison */
+            sh_test_dump_samples(z, M, N, N, 7, DUMP_Z, "[zs]");
+#endif
         }
     }
     sh_barrier_global();

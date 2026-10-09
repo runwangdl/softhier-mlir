@@ -57,20 +57,27 @@ DEFAULT_GEMM = ["256x256x256", "256x768x192:256,256,192", "512x768x768:256,256,2
 
 
 def parse_shape(s: str) -> dict:
-    """MxNxK[:tm,tn,tk[,pipeline[,accumulate[,cluster]]]]   cluster = 0 | all"""
+    """MxNxK[:tm,tn,tk[,pipeline[,accumulate[,cluster]]]]   cluster = 0 | all | xm | xmp | xmw"""
     dims, _, rest = s.partition(":")
     m, n, k = (int(v) for v in dims.lower().split("x"))
     opts = rest.split(",") if rest else []
     tm, tn, tk = (int(v) for v in (opts + ["0", "0", "0"])[:3])
     pipe = int(opts[3]) if len(opts) > 3 else 1
     acc = int(opts[4]) if len(opts) > 4 else 0
-    cluster = "SH_ALL" if len(opts) > 5 and opts[5] == "all" else "0"
-    return dict(M=m, N=n, K=k, tm=tm, tn=tn, tk=tk, pipeline=pipe, accumulate=acc, cluster=cluster)
+    cl = opts[5] if len(opts) > 5 else "0"
+    cluster = "SH_ALL" if cl in ("all", "xm", "xmp", "xmw") else "0"
+    # xm | xmp | xmw: sh_gemm_xmcast_ex (docs/XPANEL_MCAST.md) in mode auto | panel | whole; tm = rows per block,
+    # tn = column granule of the per-cluster slice, tk = K-panel (0 = auto)
+    xm = {"xm": 0, "xmp": 1, "xmw": 2}.get(cl)
+    return dict(M=m, N=n, K=k, tm=tm, tn=tn, tk=tk, pipeline=pipe, accumulate=acc, cluster=cluster, xm=xm)
 
 
-def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False, offsets: tuple | None = None) -> bool:
+def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False, offsets: tuple | None = None,
+             dump_z: int = 0, trace_dma: bool = False) -> bool:
     """offsets: HBM byte offsets of X, W, Z (default X at HBM_START, W at 16 MB, Z at 32 MB: all in HBM node 0;
-    a node is 64 MB and has its own NoC edge port, docs/DSE.md section 8)."""
+    a node is 64 MB and has its own NoC edge port, docs/DSE.md section 8).
+    dump_z: also print this many sampled Z elements and compare them against numpy X @ W (fp32) on the host.
+    trace_dma: gvsoc iDMA trace -> HBM read / write and cluster-to-cluster bytes of the run (tests/gvsoc/dma_bytes.py)."""
     from softhier_mlir.testing import lcg
     app = HERE / "gemm"
     all_ok = True
@@ -90,13 +97,35 @@ def run_gemm(shapes: list[str], nsamples: int = 256, real: bool = False, offsets
             f"#define TILE_M {c['tm']}\n#define TILE_N {c['tn']}\n#define TILE_K {c['tk']}\n"
             f"#define PIPELINE {c['pipeline']}\n#define ACCUMULATE {acc}\n"
             f"#define CLUSTER {c['cluster']}\n#define NSAMPLES {nsamples}\n" + ("#define REAL_DATA 1\n" if real else "")
+            + (f"#define XMCAST {c['xm']}\n" if c["xm"] is not None else "") + (f"#define DUMP_Z {dump_z}\n" if dump_z else "")
             + f"#define OFF_X 0x{off['x']:x}\n#define OFF_W 0x{off['w']:x}\n#define OFF_Z 0x{off['z']:x}\n" + pre_h)
         build_sw(app)
-        r = run_sim(preload=pre)
-        lines = [ln for ln in r["stdout"].splitlines() if ln.startswith("[gemm]") or "mismatch" in ln]
+        if trace_dma:
+            log = Path(build_sw.last_elf).parent / "trace.log"
+            r = run_sim(preload=pre, traces=("idma",), log=log)
+        else:
+            r = run_sim(preload=pre)
+        stdout = r["stdout"]
+        if trace_dma:
+            import dma_bytes
+            marks, txns = dma_bytes.parse(stdout)
+            stdout = "".join(m[1] if (m := dma_bytes._TRACE_START.match(ln)) else ln + "\n" for ln in stdout.splitlines())
+        lines = [ln for ln in stdout.splitlines() if ln.startswith("[gemm]") or "mismatch" in ln or ln.startswith("[sh_gemm")]
         ok = r["ok"] and any("GEMM_PASS" in ln for ln in lines)
+        extra = ""
+        if dump_z:
+            zs = lcg.parse_samples(stdout).get("[zs]", [])
+            ref = x.astype(np.float32) @ w.astype(np.float32) + z.astype(np.float32)
+            bad, err = lcg.compare_samples(zs, ref, 0.5 if not real else 0.05, 2e-3, show=4)
+            ok &= len(zs) == dump_z and bad == 0
+            extra += f" numpy: {len(zs)} samples, {bad} bad, max abs {err:.4g} (max |ref| {np.abs(ref).max():.3g})"
+        if trace_dma:
+            kinds = {}
+            for t1, k, b in txns:
+                kinds[k] = kinds.get(k, 0) + b
+            extra += " bytes: " + " ".join(f"{k}={kinds.get(k, 0) / 1e6:.3f}MB" for k in ("hbm_rd", "hbm_wr", "c2c", "local", "zero"))
         all_ok &= ok
-        print(f"{'PASS' if ok else 'FAIL'} {s:<28} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+        print(f"{'PASS' if ok else 'FAIL'} {s:<28} roi={r['roi_ns']} ns wall={r['wall_s']}s{extra}")
         for ln in lines:
             print("     " + ln)
         if not r["ok"]:
@@ -1078,6 +1107,8 @@ if __name__ == "__main__":
     ap.add_argument("--modes", nargs="*", default=["0", "1", "2", "5", "6"], help="mesh: MODE[:DEF,...]")
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--real", action="store_true", help="gemm: real-valued data instead of small ints")
+    ap.add_argument("--dump-z", type=int, default=0, help="gemm: compare this many sampled Z elements against numpy on the host")
+    ap.add_argument("--trace-dma", action="store_true", help="gemm: iDMA trace -> HBM / cluster-to-cluster bytes (dma_bytes.py)")
     ap.add_argument("--offsets", help="gemm: HBM byte offsets X,W,Z (hex ok; 64 MB per HBM node), default all in node 0")
     ap.add_argument("--define", nargs="*", default=[], help="siglip / attention: extra NAME[=VALUE] macros for shape.h")
     ap.add_argument("--composed", action="store_true", help="attention: the per-head library-call path instead of the fused kernel")
@@ -1100,7 +1131,7 @@ if __name__ == "__main__":
         a.cluster = "all" if a.test in ("smolvla", "smolvla-vlm") else "0"
     if a.test == "gemm":
         ok = run_gemm(a.shapes or DEFAULT_GEMM, a.nsamples, a.real,
-                      tuple(int(v, 0) for v in a.offsets.split(",")) if a.offsets else None)
+                      tuple(int(v, 0) for v in a.offsets.split(",")) if a.offsets else None, a.dump_z, a.trace_dma)
     elif a.test == "gemm-seq":
         ok = run_gemm_seq()
     elif a.test == "rowops":

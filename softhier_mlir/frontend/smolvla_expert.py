@@ -281,6 +281,7 @@ class _Prog:
         self.off: dict[str, int] = {}
         self.cl = f"cluster = {cluster} : i32"
         self.nsamples, self.marks = nsamples, marks
+        self.xm = None      # emit_flow(gemm="xmcast"): the step GEMMs as softhier.gemm {xmcast} (docs/XPANEL_MCAST.md)
         self.sp = self.e.space
 
     def alloc(self, rows, cols):
@@ -330,11 +331,17 @@ class _Prog:
         else:
             self.op(f'softhier.dump_samples %{name}{", " + idx if idx else ""} {{seed = {seed} : i32, n = {self.nsamples} : i32, tag = "{tag}"}} : {self.T[name]}')
 
-    def gemm(self, x, w, z, tm, tn, tk, step=None, fmt_steps=None, cl=None):
+    def gemm(self, x, w, z, tm, tn, tk, step=None, fmt_steps=None, cl=None, xm=True):
+        """xm: allow the X-multicast lowering when the program asks for it (self.xm = "auto" | "panel" | "whole"):
+        tile_m = all rows (one block), tile_n = 0 (column granule 4), tile_k = 0 (the library picks the K-panel)."""
         fs = f', fmt_steps = [{", ".join(chr(34) + f + chr(34) for f in fmt_steps)}]' if fmt_steps else ""
         st = f" step {step}" if step and fmt_steps else ""
+        xa = ""
+        if xm and self.xm and "cluster = -1" in (cl or self.cl):
+            tm, tn, tk = self.geom(x)[0], 0, 0
+            xa = "xmcast, " if self.xm == "auto" else f'xmcast = "{self.xm}", '
         self.op(f'softhier.gemm %{x}, %{w} into %{z}{st} {{fmt = "fp16"{fs}, tile_m = {tm} : i32, tile_n = {tn} : i32, '
-                f'tile_k = {tk} : i32, pipeline, {cl or self.cl}}} : {self.T[x]}, {self.T[w]}, {self.T[z]}')
+                f'tile_k = {tk} : i32, pipeline, {xa}{cl or self.cl}}} : {self.T[x]}, {self.T[w]}, {self.T[z]}')
 
     def geom(self, name):
         """(rows, cols, ld) of a declared buffer / view from its memref type string."""
@@ -659,7 +666,7 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
               profile: bool = False, dumps: tuple[str, ...] = ("X",), nsamples: int = 64, tiles=TILES,
               kv_base: int | None = None, kv_stride: int = KV_STRIDE, s_pad: int = S_PAD, num_steps: int = STEPS,
               n_cand: int = 1, x0: np.ndarray | None = None, chunk: int | None = None,
-              attn: str = "stream", fp8_mode: int | None = None) -> tuple[str, dict]:
+              attn: str = "stream", fp8_mode: int | None = None, gemm: str = "tiles") -> tuple[str, dict]:
     """Step 2/3: the flow loop: the first `steps` steps of the `num_steps` Euler schedule (dt = -1/num_steps, time table
     row s). Returns (mlir, preload). layers must be even (self/cross pairs).
     attn: "stream" (sh_x_attention: every head re-streams its kv head's prefix K / V from HBM every step) or "kvs"
@@ -680,6 +687,10 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     keys are causal within each candidate block (cross_attention n_batch), the prefix KV and the weights are shared;
     tiles = batch_tiles(n_cand, tiles).
     chunk: action rows per candidate (default the npz's 50; fewer rows == the first rows of 50 since own keys are causal).
+    gemm: "tiles" (sh_gemm SH_ALL with the TILES / batch_tiles output tiles: every tile re-reads its X panel from HBM) or
+    "xmcast" / "xmcast-panel" / "xmcast-whole" (every step GEMM as softhier.gemm {xmcast}: X crosses HBM once and is
+    multicast, each cluster streams its own W columns; docs/XPANEL_MCAST.md). The once-per-chunk KV projections stay on
+    sh_gemm. fp16 only (not with fp8_mode).
     The prefix length is the token-class row's (p_tok [1, Lp]): 241 for the 3-camera 512 x 512 prefix, any other
     (e.g. 65 / 97 for 1 / 3 cameras at 256 x 256, frontend.smolvla_e2e) reads the first Lp rows of each KV block."""
     data = np.load(npz) if isinstance(npz, (str, Path)) else npz
@@ -709,6 +720,10 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     if fmt_steps is not None:
         assert len(fmt_steps) == steps, (len(fmt_steps), steps)
     P = _Prog(cluster, nsamples)
+    assert gemm in ("tiles", "xmcast", "xmcast-panel", "xmcast-whole"), gemm
+    if gemm != "tiles":
+        assert fp8_mode is None and all(f == "fp16" for f in (fmt_steps or [])), "xmcast GEMMs are fp16 only"
+        P.xm = {"xmcast": "auto", "xmcast-panel": "panel", "xmcast-whole": "whole"}[gemm]
     T, op = P.T, P.op
     _activations(P, rows, nb)
     for nm in ("x0", "wa", "ba", "wti", "tb", "wto", "bto", "gf", "wout", "bout", "rq_self", "rq_cross"):
@@ -791,7 +806,7 @@ def emit_flow(npz, steps: int = STEPS, layers: int = LAYERS, cluster: int = -1, 
     if layers:
         op("scf.for %p = %c0 to %cP step %c1 {")
         slab(["kp_c", "vp_c", "wkx_c", "wvx_c", "kx_c", "vx_c"])
-        P.gemm("kp_c", "wkx_c", "kx_c", *tiles["kv"]); P.gemm("vp_c", "wvx_c", "vx_c", *tiles["kv"])
+        P.gemm("kp_c", "wkx_c", "kx_c", *tiles["kv"], xm=False); P.gemm("vp_c", "wvx_c", "vx_c", *tiles["kv"], xm=False)
         op("}")
     P.mark("kvproj")
     flow = {}

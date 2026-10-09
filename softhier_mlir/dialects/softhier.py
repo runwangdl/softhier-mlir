@@ -212,6 +212,12 @@ class GemmOp(IRDLOperation):
     The backend tiles it into 256x256x256 RedMule ops with K-accumulation and
     per-tile HBM<->TCDM DMA (matrices assumed tile-major in HBM). ``x``:MxK,
     ``w``:KxN, ``z``:MxN.
+
+    Dataflow attributes: ``summa`` (mesh-wide SUMMA, sh_gemm_mesh); ``xmcast`` (unit, or
+    "panel" / "whole"): small-M GEMM whose X crosses HBM once and is multicast to all
+    clusters, each cluster streaming only its column slice of W (sh_gemm_xmcast_ex,
+    docs/XPANEL_MCAST.md; tile_m = rows per block, tile_n = column granule, tile_k = K-panel,
+    0 = library choice). Neither: sh_gemm with output tiles dealt over the clusters.
     """
 
     name = "softhier.gemm"
