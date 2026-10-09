@@ -216,6 +216,7 @@ def summa_est(arch: Arch, prm: CostParams, M: int, N: int, K: int, T: int, tk: i
 
 XM_L1_LIMIT = 0x90000          # runtime/sh_gemm.inc.c SH_XM_L1_LIMIT
 XM_CHUNK = 32768               # bytes per multicast collective
+XM_WHOLE_MAX = 0x50000         # SH_XM_WHOLE_MAX: auto picks the whole-X schedule only up to this X row block
 
 
 def xmcast_plan(arch: Arch, M: int, N: int, K: int, tm: int = 0, tn: int = 0, tk: int = 0, mode: str = "auto",
@@ -232,7 +233,8 @@ def xmcast_plan(arch: Arch, M: int, N: int, K: int, tm: int = 0, tn: int = 0, tk
 
     def need(t, whole):
         return (rows * K * ELEM if whole else 2 * rows * t * ELEM) + 2 * t * Nc * ELEM + rows * Nc * ELEM
-    for whole in ((False,) if mode == "panel" else (True,) if mode == "whole" else (True, False)):
+    auto_whole = rows * K * ELEM <= XM_WHOLE_MAX
+    for whole in ((False,) if mode == "panel" else (True,) if mode == "whole" else (True, False) if auto_whole else (False,)):
         if tk:
             t = tk if K % tk == 0 and need(tk, whole) <= lim else 0
         else:
@@ -269,11 +271,11 @@ def gemm_xmcast_est(arch: Arch, prm: CostParams, M: int, N: int, K: int, tm: int
     def mcast(b):
         return math.ceil(b / XM_CHUNK) * prm.bcast_fixed + b / link_bw(arch)
     if p["whole"]:
-        xload = KT * prm.dma_fixed + rows * K * ELEM / stream_bw(arch, prm, n)
+        xload = KT * prm.dma_fixed + rows * K * ELEM / link_bw(arch)
         head = max(xload + mcast(rows * K * ELEM), wload) + prm.barrier
         loop = (KT - 1) * (max(comp, wload) + prm.cluster_sync) + comp + prm.cluster_sync
     else:
-        xload = dma_load(arch, prm, rows, t, n)
+        xload = prm.dma_fixed + rows * t * ELEM / link_bw(arch)
         head = xload + mcast(rows * t * ELEM) + wload + prm.barrier
         feed = xload + wload + mcast(rows * t * ELEM)
         loop = (KT - 1) * (max(comp, feed) + prm.barrier) + comp + prm.barrier

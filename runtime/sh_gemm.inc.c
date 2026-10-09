@@ -202,13 +202,16 @@ int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uin
  * Two schedules (mode): SH_XM_PANEL streams X panels: panel kk is loaded + multicast by cluster kk % P during the
  * RedMulE of panel kk - 1 (double-buffered X, one global barrier per panel); SH_XM_WHOLE multicasts the whole X row
  * block once (stored panel-major, KT panels of rows x tk) and then runs the K loop with local syncs only.
- * SH_XM_AUTO = WHOLE when its scratch fits, else PANEL. Rows: blocks of tm (cfg->tm, 0 = M); W is re-streamed per row
+ * SH_XM_AUTO = WHOLE when X <= SH_XM_WHOLE_MAX (320 KB) and its scratch fits, else PANEL. Rows: blocks of tm (cfg->tm, 0 = M); W is re-streamed per row
  * block. tk: cfg->tk, 0 = the largest divisor of K <= 256 whose scratch fits under SH_XM_L1_LIMIT. fp16 only.
  * TCDM (from cfg->l1_base): X0 [X1 | whole X] W0 W1 Y. Call from all cores of all clusters. */
 #ifndef SH_XM_L1_LIMIT
 #define SH_XM_L1_LIMIT 0x90000u     /* stay below the KV-stationary resident region (sh_flow.inc.c) */
 #endif
 #define SH_XM_CHUNK 32768u
+#ifndef SH_XM_WHOLE_MAX
+#define SH_XM_WHOLE_MAX 0x50000u    /* 320 KB */
+#endif
 
 typedef struct { uint32_t rows, Nc, tk, KT, whole, xb, x0, x1, w0, w1, y, end; } sh_xm_plan;
 
@@ -223,7 +226,10 @@ static int sh_xm_make_plan(sh_xm_plan *p, uint32_t M, uint32_t N, uint32_t K, co
     p->Nc = ((N + P - 1) / P + g - 1) / g * g;
     if (c->l1_base >= SH_XM_L1_LIMIT) return -2;
     const uint32_t lim = SH_XM_L1_LIMIT - c->l1_base;
-    for (int w = (mode == SH_XM_PANEL ? 0 : 1); w >= 0; --w) {
+    /* auto: whole only for X row blocks <= SH_XM_WHOLE_MAX; a larger X spends its load + multicast before the first
+       RedMulE (not overlapped), panels pipeline it (measured, docs/XPANEL_MCAST.md) */
+    const int try_whole = mode == SH_XM_WHOLE || (mode == SH_XM_AUTO && p->rows * K * 2 <= SH_XM_WHOLE_MAX);
+    for (int w = try_whole ? 1 : 0; w >= 0; --w) {
         if (mode == SH_XM_WHOLE && !w) break;
         uint32_t tk = 0;
         if (c->tk) { if (K % c->tk == 0 && sh_xm_need(p->rows, K, p->Nc, c->tk, w) <= lim) tk = c->tk; }

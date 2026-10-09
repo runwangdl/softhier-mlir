@@ -75,7 +75,7 @@ int sh_gemm_mesh(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uin
 /* Small-M GEMM over all clusters with the activation crossing HBM once (docs/XPANEL_MCAST.md): cluster c owns a
  * column slice of Z (Nc = ceil(N/P) rounded up to cfg->tn, default granule 4) and streams only its W columns; the X
  * K-panels (rows x tk) are loaded by one cluster and multicast to all. cfg->tm = rows per block (0 = M), cfg->tk =
- * K-panel (0 = auto), fmt fp16 only. mode: SH_XM_AUTO (whole X multicast once if it fits, else panels), SH_XM_PANEL,
+ * K-panel (0 = auto), fmt fp16 only. mode: SH_XM_AUTO (whole X multicast once if X <= 320 KB and it fits, else panels), SH_XM_PANEL,
  * SH_XM_WHOLE. Scratch stays below SH_XM_L1_LIMIT (0x90000). Call from all cores of all clusters. */
 enum { SH_XM_AUTO = 0, SH_XM_PANEL = 1, SH_XM_WHOLE = 2 };
 int sh_gemm_xmcast(uint64_t x, uint64_t w, uint64_t z, uint32_t M, uint32_t N, uint32_t K,
