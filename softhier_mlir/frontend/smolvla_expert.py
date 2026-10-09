@@ -551,7 +551,7 @@ def emit_op_test(which: str = "attn", seed: int = 3, cluster: int = -1, nsamples
         tm, tn, tk = TILES[fam if fam != "gu" else "gu"]
         P.mark("start")
         P.gemm("x0", "w16", "z16", tm, tn, tk); P.mark("fp16")
-        for mode, xn, zn in ((0, "x0", "z0"), (1, "x1", "z1"), (2, "x2", "z2")):
+        for mode, xn, zn in ((2, "x2", "z2"), (1, "x1", "z1"), (0, "x0", "z0")):
             P.gemm_step(xn, "w16", "w8", "wq", "ke", zn, tm, tn, tk, "%c0", "1", mode)
             P.mark(f"fp8mode{mode}")
         for nm, sd in (("z0", 330), ("z2", 330), ("z16", 330)):

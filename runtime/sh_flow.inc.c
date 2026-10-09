@@ -23,6 +23,15 @@
 #define SH_F_NPROF 8u
 
 static inline uint32_t sh_f_up64(uint32_t b) { return (b + 63u) & ~63u; }
+
+/* RedMulE fp16 trigger in ONE asm statement. The SDK's flex_redmule_trigger sets t0 / t1 / t2 in three separate asm
+ * statements that only clobber them; once inlined, GCC is free to use t0 as a temporary between them (seen: the
+ * address of a stack array element computed into t0 after `addi t0, x`, so RedMulE read X from a stack address and
+ * the TCDM reported an out-of-bound request; docs/SIMULATOR_NOTES.md #12). Clobbered registers cannot hold the
+ * inputs, so this form is safe. Encoding = the SDK's REDMULE_FP_16 word (rs1 t0, rs2 t1, rs3 t2, op 011). */
+static inline void sh_f_redmule_fp16(uint32_t x, uint32_t w, uint32_t y) {
+    __asm__ volatile ("mv t0, %0\n\tmv t1, %1\n\tmv t2, %2\n\t.word 0x386281aa" :: "r"(x), "r"(w), "r"(y) : "t0", "t1", "t2", "memory");
+}
 static inline uint32_t sh_f_up32(uint32_t n) { return (n + 31u) & ~31u; }
 
 /* ---- geometry of the KV-stationary deal ---------------------------------------------------- */
@@ -178,7 +187,7 @@ int sh_f_attention_kvs(uint64_t q, uint64_t ko, uint64_t vo, uint64_t tok, uint6
         }
         flex_intra_cluster_sync();
         SH_F_STAMP(2);
-        if (first) { flex_redmule_config(R, dh, Lpad); flex_redmule_trigger(a.qs, kt, a.s, REDMULE_FP_16); flex_redmule_wait(); }
+        if (first) { flex_redmule_config(R, dh, Lpad); sh_f_redmule_fp16(a.qs, kt, a.s); flex_redmule_wait(); }
         flex_intra_cluster_sync();
         SH_F_STAMP(3);
         /* masked row softmax over this key part; per-core validity rows (prefix from tok, own causal, padding 0) */
@@ -211,7 +220,7 @@ int sh_f_attention_kvs(uint64_t q, uint64_t ko, uint64_t vo, uint64_t tok, uint6
         sh_fp_fence();
         flex_intra_cluster_sync();
         SH_F_STAMP(4);
-        if (first) { flex_redmule_config(R, Lpad, dh); flex_redmule_trigger(a.s, vr, a.o, REDMULE_FP_16); flex_redmule_wait(); }
+        if (first) { flex_redmule_config(R, Lpad, dh); sh_f_redmule_fp16(a.s, vr, a.o); flex_redmule_wait(); }
         flex_intra_cluster_sync();
     }
     flex_global_barrier_xy();                  /* every partial (O, m, l) is in its cluster's TCDM */
@@ -338,7 +347,7 @@ int sh_f_gemm_w8(uint64_t x, uint64_t w8, uint64_t z, uint32_t M, uint32_t N, ui
         for (uint32_t kk = 0; kk < KT; ++kk) {
             const uint32_t cur = kk & 1, nxt = cur ^ 1;
             if (dm && kk + 1 < KT) SH_F_LOAD(nxt, kk + 1);
-            if (first) flex_redmule_trigger(X[cur], W[cur], y, REDMULE_FP_16);
+            if (first) sh_f_redmule_fp16(X[cur], W[cur], y);
             if (dm && kk + 1 < KT) bare_dma_wait_all();
             flex_intra_cluster_sync();
             if (expand && kk + 1 < KT) sh_f_expand(W[nxt], B[nxt], bb);
