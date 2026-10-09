@@ -198,3 +198,14 @@ python3 -m softhier_mlir.frontend.smolvla prepare-vlm --cams 3 --out /app/models
 .venv/bin/python tests/gvsoc/run.py smolvla-vlm --npz /app/models/smolvla_base/vlm_c3.npz --all-layers
 .venv/bin/python tests/gvsoc/run.py llmops --cluster all                                                     # the ops alone
 ```
+
+### Test-time adaptation: one LoRA step on the action expert (backward on SoftHier)
+
+Backward primitives (`runtime/sh_train.inc.c`: rmsnorm / silu_mul / softmax / attention backward, transposed-operand
+GEMMs, MSE, SGD / Adam on fp32 masters, data-parallel REDADD gradient sum) and the full 16-layer TTT step with LoRA r=16
+on q / o / down, every gradient checked against float64 torch on gvsoc; numbers and the deployment gaps in
+[`docs/TTT.md`](docs/TTT.md).
+
+```bash
+.venv/bin/python tests/gvsoc/ttt.py ops | layer | expert --layers 16 --profile | reduce | dp --layers 4
+```
