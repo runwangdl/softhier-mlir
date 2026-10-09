@@ -147,7 +147,7 @@ Deleted; the shared `sh_rmsnorm` costs ~10 us. The micro-benchmarks of the GEMM 
 ### Per-step RedMulE format (R4 hook)
 `expert.py flow --fmt fp8,fp16,int8,...` (one entry per step) sets `fmt_steps` on every weight GEMM inside the step loop; the
 emitter turns it into `.fmt = ((const uint32_t[]){SH_FP8, SH_FP16, ...})[i_step]` (`tests/filecheck/expert_translate.mlir`).
-Only the plumbing is verified: the operands stay fp16 in memory, so a step run with `SH_FP8` / `SH_INT8` computes on
+Real fp8 steps (fp8 weight copies, activation cast, measured schedules): docs/FLOW_DATAFLOW.md. The `fmt_steps` path below is plumbing only: the operands stay fp16 in memory, so a step run with `SH_FP8` / `SH_INT8` computes on
 misinterpreted bytes (its `x_t` is garbage by design; the following fp16 steps run normally on it). A real fp8 step needs
 fp8 weight copies in HBM (half the weight traffic, R2) and an fp16 -> fp8 cast of the activations in the GEMM's X staging.
 

@@ -132,7 +132,7 @@ Weight bytes in the south HBM region (where the flow program puts them) time ide
 | fp8 mode 1 (bytes + cast pass), stream | 11.253 ms | 256.3 / 29.8 MB | +12.9 % time, -26 % read |
 | fp8 mode 3 (bytes, cast fused: bound), stream | 9.821 ms | - | -1.4 % |
 | fp8 mode 3 + KV-stationary | 9.851 ms | 233.2 / 22.7 MB (+ 6.4 MB NoC) | -1.1 % time, **-32.5 % read** |
-| fp8 mode 2 (numbers path) | MODE2_STEP | - | |
+| fp8 mode 2 (numbers path: cast pass + fp16 W) | 11.94 ms | 345.7 MB + cast pass | +19.9 % |
 | fp8 mode 0 (core expansion) | 4 layers: 15.66 ms vs 2.90 ms fp16 (5.4x) | | |
 
 A first mode-1 measurement left the unwritten w' tiles as garbage; the garbage activations pushed `sh_rmsnorm` into its
@@ -141,7 +141,19 @@ call (0.6 us).
 
 ### Precision schedules (device, mode 2, full 10-step flow, stream attention)
 
-SCHEDULE_TABLE
+| schedule (fmt of the layer GEMMs per step) | x_10 vs lerobot fp32: max / mean / rms | vs device all-fp16: max / mean | vs own twin: max | chunk time, measured (mode 2) | chunk time, composed (mode 3 + KVS steps) | HBM read per chunk, composed (fp8 bytes path) |
+|---|---|---|---|---|---|---|
+| all fp16 | 0.0093 / 0.0009 / 0.0014 | - | 0.0107 | 99.6 ms | 100.2 ms (measured) | 3457 MB |
+| fp8 steps 0-2 | 0.0423 / 0.0024 / 0.0057 | 0.0483 / 0.0025 | 0.0155 | 105.9 ms | 99.7 ms | 3189 MB |
+| fp8 steps 0-5 | 0.0687 / 0.0037 / 0.0096 | 0.0744 / 0.0040 | 0.0194 | 111.7 ms | 99.2 ms | 2921 MB |
+| fp8 all steps | 0.1339 / 0.0075 / 0.0137 | 0.1335 / 0.0077 | 0.0251 | 119.5 ms | 98.5 ms | 2563 MB |
+| fp8 steps 7-9 (control) | 0.0333 / 0.0042 / 0.0055 | 0.0261 / 0.0043 | 0.0225 | 105.9 ms | 99.7 ms | 3189 MB |
+
+Max |action| is 1.71. "Own twin": the fp16-floor numpy model of the same schedule (the device's distance to it is the
+fp16 floor of the fp8 program; it grows from 0.011 to 0.025 with the number of fp8 steps). Measured per-step times in
+the mode-2 runs: fp8 step 11.93-11.97 ms, fp16 step 9.99-10.01 ms. The composed columns add measured single steps
+(fp8 step: mode 3 + KVS 9.851 ms, 233 MB read with KVS / 256 MB with the cast pass; fp16 step: 10.018 / 9.963 ms,
+345.7 MB) and are *not* end-to-end runs: mode 3 has invalid numbers by construction.
 
 numpy twin of the same schedules (`np_flow(fmt_steps=...)`), x_10 vs lerobot max / mean: all fp16 0.0016 / 0.00015;
 fp8 0-2 0.056 / 0.0021; fp8 0-5 0.086 / 0.0036; fp8 all 0.159 / 0.0078; fp8 7-9 0.025 / 0.0044; fp8 6-9 0.029 / 0.0046.
@@ -149,7 +161,16 @@ int8 (numpy only, W per output channel, X per row, symmetric /127): 0-5 0.023 / 
 7-9 0.011 / 0.0020. Not run on the device: RedMulE's int8 mode accumulates in int8, and int8 x int8 products do not
 fit an fp16 significand, so the fp16-RedMulE trick used for fp8 does not carry over.
 
-SCHEDULE_CONCLUSION
+**Conclusion.** Real fp8 steps work on the device and their error is what the quantiser predicts (device within
+0.016-0.025 of its twin). Where the fp8 steps go matters, but not the way R4 assumed: three early fp8 steps (0-2) give
+*half the mean* error of three late ones (7-9: 0.0024 vs 0.0042) but a *higher max* (0.042 vs 0.033), and all-fp8
+reaches 0.134 max (8 % of the largest action); per-tensor e4m3 on these near-uniform weights is coarse (2.6 % rms
+weight error), int8 per-channel would be ~4x more accurate (numpy). On today's SoftHier the fp8 step is *slower*:
++20 % with the numbers path, +13 % even with the bytes halved in the DMA (the activation cast pass costs more than the
+bytes save), 5.4x with core-side expansion. Only with a cast in the DMA path *and* the activation cast fused into its
+producer does an fp8 step reach -1.4 % time at -26 % (stream) / -33 % (with KVS) HBM read: per-step precision is a
+traffic / energy lever on this machine, not a latency lever, because the step is bound by core row ops (softmax,
+SiLU) and RedMulE runs at ~1 % of its peak (docs/SMOLVLA_EXPERT.md).
 
 ## 3. What hardware would make per-step precision cheap
 
