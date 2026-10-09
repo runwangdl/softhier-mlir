@@ -631,3 +631,36 @@ def emit_ops_test(seed: int = 5, cluster: int = -1, nsamples: int = 128) -> tupl
     m_, v_ = 0.1 * g, 0.001 * g * g
     ref["A32"] = f["w0"] - 0.01 * (m_ / 0.1) / (np.sqrt(v_ / 0.001) + 1e-8); ref["A16"] = ref["A32"]; ref["M32"] = m_; ref["V32"] = v_
     return P.module("ttt_ops"), P.pre, ref
+
+
+# ----------------------------------------------------------------------------- step 3b: the data-parallel gradient sum alone
+def emit_reduce_test(grads16: np.ndarray, nsamples: int = 2048, modes=(0, 1)) -> tuple[str, dict]:
+    """grads16: [P, n] fp16 per-cluster gradient arenas (n % 64 == 0). Cluster c's arena is preloaded at base + c * stride;
+    the program sums them with sh_t_allreduce in mode 0 (fp16 REDADD) and mode 1 (exact two-limb integer REDADD, fp32 out),
+    a mark around each, and dumps samples of both results."""
+    Pn, n = grads16.shape
+    rows = n // ARENA_COLS
+    P = TProg(-1, nsamples)
+    T, op = P.T, P.op
+    stride = (n * 2 + 4095) & ~4095
+    base = P.e.next_off
+    for c in range(Pn):
+        P.pre[base + c * stride] = np.ascontiguousarray(grads16[c].reshape(rows, ARENA_COLS))
+    P.e.next_off = base + Pn * stride
+    T["gsrc"] = f'memref<{rows}x{ARENA_COLS}xf16, "{P.sp}">'
+    op(f"%gsrc = softhier.hbm_buffer {{offset = {base} : i32}} : {T['gsrc']}")      # cluster 0's arena; cluster c's at + c stride
+    P.B("g16", rows, ARENA_COLS); P.B("g32", rows, ARENA_COLS, elem="f32"); P.B("scal", 1, 32)
+    sent = sentinel_array(); P.B("sentinel", *sent.shape, sent)
+    op(f"softhier.preload_wait %sentinel : {T['sentinel']}")
+    P.mark("start")
+    if 0 in modes:
+        op(f"softhier.grad_allreduce %gsrc -> %g16, %scal {{src_stride = {stride} : i32, mode = 0 : i32}} : {T['gsrc']} -> {T['g16']}, {T['scal']}")
+        P.mark("redadd_fp16")
+    if 1 in modes:
+        op(f"softhier.grad_allreduce %gsrc -> %g32, %scal {{src_stride = {stride} : i32, mode = 1 : i32}} : {T['gsrc']} -> {T['g32']}, {T['scal']}")
+        P.mark("redadd_limbs")
+    if 0 in modes:
+        P.dumps("g16", 11, "R16")
+    if 1 in modes:
+        P.dumps("g32", 12, "R32")
+    return P.module("ttt_reduce"), P.pre

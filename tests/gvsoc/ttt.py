@@ -183,6 +183,60 @@ def run_expert(npz: str, layers: int, nsamples: int, opt: str, lr: float, profil
     return ok
 
 
+def sample_grads(npz: str, layers: int, nsamp: int, seed: int, loss_scale: float, cache: Path) -> np.ndarray:
+    """[nsamp, layers * 98048] fp16 LoRA gradients (times loss_scale) of nsamp TTT samples from torch float64: sample c has its
+    own noise x_c ~ N(0, 1) and target x_c - a (cached)."""
+    from softhier_mlir.frontend import smolvla_ttt as TT
+    if cache.exists():
+        return np.load(cache)["g"]
+    data = np.load(npz)
+    W = {k[2:]: data[k] for k in data.files if k.startswith("p_")}
+    act = data["ref_actions"].reshape(TT.S, TT.AD)
+    lora = TT.lora_init(layers, seed)
+    out = []
+    for c in range(nsamp):
+        x = np.random.default_rng(1000 + c).standard_normal((TT.S, TT.AD)).astype(np.float16)
+        ref = TT.torch_ttt(W, layers, True, lora, lr=0.0, x_in=x, target=(x.astype(np.float32) - act).astype(np.float16))
+        out.append((ref["grad"] * loss_scale).astype(np.float16))
+        print(f"[ttt] sample {c}: loss {ref['loss']:.4f} max |g| {np.abs(ref['grad']).max():.2e}", flush=True)
+    g = np.stack(out)
+    np.savez(cache, g=g)
+    return g
+
+
+def run_reduce(npz: str, layers: int, seed: int, loss_scale: float, nsamples: int) -> bool:
+    """Step 3: the data-parallel gradient sum alone, on 16 real per-sample LoRA gradient arenas (full size): device REDADD
+    (fp16, and the exact two-limb integer scheme) vs the float64 sum of the same fp16 inputs."""
+    from softhier_mlir.frontend import smolvla_ttt as TT
+    g = sample_grads(npz, layers, 16, seed, loss_scale, HERE / "ttt_app" / f"grads_L{layers}_s{seed}.npz")
+    exact = g.astype(np.float64).sum(0)
+    rows = exact.size // TT.ARENA_COLS
+    ex2 = exact.reshape(rows, TT.ARENA_COLS)
+    floor = ex2.astype(np.float16).astype(np.float64)
+    tiny = np.abs(g.astype(np.float64)) < 2.0 ** -14
+    print(f"[ttt] {g.shape[0]} arenas x {g.shape[1]} fp16 ({g.shape[1] * 2 / 2 ** 20:.2f} MiB each); |sum| max {np.abs(exact).max():.1f}; "
+          f"subnormal fp16 inputs {tiny.mean() * 100:.3f} %; fp16(sum) vs sum: rel-L2 {np.linalg.norm(floor - ex2) / np.linalg.norm(ex2):.2e}")
+    app = _app(HERE / "ttt_app")
+    mlir, pre = TT.emit_reduce_test(g, nsamples)
+    r = _build_and_run(app, mlir, pre, 7200, None)
+    ok = r["ok"]
+    print(f"{'PASS' if ok else 'FAIL'} ttt reduce roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[sh_"):
+            print("     " + ln)
+    for t, dt in timing(r["stdout"]):
+        print(f"     time {t:<14} {dt / 1e3:9.1f} us   ({g.shape[1] * 2 / dt:.1f} B/ns of one cluster's arena)")
+    got = parse_all(r["stdout"])
+    for tag in ("R16", "R32"):
+        if tag not in got:
+            print(f"     {tag} MISSING"); ok = False; continue
+        cmp(tag, got[tag], ex2, 1e-2)
+        zero = sum(1 for rr, cc, v in got[tag] if v == 0.0 and ex2[rr, cc] != 0.0)
+        print(f"            {tag}: {zero} of {len(got[tag])} samples flushed to 0; floor fp16(sum) on the same samples: "
+              f"max abs {max(abs(floor[rr, cc] - ex2[rr, cc]) for rr, cc, _ in got[tag]):.3e}")
+    return ok
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("test", choices=["ops", "layer", "expert", "reduce"])
@@ -199,6 +253,8 @@ if __name__ == "__main__":
         ok = run_ops(a.seed, a.nsamples)
     elif a.test == "layer":
         ok = run_layer(a.seed, a.nsamples, a.opt, a.lr)
+    elif a.test == "reduce":
+        ok = run_reduce(a.npz, a.layers, a.seed, a.loss_scale or 65536.0, a.nsamples)
     elif a.test == "expert":
         ok = run_expert(a.npz, a.layers, a.nsamples, a.opt, a.lr, a.profile, a.seed, a.loss_scale)
     else:

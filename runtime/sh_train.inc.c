@@ -665,6 +665,19 @@ int sh_t_attention_fwd(uint64_t q, uint64_t kp, uint64_t vp, uint64_t ko, uint64
  * Returns the number of rounds. */
 #define SH_T_RED_CHUNK 0x4000u          /* 16 KB per chunk: 16 slots x (hi | lo | out) fit TCDM */
 static inline uint16_t sh_t_mask_all(uint32_t dim) { return (uint16_t)~(dim - 1u); }
+/* gvsoc collective model: a destination-initiated reduction accumulates the pulled data INTO the read-burst buffer the
+ * root's iDMA back-end hands the request (and every intermediate router's copy of it), and those 4 KB buffers are a
+ * static FIFO pool of ARCH_IDMA_OUTSTAND_BURST entries that keeps whatever the burst 256 reads earlier carried. So
+ * REDADD returns sum + stale (pool contents) once the pool has wrapped (first reductions of a run looked right). Real
+ * hardware starts from zero. Workaround: read ARCH_IDMA_OUTSTAND_BURST x 4 KB of zeros from the cluster's zero memory
+ * (on the same AXI back-end) right before the reduction, so the bursts it gets (<= 256, FIFO order) hold zeros.
+ * Cost: 1 MB of local zero reads per owner and reduction step (~16 k cycles). */
+#define SH_T_RED_ZSCR 0xC0000u                 /* 128 KB TCDM sink for the zero reads (above the reduction's buffers) */
+SH_T_COLD static void sh_t_red_flush(void) {
+    for (uint32_t i = 0; i < ARCH_IDMA_OUTSTAND_BURST * 4096u / ARCH_CLUSTER_ZOMEM_SIZE; ++i)
+        bare_dma_start_1d(local(SH_T_RED_ZSCR), zomem(0), ARCH_CLUSTER_ZOMEM_SIZE);
+    bare_dma_wait_all();
+}
 static inline void sh_t_red_stage(uint32_t slots, uint64_t mine, uint32_t rd, uint32_t P, uint32_t nchunk, uint32_t n) {
     const uint32_t CH = SH_T_RED_CHUNK, ce = CH / 2;
     for (uint32_t r = 0; r < P; ++r) {
@@ -738,21 +751,31 @@ SH_T_COLD int sh_t_allreduce(uint64_t dst, uint64_t src, uint32_t src_stride, ui
                 hp[i] = (uint16_t)(qv >> 12); lp[i] = (uint16_t)(qv & 0xFFF);
             }
         }
-        flex_global_barrier_xy();
         const uint32_t c = rd * P + cid;
-        if (c < nchunk && dm) {
-            const uint32_t ne = (n - c * ce) < ce ? (n - c * ce) : ce;
-            if (mode == 0) {
-                flex_dma_async_reduction(rhi, slots + cid * CH, ne * 2, COLLECTIVE_REDADD_FP_16, rm, cm);
-                flex_dma_async_wait_all();
-            } else {
-                flex_dma_async_reduction(rhi, slots + cid * CH, ne * 2, COLLECTIVE_REDADD_INT_16, rm, cm);
-                flex_dma_async_wait_all();
-                flex_dma_async_reduction(rlo, lslots + cid * CH, ne * 2, COLLECTIVE_REDADD_UINT_16, rm, cm);
-                flex_dma_async_wait_all();
+        if (c < nchunk && dm) sh_t_red_flush();   /* all owners at once: only the owner's own iDMA reads until its reduction */
+        flex_global_barrier_xy();
+        /* all 16 owners issue at once (checked exact against constant per-cluster data, 0.71 vs 0.76 ms serialised for a
+         * 3 MiB arena); SH_T_RED_SERIAL makes them take turns (one reduction on the NoC at a time). */
+#ifdef SH_T_RED_SERIAL
+        for (uint32_t owner = 0; owner < P; ++owner) {
+            if (owner == cid && c < nchunk && dm) {
+#else
+        {
+            if (c < nchunk && dm) {
+#endif
+                const uint32_t ne = (n - c * ce) < ce ? (n - c * ce) : ce;
+                if (mode == 0) {
+                    flex_dma_async_reduction(rhi, slots + cid * CH, ne * 2, COLLECTIVE_REDADD_FP_16, rm, cm);
+                    flex_dma_async_wait_all();
+                } else {
+                    flex_dma_async_reduction(rhi, slots + cid * CH, ne * 2, COLLECTIVE_REDADD_INT_16, rm, cm);
+                    flex_dma_async_wait_all();
+                    flex_dma_async_reduction(rlo, lslots + cid * CH, ne * 2, COLLECTIVE_REDADD_UINT_16, rm, cm);
+                    flex_dma_async_wait_all();
+                }
             }
+            flex_global_barrier_xy();      /* every pull done: the slots may be overwritten / the NoC is free */
         }
-        flex_global_barrier_xy();          /* every pull done: the slots may be overwritten */
         if (c < nchunk) {
             const uint32_t ne = (n - c * ce) < ce ? (n - c * ce) : ce;
             if (mode == 0) {
