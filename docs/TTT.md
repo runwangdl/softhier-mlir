@@ -161,7 +161,20 @@ The 0.71 ms is 14x the line-rate model (127 + 3.1 MB / 64 B/cycle = 49 us): ever
 from HBM into TCDM slots (50 MB of HBM reads in total), plus the burst-buffer flush (below). Gradients that are
 accumulated per chunk in TCDM would remove the staging.
 
-DP_RESULT_PLACEHOLDER
+**End to end** (`ttt.py dp --layers 4 --loss-scale 16384`): every cluster runs the whole step on its own sample
+(`cluster = SH_SELF`, activations and gradients in a 10 MiB per-cluster HBM region, the program indexes it with
+`softhier.cluster_id`), then the fp16 REDADD and SGD with the mean gradient. 4 layers because 16 regions of the full
+16-layer step (22 MB each) plus the weights do not fit the 256 MiB the preload reaches.
+
+| quantity | value |
+|---|---|
+| cluster 0's v vs torch | max abs 0.042 of 5.4 (rel-L2 4.4e-3) |
+| mean LoRA gradient (16 samples, after the fp16 REDADD), layers 0 and 3 | rel-L2 0.18 % - 3.7 % (max abs <= 2.7 % of max), 10 of 12 tensors <= 1 % |
+| time (cluster 0's marks) | fwd 24.3 ms, loss 0.84 ms, bwd 40.4 ms, REDADD 6.44 ms (incl. waiting for the slowest cluster; the reduction itself ~0.2 ms for 0.75 MiB), SGD 0.54 ms: **72.6 ms for 16 samples x 4 layers** |
+| extrapolated to 16 layers | ~0.26 s per 16 samples = **~16 ms per sample** (vs 30.6 ms with all 16 clusters on one sample), latency 0.26 s, 16 x 22 MB of activations |
+
+Data parallelism buys ~1.9x throughput at M = 50 (a single cluster's GEMMs and attention heads run without the
+cross-cluster barriers and with whole tiles), at 16x the latency and 16x the activation memory.
 
 ## 6. What the simulator / toolchain made necessary (also docs/SIMULATOR_NOTES.md #12-#14)
 
