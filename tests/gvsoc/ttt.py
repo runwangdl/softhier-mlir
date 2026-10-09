@@ -26,12 +26,12 @@ from tests.gvsoc.expert import _build_and_run, marks_seq  # noqa: E402
 HERE = Path(__file__).resolve().parent
 
 
-def _app(app_dir: Path) -> Path:
+def _app(app_dir: Path, defines: str = "") -> Path:
     """The SDK app dir; the library is built without the mesh SUMMA (unused, 4.5 KB of the 64 KB instruction memory)."""
     app = Path(app_dir)
     app.mkdir(parents=True, exist_ok=True)
     rt = (HERE / "../../runtime").resolve()
-    (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c -DSH_NO_GEMM_MESH PARENT_SCOPE)\n"
+    (app / "CMakeLists.txt").write_text(f"set(SOURCES ${{CMAKE_CURRENT_SOURCE_DIR}}/main.c {rt}/sh_ops.c -DSH_NO_GEMM_MESH{defines} PARENT_SCOPE)\n"
                                         f"set(INCLUDE_DIRS {rt} PARENT_SCOPE)\n")
     return app
 F32_RE = re.compile(r"^(\S+) (\d+) (\d+) ([0-9a-fA-F]{8})$")
@@ -94,9 +94,12 @@ def _grad_report(got: dict, ref: dict, layers_dumped, scale: float, lr: float, r
             gref = TT.lora_tensor(ref["grad"], L, nm) * scale
             wref = TT.lora_tensor(ref["w_new"], L, nm)
             tg, tw = f"G{nm.upper()}{L}", f"W{nm.upper()}{L}"
-            if tg not in got or tw not in got:
-                print(f"     {tg} / {tw} MISSING"); ok = False; continue
+            if tg not in got:
+                print(f"     {tg} MISSING"); ok = False; continue
             g_ok, g_err, g_rel = cmp(tg, got[tg], gref, rtol)
+            ok &= g_ok
+            if tw not in got:
+                continue
             w0 = TT.lora_tensor(ref["w0"], L, nm)
             upd = wref - w0
             w_err = max(abs(v - float(wref[r, c])) for r, c, v in got[tw])
@@ -237,9 +240,49 @@ def run_reduce(npz: str, layers: int, seed: int, loss_scale: float, nsamples: in
     return ok
 
 
+def run_dp(npz: str, layers: int, nsamples: int, lr: float, seed: int, loss_scale: float, profile: bool) -> bool:
+    """Step 3, data-parallel: 16 clusters, one TTT sample each (own noise x_c, target x_c - a), the whole fwd + bwd on the
+    cluster's own sample (SH_SELF), LoRA gradients summed with the in-network fp16 REDADD, SGD with their mean."""
+    from softhier_mlir.frontend import smolvla_ttt as TT
+    data = np.load(npz)
+    W = {k[2:]: data[k] for k in data.files if k.startswith("p_")}
+    act = data["ref_actions"].reshape(TT.S, TT.AD)
+    lora = TT.lora_init(layers, seed)
+    xs = [np.random.default_rng(1000 + c).standard_normal((TT.S, TT.AD)).astype(np.float16) for c in range(16)]
+    ts = [(x.astype(np.float32) - act).astype(np.float16) for x in xs]
+    refs = [TT.torch_ttt(W, layers, True, lora, lr=lr, x_in=x, target=t) for x, t in zip(xs, ts)]
+    g = np.mean([r["grad"] for r in refs], axis=0)
+    ref = {"grad": g, "w_new": lora.astype(np.float64) - lr * g, "w0": lora.astype(np.float64)}
+    print(f"[ttt] dp: 16 samples, torch float64 mean loss {np.mean([r['loss'] for r in refs]):.5f}, max |mean grad| {np.abs(g).max():.2e}")
+    app = _app(HERE / "ttt_app", " -DSH_T_NO_RED_EXACT")
+    dl = (0, layers - 1)
+    mlir, pre, info = TT.emit_ttt(W, layers, True, lora, lr=lr, loss_scale=loss_scale, nsamples=nsamples, profile=profile,
+                                  dump_layers=dl, x_in=xs, target=ts, dp=True)
+    print(f"[ttt] per-cluster region {info['pcs'] / 2 ** 20:.1f} MiB")
+    r = _build_and_run(app, mlir, pre, 48 * 3600, app / "run.log")
+    ok = r["ok"]
+    print(f"{'PASS' if ok else 'FAIL'} ttt dp layers={layers} roi={r['roi_ns']} ns wall={r['wall_s']}s")
+    for ln in r["stdout"].splitlines():
+        if ln.startswith("[sh_"):
+            print("     " + ln)
+    agg: dict = {}
+    for t, dt in timing(r["stdout"]):
+        k = re.sub(r"\d+$", "", t)
+        agg.setdefault(k, [0, 0]); agg[k][0] += dt; agg[k][1] += 1
+    for k, (t, n) in agg.items():
+        print(f"     time {k:<9} {t / 1e3:10.1f} us  ({n} x {t / n / 1e3:.1f})")
+    got = parse_all(r["stdout"])
+    if "V" in got:
+        cmp("V(c0)", got["V"], refs[0]["v"], 5e-2)
+    ok &= _grad_report(got, ref, dl, loss_scale * 16, lr, 5e-2)
+    if not r["ok"]:
+        print(r["stdout"][-2000:])
+    return ok
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["ops", "layer", "expert", "reduce"])
+    ap.add_argument("test", choices=["ops", "layer", "expert", "reduce", "dp"])
     ap.add_argument("--seed", type=int, default=5)
     ap.add_argument("--nsamples", type=int, default=128)
     ap.add_argument("--opt", default="sgd")
@@ -255,6 +298,8 @@ if __name__ == "__main__":
         ok = run_layer(a.seed, a.nsamples, a.opt, a.lr)
     elif a.test == "reduce":
         ok = run_reduce(a.npz, a.layers, a.seed, a.loss_scale or 65536.0, a.nsamples)
+    elif a.test == "dp":
+        ok = run_dp(a.npz, a.layers, a.nsamples, a.lr, a.seed, a.loss_scale or 4096.0, a.profile)
     elif a.test == "expert":
         ok = run_expert(a.npz, a.layers, a.nsamples, a.opt, a.lr, a.profile, a.seed, a.loss_scale)
     else:

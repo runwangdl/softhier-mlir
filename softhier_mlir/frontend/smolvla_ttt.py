@@ -70,8 +70,21 @@ TT = {"lq": (S, R, D), "lqb": (S, 64, R), "lo": (S, R, DQ), "lob": (S, 48, R), "
 class TProg(_Prog):
     """_Prog with f32 buffers, indexed buffers / views and the op spellings of the training ops."""
 
-    def B(self, name, rows, cols, arr=None, elem="f16"):
+    PCB = 0x04000000            # data-parallel programs: per-cluster region base (cluster c at PCB + c * PCS); > the 4-layer weights
+    dp = False
+
+    def B(self, name, rows, cols, arr=None, elem="f16", pc=False, pc_arrs=None):
         esz = 4 if elem == "f32" else 2
+        if pc and self.dp:     # per-cluster buffer: offset fixed up at module() time (__PCS__ = the per-cluster stride)
+            rel = self.pc_cur
+            self.pc_cur += (rows * cols * esz + 4095) & ~4095
+            if pc_arrs is not None:
+                self.pc_pre.append((rel, pc_arrs))
+            self.T[name] = f'memref<{rows}x{cols}x{elem}, "{self.sp}">'
+            self.e.lines.append(f"    %{name} = softhier.hbm_buffer %cid {{offset = {self.PCB + rel} : i32, stride = __PCS__ : i32}} : {self.T[name]}")
+            return name
+        if pc and arr is None and pc_arrs is not None:
+            arr = pc_arrs[0]
         off = self.e.next_off
         if arr is not None:
             assert arr.shape == (rows, cols), (name, arr.shape, rows, cols)
@@ -152,6 +165,8 @@ class TProg(_Prog):
 
     def module(self, name):
         body = "\n".join(self.e.lines)
+        if self.dp:
+            body = body.replace("__PCS__", str(self.pcs)).replace("__PCK__", str(self.pck))
         return f'builtin.module {{\n  func.func @{name}() attributes {{sh.optimize = "Os"}} {{\n{body}\n    func.return\n  }}\n}}\n'
 
 
@@ -223,7 +238,7 @@ def _layer_bwd(P: TProg, kind: str, sl: dict, W: dict, Lw: dict, Gw: dict, kv: d
 def _bwd_buffers(P: TProg):
     for nm, r, c in [("dm", S, FF), ("dgu", S, 2 * FF), ("dxn", S, D), ("dh1", S, D), ("do", S, DQ), ("dqkv", S, DQ + 2 * DKV),
                      ("ascr", S, 2 * H * DH), ("lscr", 5120, S)]:
-        P.B(nm, r, c)
+        P.B(nm, r, c, pc=True)
     P.vw("dga", "dgu", S, FF, 2 * FF, 0); P.vw("dup", "dgu", S, FF, 2 * FF, FF)
     P.vw("dq", "dqkv", S, DQ, DQ + 2 * DKV, 0); P.vw("dk", "dqkv", S, DKV, DQ + 2 * DKV, DQ); P.vw("dv", "dqkv", S, DKV, DQ + 2 * DKV, DQ + DKV)
 
@@ -267,27 +282,37 @@ def lora_init(layers: int, seed: int) -> np.ndarray:
 
 def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float = 1e-3, opt: str = "sgd", loss_scale: float = 1.0,
              step: int = 0, nsamples: int = 128, cluster: int = -1, profile: bool = False, dump_layers=(0,), x_in=None, target=None,
-             h_in=None, dh_in=None, extra_dumps=()) -> tuple[str, dict, dict]:
+             h_in=None, dh_in=None, extra_dumps=(), dp: bool = False) -> tuple[str, dict, dict]:
     """The TTT step program. Wt: weights in library layout (smolvla_expert.to_library_layout names, numpy fp16) incl. the
     host tables (rq_self, rq_cross, tok, kp{L}, vp{L}, and for head=True: wa ba wti tb wto bto gf wout bout).
     head=True: x_t (x_in [50, 32]) -> suffix embedding (time row `step`) -> layers -> final norm -> v; MSE(v, target) with the
     gradient scaled by loss_scale; head=False: h_in [50, 720] -> layers, the output gradient dh_in [50, 720] is given.
     Then backward into the LoRA arena and one optimizer step (opt = sgd | adam, lr; gradients divided by loss_scale).
+    dp=True: the data-parallel variant: x_in / target are lists of one sample per cluster, every cluster runs the whole step
+    on its own sample (cluster = SH_SELF, activations / gradients in a per-cluster HBM region), the per-cluster LoRA
+    gradients are summed with the in-network REDADD (sh_t_allreduce mode 0) and the optimizer applies their mean.
     Returns (mlir, preload, info) with info = buffer offsets for the host-side checks."""
     assert layers % 2 == 0
-    P = TProg(cluster, nsamples)
+    P = TProg(-2 if dp else cluster, nsamples)
     T, op = P.T, P.op
+    lay, sstride = _slab_layout()
+    if dp:
+        assert head and len(x_in) == 16
+        P.dp, P.pc_cur, P.pc_pre = True, (layers + 1) * sstride, []
+        op("%cid = softhier.cluster_id : index")
     N = layers * LAYER_N
     rows = N // ARENA_COLS
     # ---- buffers: activations shared between layers, backward scratch, LoRA arenas, tables, weights, slabs
     for nm, r, c in [("xn2", S, D), ("ao", S, D), ("dhB", S, D)]:
-        P.B(nm, r, c)
-    P.B("dhA", S, D, None if head else (dh_in.astype(np.float32) * loss_scale).astype(np.float16))
+        P.B(nm, r, c, pc=True)
+    P.B("dhA", S, D, None if head else (dh_in.astype(np.float32) * loss_scale).astype(np.float16), pc=True)
     _bwd_buffers(P)
     w32 = np.ascontiguousarray(lora16.astype(np.float32).reshape(rows, ARENA_COLS))
     P.B("w16", rows, ARENA_COLS, lora16.reshape(rows, ARENA_COLS))
     P.B("w32", rows, ARENA_COLS, w32, elem="f32")
-    P.B("g16", rows, ARENA_COLS)
+    P.B("g16", rows, ARENA_COLS, pc=True)
+    if dp:
+        P.B("gsum", rows, ARENA_COLS); P.B("scal", 1, 32)
     if opt == "adam":
         P.B("m32", rows, ARENA_COLS, np.zeros_like(w32), elem="f32"); P.B("v32", rows, ARENA_COLS, np.zeros_like(w32), elem="f32")
     for nm in ("rq_self", "rq_cross"):
@@ -301,19 +326,39 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
         bc = lambda row: np.ascontiguousarray(np.broadcast_to(np.asarray(row, np.float16).reshape(1, -1), (S, row.size)))  # noqa: E731
         P.B("ba_b", S, D, bc(Wt["ba"])); P.B("tb_b", S, D, bc(Wt["tb"][step])); P.B("bto_b", S, D, bc(Wt["bto"]))
         P.B("bout_b", S, AD, bc(Wt["bout"])); P.B("ones", S, D, np.ones((S, D), np.float16))
-        P.B("x", S, AD, x_in.astype(np.float16)); P.B("tgt", S, AD, target.astype(np.float16))
+        xs = [np.asarray(a, np.float16) for a in (x_in if dp else [x_in])]
+        ts = [np.asarray(a, np.float16) for a in (target if dp else [target])]
+        P.B("x", S, AD, pc=True, pc_arrs=xs); P.B("tgt", S, AD, pc=True, pc_arrs=ts)
         for nm, r, c in [("e", S, D), ("e1", S, D), ("fin", S, D), ("vt", S, AD), ("dvt", S, AD), ("dfin", S, D)]:
-            P.B(nm, r, c)
-        P.B("lrows", S, 1, elem="f32")
-    # slabs: one per layer + the final residual
-    lay, sstride = _slab_layout()
-    slab0 = P.e.next_off
-    if not head:
-        P.pre[slab0 + lay["hin"]] = h_in.astype(np.float16)
-    P.e.next_off = slab0 + (layers + 1) * sstride
-    for nm, off in (("hfin", slab0 + layers * sstride + lay["hin"]), ("h0", slab0 + lay["hin"])):
-        T[nm] = f'memref<{S}x{D}xf16, "{P.sp}">'
-        op(f"%{nm} = softhier.hbm_buffer {{offset = {off} : i32}} : {T[nm]}")
+            P.B(nm, r, c, pc=True)
+        P.B("lrows", S, 1, elem="f32", pc=True)
+    # slabs: one per layer + the final residual (dp: at the start of each cluster's region, slab index = cid K + layer)
+    if dp:
+        slab0 = P.PCB
+        P.pck = -(-P.pc_cur // sstride)
+        P.pcs = P.pck * sstride
+        assert P.PCB + 16 * P.pcs <= 0x10000000, f"16 per-cluster regions of {P.pcs / 2 ** 20:.1f} MiB exceed the 256 MiB the preload reaches"
+        for rel, arrs in P.pc_pre:
+            for c, a in enumerate(arrs):
+                P.pre[P.PCB + c * P.pcs + rel] = a
+        op(f"%cK = arith.constant __PCK__ : index"); op("%cidK = arith.muli %cid, %cK : index")
+        for nm, off in (("hfin", slab0 + layers * sstride + lay["hin"]), ("h0", slab0 + lay["hin"])):
+            T[nm] = f'memref<{S}x{D}xf16, "{P.sp}">'
+            op(f"%{nm} = softhier.hbm_buffer %cid {{offset = {off} : i32, stride = __PCS__ : i32}} : {T[nm]}")
+    else:
+        slab0 = P.e.next_off
+        if not head:
+            P.pre[slab0 + lay["hin"]] = h_in.astype(np.float16)
+        P.e.next_off = slab0 + (layers + 1) * sstride
+        for nm, off in (("hfin", slab0 + layers * sstride + lay["hin"]), ("h0", slab0 + lay["hin"])):
+            T[nm] = f'memref<{S}x{D}xf16, "{P.sp}">'
+            op(f"%{nm} = softhier.hbm_buffer {{offset = {off} : i32}} : {T[nm]}")
+
+    def sidx(L):      # slab index of layer SSA value L (dp: cid K + L)
+        if not dp:
+            return L
+        op(f"%S{L} = arith.addi %cidK, %{L} : index")
+        return f"S{L}"
     # weights: per (self, cross) pair slabs at a constant stride (the flow program's layout)
     SELF = [("wqkv", D, DQ + 2 * DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D), ("kp", LP, DKV), ("vp", LP, DKV)]
     CROSS = [("wq", D, DQ), ("wkx", DKV, DKV), ("wvx", DKV, DKV), ("wo", DQ, D), ("wgu", D, 2 * FF), ("wd", FF, D), ("g1", 1, D), ("g2", 1, D),
@@ -344,7 +389,7 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     # ---- once per chunk: cross-layer KV projection (frozen)
     op("scf.for %p = %c0 to %cP step %c1 {")
     w = wslab(["kp", "vp", "wkx", "wvx", "kx", "vx"], "c")
-    P.g(w["kp"], w["wkx"], w["kx"], E.TILES["kv"]); P.g(w["vp"], w["wvx"], w["vx"], E.TILES["kv"])
+    P.g(w["kp"], w["wkx"], w["kx"], E.TILES["kv"], cl="cluster = -1 : i32"); P.g(w["vp"], w["wvx"], w["vx"], E.TILES["kv"], cl="cluster = -1 : i32")
     op("}")
     P.mark("kvproj")
     # ---- forward
@@ -357,8 +402,8 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     op("scf.for %p = %c0 to %cP step %c1 {")
     op("%L0 = arith.muli %p, %c2 : index"); op("%L1 = arith.addi %L0, %c1 : index"); op("%L2 = arith.addi %L0, %c2 : index")
     ws = wslab([n for n, _, _ in SELF], "s"); wc = wslab([n for n, _, _ in CROSS if n not in ("wkx", "wvx")], "c")
-    s0, s1 = _slab_decl(P, "L0", "_0", slab0, sstride, lay), _slab_decl(P, "L1", "_1", slab0, sstride, lay)
-    hnext = P.ib("hin_2", "L2", slab0 + lay["hin"], sstride, S, D)
+    s0, s1 = _slab_decl(P, sidx("L0"), "_0", slab0, sstride, lay), _slab_decl(P, sidx("L1"), "_1", slab0, sstride, lay)
+    hnext = P.ib("hin_2", sidx("L2"), slab0 + lay["hin"], sstride, S, D)
     l0, l1 = _lora_views(P, "w16", "L0", "_f0"), _lora_views(P, "w16", "L1", "_f1")
     _layer_fwd(P, "self", s0, s1["hin"], ws, l0, {"kp": ws["kp"], "vp": ws["vp"]})
     if profile:
@@ -383,7 +428,7 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     op("%p = arith.subi %cPm1, %pr : index")
     op("%L0 = arith.muli %p, %c2 : index"); op("%L1 = arith.addi %L0, %c1 : index")
     ws = wslab([n for n, _, _ in SELF], "s"); wc = wslab([n for n, _, _ in CROSS if n not in ("wkx", "wvx")], "c")
-    s0, s1 = _slab_decl(P, "L0", "_b0", slab0, sstride, lay), _slab_decl(P, "L1", "_b1", slab0, sstride, lay)
+    s0, s1 = _slab_decl(P, sidx("L0"), "_b0", slab0, sstride, lay), _slab_decl(P, sidx("L1"), "_b1", slab0, sstride, lay)
     l0, l1 = _lora_views(P, "w16", "L0", "_b0"), _lora_views(P, "w16", "L1", "_b1")
     g0, g1 = _lora_views(P, "g16", "L0", "_g0"), _lora_views(P, "g16", "L1", "_g1")
     _layer_bwd(P, "cross", s1, wc, l1, g1, {"kx": wc["kx"], "vx": wc["vx"]}, "dhA", "dhB", marks=profile, pidx="%L1")
@@ -394,15 +439,22 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
         P.mark("bself", "%L0")
     op("}")
     P.mark("bwd")
+    gname = "g16"
+    if dp:   # sum of the 16 per-cluster gradient arenas with the in-network REDADD; the optimizer applies the mean
+        T["g16c0"] = T["g16"]
+        op(f"%g16c0 = softhier.hbm_buffer {{offset = {P.PCB + int(next(ln for ln in P.e.lines if '%g16 = ' in ln).split('offset = ')[1].split(' ')[0]) - P.PCB} : i32}} : {T['g16']}")
+        op(f"softhier.grad_allreduce %g16c0 -> %gsum, %scal {{src_stride = __PCS__ : i32, mode = 0 : i32}} : {T['g16c0']} -> {T['gsum']}, {T['scal']}")
+        P.mark("allreduce")
+        gname, P.cl, loss_scale = "gsum", "cluster = -1 : i32", loss_scale * 16
     # ---- optimizer on the whole arena
     inv = 1.0 / loss_scale
     if opt == "adam":
-        op(f'softhier.optim_step %g16, %w32 -> %w16 moments %m32, %v32 {{kind = "adam", lr = {lr!r} : f32, inv_scale = {inv!r} : f32, '
+        op(f'softhier.optim_step %{gname}, %w32 -> %w16 moments %m32, %v32 {{kind = "adam", lr = {lr!r} : f32, inv_scale = {inv!r} : f32, '
            f'b1 = 0.9 : f32, b2 = 0.999 : f32, eps = 1.0e-8 : f32, bc1 = 0.1 : f32, bc2 = 0.001 : f32, {P.cl}}} : '
-           f"{T['g16']}, {T['w32']} -> {T['w16']} moments {T['m32']}, {T['v32']}")
+           f"{T[gname]}, {T['w32']} -> {T['w16']} moments {T['m32']}, {T['v32']}")
     else:
-        op(f'softhier.optim_step %g16, %w32 -> %w16 {{kind = "sgd", lr = {lr!r} : f32, inv_scale = {inv!r} : f32, {P.cl}}} : '
-           f"{T['g16']}, {T['w32']} -> {T['w16']}")
+        op(f'softhier.optim_step %{gname}, %w32 -> %w16 {{kind = "sgd", lr = {lr!r} : f32, inv_scale = {inv!r} : f32, {P.cl}}} : '
+           f"{T[gname]}, {T['w32']} -> {T['w16']}")
     P.mark("opt")
     # ---- dumps (after the timed region where possible: they read buffers nothing writes later)
     if head:
@@ -411,13 +463,16 @@ def emit_ttt(Wt: dict, layers: int, head: bool, lora16: np.ndarray, *, lr: float
     for L in dump_layers:
         for i, (nm, r, c) in enumerate(LORA):
             off = L * LAYER_N + LORA_OFF[nm]
-            vg = P.vw(f"dg_{nm}{L}", "g16", r, c, c, off)
+            vg = P.vw(f"dg_{nm}{L}", gname, r, c, c, off)
             P.dumps(vg, 400 + 10 * L + i, f"G{nm.upper()}{L}")
-            vw32 = P.vw(f"dw_{nm}{L}", "w32", r, c, c, off, elem="f32")
-            P.dumps(vw32, 500 + 10 * L + i, f"W{nm.upper()}{L}")
+            if not dp:
+                vw32 = P.vw(f"dw_{nm}{L}", "w32", r, c, c, off, elem="f32")
+                P.dumps(vw32, 500 + 10 * L + i, f"W{nm.upper()}{L}")
     for nm in extra_dumps:
         P.dumps(nm, 600, nm.upper())
-    info = {"rows": rows, "slab0": slab0, "sstride": sstride, "lay": lay, "w16": P.off["w16"], "g16": P.off["g16"]}
+    assert not dp or P.e.next_off <= P.PCB, "shared buffers overlap the per-cluster regions"
+    info = {"rows": rows, "slab0": slab0, "sstride": sstride, "lay": lay, "w16": P.off["w16"], "loss_scale": loss_scale,
+            "pcs": getattr(P, "pcs", 0)}
     return P.module("smolvla_ttt"), P.pre, info
 
 

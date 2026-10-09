@@ -689,6 +689,9 @@ static inline void sh_t_red_stage(uint32_t slots, uint64_t mine, uint32_t rd, ui
 }
 
 SH_T_COLD int sh_t_allreduce(uint64_t dst, uint64_t src, uint32_t src_stride, uint32_t n, uint32_t mode, uint64_t scal) {
+#ifdef SH_T_NO_RED_EXACT   /* programs that only use the fp16 REDADD can drop the exact path (instruction memory) */
+    mode = 0;
+#endif
     const uint32_t P = ARCH_NUM_CLUSTER_X * ARCH_NUM_CLUSTER_Y, cid = flex_get_cluster_id(), CH = SH_T_RED_CHUNK, ce = CH / 2;
     const int dm = flex_is_dm_core();
     const uint16_t rm = sh_t_mask_all(ARCH_NUM_CLUSTER_X), cm = sh_t_mask_all(ARCH_NUM_CLUSTER_Y);
