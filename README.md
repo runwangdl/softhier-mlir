@@ -1,223 +1,293 @@
-# softhier-mlir
+<h1 align="center">softhier-mlir</h1>
 
-An [xDSL](https://github.com/xdslproject/xdsl)/MLIR **dialect and lowering flow
-for [SoftHier](https://github.com/pulp-platform/softhier-sdk)** — a PULP/Snitch
-RISC-V *many-cluster* accelerator (RedMule matmul engines + iDMA NoC + HBM),
-simulated in GVSoC.
+<p align="center">
+  An <a href="https://github.com/xdslproject/xdsl">xDSL</a>/MLIR dialect, lowering flow and operator library for
+  <b>SoftHier</b>,<br>a RISC-V many-cluster accelerator (RedMulE + iDMA + HBM) simulated in GVSoC.
+</p>
 
-The bet: most of the SoftHier software stack can be expressed with **mature MLIR
-dialects** (`linalg`, `memref`, `scf`, `vector`, and a `mesh`-style device grid),
-leaving a **thin `softhier` dialect** for only the irreducible hardware ops.
-Backend reuse follows [`snax-mlir`](https://github.com/KULeuven-MICAS/snax-mlir)
-(Snitch/RISC-V dialects) rather than a from-scratch codegen.
+<p align="center">
+  <a href="https://github.com/runwangdl/softhier-mlir/actions/workflows/ci.yml"><img src="https://github.com/runwangdl/softhier-mlir/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/built%20on-xDSL-8250df" alt="xDSL">
+  <img src="https://img.shields.io/badge/target-SoftHier%20%2F%20GVSoC-bc4c00" alt="SoftHier / GVSoC">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="Apache-2.0"></a>
+</p>
 
-> Status (2026-10-08): **the compiler emits calls into an operator library** (`runtime/`,
-> "softhier-ops") instead of inline runtime code. A SigLIP/ViT encoder layer written by the
-> frontend (`softhier_mlir/frontend/siglip.py`) lowers to the `softhier` dialect, translates to
-> C, builds and runs on the SoftHier GVSoC with every tensor matching a numpy reference on one
-> cluster (S=256, D=768, 12 heads, FFN 3072). GEMMs run on one cluster, round-robin over all 16,
-> or as a mesh-wide SUMMA; the 8 original examples still pass end to end.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#a-first-program">A first program</a> ·
+  <a href="#the-softhier-dialect">Dialect</a> ·
+  <a href="#what-runs-today">Results</a> ·
+  <a href="#the-stack-around-it">The stack</a> ·
+  <a href="#documentation">Docs</a>
+</p>
 
-## Layout (what calls what)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/flow-dark.svg">
+    <img src="docs/img/flow-light.svg" alt="Model to softhier dialect to C to ELF to GVSoC, with a design-space exploration loop" width="100%">
+  </picture>
+</p>
 
-```
-softhier_mlir/frontend/siglip.py   model -> softhier dialect (HBM buffers, strided views, per-head attention)
-softhier_mlir/dialects/softhier.py the dialect: gemm, layernorm, softmax, gelu, add, add_bias, transpose, view,
-                                   redmule/l1 ops, test-data ops (hbm_fill_lcg, dump_samples)
-softhier_mlir/transforms/          linalg-to-softhier, pipeline-gemm, distribute-summa (policy = attributes)
-softhier_mlir/backend/emit_c.py    one library call per op; generated main.c includes only runtime/sh_ops.h
-runtime/sh_ops.h                   the library API (SPMD: every op is called by all cores of all clusters)
-runtime/sh_gemm.inc.c              tiled GEMM (any tm/tn/tk, split-K, double-buffered, cluster=0|SH_ALL), SUMMA
-runtime/sh_rowops.inc.c            layernorm / softmax / gelu / add / bias / scale / transpose on HBM tensors
-runtime/sh_test.inc.c              on-device LCG data + sampled dumps; host twin in softhier_mlir/testing/lcg.py
-softhier_mlir/sim/testdata.py      test inputs generated on the host into the HBM preload image (softhier-translate --preload-elf)
-softhier_mlir/sim/gvsoc.py         build (x86 chroot, private build dir) + run (ideal HBM) + Arch knobs
-tests/gvsoc/run.py                 gemm | rowops | siglip | siglip-mlir | mlir <files>: build, simulate, compare
-docs/SIMULATOR_NOTES.md            the gvsoc model bugs found on the way and the conventions relied on
-```
+softhier-mlir takes a network written in `linalg` or emitted by one of its frontends, lowers it to a thin
+`softhier` dialect, and emits a C program that calls an operator library (`runtime/`, "softhier-ops"). The
+program is built with the SoftHier SDK and run on the SoftHier GVSoC model, where every result is checked
+on the device or against a numpy / torch reference.
+
+The bet: most of the SoftHier software stack can be expressed with mature MLIR dialects (`linalg`, `memref`,
+`scf`), leaving a small accelerator dialect for the hardware operations that have no equivalent. Design
+rationale: [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## Highlights
+
+- **A whole VLA, end to end.** One SmolVLA inference (SigLIP vision, connector, 16-layer VLM prefix with KV
+  cache, 10-step flow-matching action expert) runs on the simulated chip in 119.1 ms and matches lerobot's
+  actions within 0.032.
+- **Thin dialect, library backend.** One library call per op. Tiling, software pipelining and mesh-wide SUMMA
+  are attributes that passes set, not hand-written C.
+- **Training too.** Backward kernels and one LoRA step on the action expert, with every gradient checked
+  against float64 torch autograd.
+- **A cost model that drives the compiler.** An analytic model calibrated on micro-benchmarks picks GEMM
+  tiles and ranks architecture knobs before anything is simulated.
+- **Reproducible.** One Docker image holds the simulator, the toolchain and this repo.
 
 ## Quick start
 
+### With Docker (simulator included)
+
 ```bash
-python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]" numpy
-bash tests/run_filecheck.sh                                   # compiler tests (no simulator)
-python tests/gvsoc/run.py gemm                                # library GEMM shapes on gvsoc, self-checked
-python tests/gvsoc/run.py mlir examples/*.mlir                # every example end to end
-python tests/gvsoc/run.py siglip-mlir --seq 256 --cluster 0   # one encoder layer through the compiler
-python tests/gvsoc/run.py siglip --cluster all --data device  # test inputs generated on the device instead of
-                                                              # preloaded from the host (the default; ~20x less wall time)
-python -m softhier_mlir.frontend.siglip --layers 12 --no-test # the dialect module of a 12-layer encoder
-```
-Simulator setup (aarch64 host, x86 toolchain chroot, ideal HBM) is described in `softhier_mlir/sim/gvsoc.py`.
-
-**Docs:** [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — how to generate & run, and how to
-add a new op (step by step) · [`docs/DESIGN.md`](docs/DESIGN.md) — the dialect
-abstraction and lowering pipeline. · [`docs/WORLD_MODEL.md`](docs/WORLD_MODEL.md) — N expert candidates at once + on-chip RSSM imagination (cost curves). · [`docs/XPANEL_MCAST.md`](docs/XPANEL_MCAST.md) — small-M GEMM with the activation multicast once (`softhier.gemm {xmcast}`): flow step HBM read -31 % (N=1) / -52 % (N=4), time -6 % / -14 %.
-
-## Working end-to-end pipeline
-
-```
-linalg.matmul  --softhier-opt -p linalg-to-softhier-->  softhier dialect
-               --softhier-translate-->  main.c (flex_ runtime)
-               --SDK build + GVSoC-->  runs, self-checks (MLP_PASS / GEMM_PASS)
+git clone https://github.com/runwangdl/softhier-mlir && cd softhier-mlir
+docker compose -f docker/compose.yaml build                 # about 15 min, 3.8 GB
+docker compose -f docker/compose.yaml run --rm softhier     # shell in the mounted checkout
+smoke                                                       # compiler tests + GEMMs + two examples on GVSoC
 ```
 
-Verified on GVSoC (`../softhier/gvsoc`, RedMule traces + on-device checks):
-- **256³ GEMM** — one RedMule tile.
-- **2-layer MLP** `Z = ReLU(X@W1)@W2` — two chained GEMMs, `MLP_PASS` (all outputs 1.0).
-- **512³ GEMM** — tiled loop-nest, 8 RedMule tiles with K-accumulation, `GEMM_PASS`.
-- **linalg-form** of the MLP and the 512³ GEMM — lower + run, same results.
-- **non-constant input** (col-parity X) — `GEMM_PASS` (Z=0.75), correctness beyond constants.
+The image builds natively on arm64 (Apple Silicon) and amd64. What it contains and how it differs from a stock
+SoftHier install: [`docker/README.md`](docker/README.md).
+
+### Compiler only (no simulator)
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]" numpy
+bash tests/run_filecheck.sh          # 18 FileCheck tests
+```
+
+This gives you `softhier-opt` (parse, verify, run passes) and `softhier-translate` (dialect to C).
+
+## A first program
+
+A 512 x 512 x 512 GEMM in standard `linalg`, on matrices that live in HBM
+([`examples/gemm512_linalg.mlir`](examples/gemm512_linalg.mlir)):
+
+```mlir
+%xh = softhier.hbm_buffer {offset = 0 : i32}       : memref<512x512xf16, "hbm_west">
+%wh = softhier.hbm_buffer {offset = 524288 : i32}  : memref<512x512xf16, "hbm_south">
+%zh = softhier.hbm_buffer {offset = 1048576 : i32} : memref<512x512xf16, "hbm_west">
+
+linalg.matmul ins(%xh, %wh : memref<512x512xf16, "hbm_west">, memref<512x512xf16, "hbm_south">)
+              outs(%zh : memref<512x512xf16, "hbm_west">)
+```
+
+Lower it, then translate it:
+
+```bash
+softhier-opt examples/gemm512_linalg.mlir -p linalg-to-softhier | softhier-translate /dev/stdin
+```
+
+The pass turns the `linalg.matmul` into `softhier.gemm %xh, %wh into %zh {fmt = "fp16"}`, and the backend emits
+one call into the library:
+
+```c
+#include "sh_ops.h"
+static void gemm512(void) {
+    const uint64_t hb1 = sh_hbm_addr(0);        // 512x512xf16 HBM, 524288 B
+    const uint64_t hb2 = sh_hbm_addr(524288);
+    const uint64_t hb3 = sh_hbm_addr(1048576);
+    { sh_gemm_cfg cfg = { .tm = 0, .tn = 0, .tk = 0, .pipeline = 0, .accumulate = 0, .fmt = SH_FP16, .l1_base = 0 };
+      sh_gemm(hb1, hb2, hb3, 512, 512, 512, 512, 512, 512, &cfg, 0); }
+}
+```
+
+Build it and run it on the simulator (inside the Docker image):
+
+```console
+$ python tests/gvsoc/run.py mlir examples/gemm512_linalg.mlir
+PASS gemm512_linalg.mlir        passes=linalg-to-softhier                 roi=90926 ns wall=1.4s
+     GEMM512_CHECK ok=262144/262144 GEMM512_PASS
+```
+
+`roi` is simulated time at 1 GHz. [`docs/TUTORIAL.md`](docs/TUTORIAL.md) walks through this flow and through adding
+a new op from scratch.
+
+## The target
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/chip-dark.svg">
+    <img src="docs/img/chip-light.svg" alt="A 4 by 4 mesh of clusters with HBM on the west and south edges; one cluster holds three Snitch cores, RedMulE, iDMA and a 1 MiB TCDM" width="100%">
+  </picture>
+</p>
+
+SoftHier is a mesh of Snitch clusters. Each cluster has a RedMulE matrix engine that accumulates in place
+(`Y += X·W`), an iDMA that can multicast along a mesh row or column and reduce inside the network, and a 1 MiB
+scratchpad. HBM sits on the mesh edges. Every kernel written for it so far has the same shape: an
+output-stationary SUMMA, RedMulE tiles, in-network broadcast and reduce, and a double-buffered pipeline. That
+regularity is what makes a compact dialect workable.
 
 ## The `softhier` dialect
 
 | Op | Meaning |
 |---|---|
-| `softhier.redmule %x, %w into %y {fmt}` | RedMule GEMM tile, in-place `y += x·w` |
-| `softhier.gemm %x, %w into %z {fmt}` | full (multi-tile) HBM GEMM; backend tiles it |
-| `softhier.dma_2d %src -> %dst` | strided HBM↔TCDM copy |
-| `softhier.dma_broadcast` / `dma_reduce {kind}` | mesh row/col multicast / in-network REDADD·REDMAX |
-| `softhier.group_barrier {grid_x,grid_y}` | two-phase XY group barrier |
-| `softhier.relu` / `vexp` / `transpose` | Spatz ReLU / `vfexp` / transpose engine |
-| `softhier.l1_zero` / `l1_fill` / `l1_buffer` | TCDM tile clear / fill / declare |
-| `softhier.hbm_buffer` / `hbm_fill` / `hbm_fill_col_parity` | HBM buffer declare / fill |
-| `softhier.check_const` / `hbm_check_const` | on-device self-verify (prints PASS/FAIL) |
-| `softhier.cluster_pos` | this cluster's (x,y) |
-| `softhier.view` / `layernorm` / `softmax` / `gelu` / `add` / `add_bias` | strided HBM views + row-wise fp16 tensor ops (`sh_*` library calls) |
-| `softhier.attention %q, %k, %v -> %o {scale, heads, q_block}` | fused multi-head attention: `softmax(scale q k^T) v` in work items of `q_block` query rows inside one cluster's TCDM, fp16 SIMD softmax, any S the L1 holds (`sh_attention_q`); S=256: 0.55 ms vs 0.83 ms per-head, S=1024: 7.8 vs 11.8 ms. GEMM tiles come from the cost model (`softhier_mlir.dse.tiling`, the GEMMs are HBM-bound); numbers in `docs/DSE.md` section 8 |
+| `softhier.gemm %x, %w into %z {fmt}` | full HBM GEMM; the backend tiles it (`xmcast`: activation multicast once) |
+| `softhier.redmule %x, %w into %y {fmt}` | one RedMulE tile, in place `y += x·w` |
+| `softhier.attention %q, %k, %v -> %o {scale, heads, q_block}` | fused multi-head attention inside one cluster's TCDM, fp16 SIMD softmax |
+| `softhier.dma_2d %src -> %dst` | strided HBM ↔ TCDM copy |
+| `softhier.dma_broadcast` / `dma_reduce {kind}` | mesh row / column multicast, in-network REDADD / REDMAX |
+| `softhier.group_barrier {grid_x, grid_y}` | two-phase XY barrier on a sub-mesh |
+| `softhier.view` / `layernorm` / `softmax` / `gelu` / `add` / `add_bias` / `transpose` | strided HBM views and row-wise fp16 tensor ops |
+| `softhier.rmsnorm` / `rope` / `silu_mul` / `pixel_shuffle` | the LLM-side ops of the SmolVLA prefix |
+| `softhier.hbm_buffer` / `l1_buffer` / `hbm_fill` / `check_const` / `dump_samples` | buffers, test data, on-device self-checks |
 
-Memref memory spaces select the physical space / HBM edge:
-`"tcdm"`, `"remote_tcdm"`, `"hbm_west" | "hbm_south" | "hbm_north" | "hbm_east"`.
+Placement is carried by memref memory spaces: `"tcdm"`, `"remote_tcdm"`, `"hbm_west"`, `"hbm_south"`, `"hbm_north"`,
+`"hbm_east"`. Passes: `linalg-to-softhier`, `pipeline-gemm`, `distribute-summa`.
 
-## Quick start
+## What runs today
+
+All numbers are simulated on the SoftHier GVSoC: 16 clusters at 1 GHz with ideal HBM, so HBM-bound segments
+are optimistic.
+
+| Workload | Result | Details |
+|---|---|---|
+| SmolVLA inference, 1 camera x 256 tokens | 119.1 ms; actions within 0.032 of lerobot | [`SMOLVLA_E2E.md`](docs/SMOLVLA_E2E.md) |
+| SmolVLA inference, 3 cameras | 178.7 ms; actions within 0.067 | [`SMOLVLA_E2E.md`](docs/SMOLVLA_E2E.md) |
+| SigLIP vision tower, 12 layers, seq 256 | 2.29 ms per layer; every tensor at the fp16 floor against HF | [`SMOLVLA.md`](docs/SMOLVLA.md) |
+| SigLIP vision tower, 12 layers, seq 1024 (512 x 512 image) | 14.86 ms per layer | [`SMOLVLA.md`](docs/SMOLVLA.md) |
+| Fused attention against per-head attention | 0.55 against 0.83 ms (S = 256), 7.8 against 11.8 ms (S = 1024) | [`DSE.md`](docs/DSE.md) section 8 |
+| Small-M GEMM with the activation multicast (`xmcast`) | flow step: HBM read -31 % (N = 1) / -52 % (N = 4), time -6 % / -14 % | [`XPANEL_MCAST.md`](docs/XPANEL_MCAST.md) |
+| One LoRA step on the action expert | backward on the chip, gradients checked against float64 torch | [`TTT.md`](docs/TTT.md) |
+| N expert candidates at once, on-chip RSSM imagination | cost curves | [`WORLD_MODEL.md`](docs/WORLD_MODEL.md) |
+
+<p align="center">
+  <img src="docs/dse/timeline_s256_after.png" alt="Per-cluster timeline of one SigLIP layer: RedMulE and iDMA activity over 1.9 ms" width="88%"><br>
+  <sub>One SigLIP layer (S = 256, fused attention, cost-model tiles) on 16 clusters: RedMulE activity per cluster,
+  from <code>softhier_mlir.sim.trace</code>.</sub>
+</p>
+
+<details>
+<summary><b>Commands for each workload</b></summary>
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"
+# library kernels and every example, self-checked on the simulator
+python tests/gvsoc/run.py gemm
+python tests/gvsoc/run.py mlir examples/*.mlir
 
-# lower a standard-linalg 512^3 GEMM onto SoftHier, then emit runnable C
-softhier-opt examples/gemm512_linalg.mlir -p linalg-to-softhier | \
-  softhier-translate /dev/stdin      # (or: -o main.c)
+# one SigLIP encoder layer through the compiler
+python tests/gvsoc/run.py siglip-mlir --seq 256 --cluster all [--fused]
+python -m softhier_mlir.frontend.siglip --layers 12 --no-test         # the dialect module of a 12-layer encoder
 
-# run the FileCheck suite
-for f in tests/filecheck/*.mlir; do echo "$f"; done   # see each file's RUN line
+# SmolVLA's SigLIP tower with real weights (needs torch + transformers and the checkpoint)
+python -m softhier_mlir.frontend.smolvla prepare --ckpt /app/models/smolvla_base/model.safetensors \
+       --seq 256 --out /app/models/smolvla_base/vision_s256.npz
+python tests/gvsoc/run.py smolvla --npz /app/models/smolvla_base/vision_s256.npz --layers 1
+
+# the VLM text prefix (16 Llama layers, GQA, RoPE, token-class attention mask)
+python -m softhier_mlir.frontend.smolvla prepare-vlm --cams 3 --out /app/models/smolvla_base/vlm_c3.npz
+python tests/gvsoc/run.py smolvla-vlm --npz /app/models/smolvla_base/vlm_c3.npz --all-layers
+
+# one inference end to end, then the 32-configuration cost table
+python tests/gvsoc/run.py smolvla-e2e --npz /app/models/smolvla_base/e2e_c1_t256.npz --e2e-trace
+python -m softhier_mlir.dse.e2e_cost --collect
+
+# test-time adaptation: one LoRA step on the action expert
+python tests/gvsoc/ttt.py ops | layer | expert --layers 16 --profile | reduce | dp --layers 4
 ```
 
-To run generated C on GVSoC, drop it into `soft_hier_sdk/generated/<name>/`
-(with a one-line CMakeLists) and `make sh-old-hs app=... && make sh-old-run`, or use
-`tests/gvsoc/run.py` (private build dir, ideal HBM, host-side comparison).
+Weights go into HBM through the simulator's preload path (`softhier_mlir/sim/preload.py`), so a network with real
+weights needs no data generation on the device. The fp16 weights of SmolVLA (674 MiB) exceed the chip's 512 MiB
+of HBM, so the inference is chained as four programs with an exact HBM hand-over.
 
-### Real weights: SmolVLA's SigLIP vision tower
-
-Parameters go into HBM through the simulator's preload path (`softhier_mlir/sim/preload.py`,
-see `docs/SIMULATOR_NOTES.md`), so a network with real weights needs no on-device data generation:
-
-```bash
-# checkpoint -> weights in library layout + im2col'd test image + fp32 HF reference (torch/transformers)
-python3 -m softhier_mlir.frontend.smolvla prepare --ckpt /app/models/smolvla_base/model.safetensors \
-        --seq 256 --out /app/models/smolvla_base/vision_s256.npz
-# npz -> MLIR (+ preload image) -> C -> gvsoc; compares sampled EMB / L<n> / OUT against the reference
-.venv/bin/python tests/gvsoc/run.py smolvla --npz /app/models/smolvla_base/vision_s256.npz --layers 1
-```
-
-`--seq 256` keeps the top-left 16x16 patches with their own position embeddings (exactly the full
-model restricted to those tokens); `--seq 1024 --all-layers` is the full 512x512 encoder. The
-program is one `scf.for` over the layers and one over the heads (the cluster instruction memory is
-64 KB), starts with `softhier.preload_wait` on the image's sentinel segment (the loader's done flag
-fires before the data has crossed the NoC) and prints `[mark]` stamps per layer; `--unroll` gives the
-spelled-out form with the layer-1 intermediate dumps, `--from-log` re-evaluates a finished run.
-
-Results (16 clusters, ideal HBM, gvsoc at 1 GHz; 256 sampled elements per tensor against the fp32
-HF `SiglipVisionModel`):
-
-| run | per layer (simulated) | total | wall | embeddings | layer 1 | layer 12 | post-LN |
-|---|---|---|---|---|---|---|---|
-| seq 256, 12 layers | 2.29 ms (attention 1.21, proj+MLP 1.07) | 38.8 ms compute + 2.7 ms preload | 502 s | max abs 0.0067 (max 1.23) | 0.039 (max 3.6) | 0.19 (max 359) | 0.21 (max 24.7, median 0.01) |
-| seq 1024 (full 512x512 image), 12 layers | 14.86 ms (attention 10.85, proj+MLP 3.9-4.1) | 190.4 ms compute + 2.7 ms preload | 4431 s | 0.0057 (max 12.0) | 0.035 (max 10.9) | 0.31 (max 472) | 0.35 (max 24.5, median 0.016) |
-
-Everything is at the fp16 floor (fp16 operands and RedMulE accumulation): the device agrees with
-the fp16-rounded numpy model of the same program as closely as with HF. At seq 1024 the per-head
-attention (12 x 3 ops on 1024x1024 scores) is 73% of the layer; the fused `softhier.attention` op is
-the next step for it. The gvsoc runs at ~24 s of wall time per simulated ms for this program; the
-host's 7 GB is shared between sessions and the full run (~1 GB RSS) gets OOM-killed when it is not.
+</details>
 
 ## Design-space exploration
 
-`softhier_mlir/dse/` turns a module into a shape-level workload (`workload.py`), estimates it
-analytically for any `Arch` (`cost.py`: RedMulE FSM, DMA/HBM rates, double-buffered tiles,
-SUMMA collectives, scalar row ops), calibrates the constants on micro-benchmarks
-(`calibrate.py` + `tests/gvsoc/ubench`) and sweeps knob grids, simulating the top-K points per
-unique kernel shape on a **private** SoftHier copy (`sweep.py`). Results, the fitted
-constants and the model-vs-simulation errors are in [`docs/DSE.md`](docs/DSE.md).
+`softhier_mlir/dse/` turns a module into a shape-level workload, estimates it analytically for any architecture
+(`Arch`: mesh size, RedMulE geometry, NoC width, TCDM, HBM), calibrates the constants on micro-benchmarks, and
+sweeps knob grids, simulating only the top candidates. Fitted constants, model-against-simulation errors and
+sweep results: [`docs/DSE.md`](docs/DSE.md).
 
 ```bash
 python -m softhier_mlir.frontend.siglip --layers 12 --no-test | python -m softhier_mlir.dse.workload -
-python -m softhier_mlir.dse.calibrate --home /app/softhier_dse --fit docs/dse/params.json
 python -m softhier_mlir.dse.sweep --home /app/softhier_dse --params docs/dse/params.json \
     --arch noc_link_width=256,512,1024 --arch redmule_ce=64x64,128x32 --arch mesh=1x1,4x4 --top 12
 ```
 
-## Layout
+Architecture sweeps rewrite the simulator's configuration, so they need a private copy of the SoftHier install
+(`--home`).
+
+## The stack around it
+
+softhier-mlir is the compiler. It needs a simulator, an SDK and a toolchain, which come from these projects:
+
+| Layer | Project | Role here |
+|---|---|---|
+| Simulator | [gvsoc/gvsoc](https://github.com/gvsoc/gvsoc), branch `bowwang-dev/softhier-deeploy` | the SoftHier `flex_cluster` model this repo runs on; [`gvsoc-core`](https://github.com/gvsoc/gvsoc-core) is the engine and ISS, [`gvsoc-pulp`](https://github.com/gvsoc/gvsoc-pulp) the PULP models |
+| SDK | [pulp-platform/softhier-sdk](https://github.com/pulp-platform/softhier-sdk) | the public runtime (startup, linker script, `flex_*` headers). This repo currently builds against the variant shipped in the GVSoC branch above |
+| Toolchain | [husterZC/gun_toolchain](https://github.com/husterZC/gun_toolchain) | prebuilt `riscv32-unknown-elf-gcc` 14.2 with V and Zfh |
+| Sibling compiler | [pulp-platform/Deeploy](https://github.com/pulp-platform/Deeploy) | ONNX-to-C deployment; its container builds the same simulator (`make softhier`), which `docker/Dockerfile` follows |
+| Compiler framework | [xdslproject/xdsl](https://github.com/xdslproject/xdsl) | the Python MLIR implementation the dialect, passes and tools are written in |
+| Prior art | [KULeuven-MICAS/snax-mlir](https://github.com/KULeuven-MICAS/snax-mlir) | xDSL flow for Snitch + accelerators |
+| Hardware | [RedMulE](https://github.com/pulp-platform/redmule), [iDMA](https://github.com/pulp-platform/iDMA), [Snitch](https://github.com/pulp-platform/snitch_cluster), [Spatz](https://github.com/pulp-platform/spatz), [FlooNoC](https://github.com/pulp-platform/FlooNoC) | the RTL blocks the GVSoC models stand for |
+| Memory model | [DRAMSys](https://github.com/tukl-msd/DRAMSys) | HBM timing in the stock simulator; this repo uses GVSoC's ideal memory instead |
+| Model | [lerobot SmolVLA](https://huggingface.co/lerobot/smolvla_base) | the reference network and checkpoint |
+
+The simulator needs fixes that are not upstream. They are in [`docker/patches/`](docker/patches) and explained
+in [`docs/SIMULATOR_NOTES.md`](docs/SIMULATOR_NOTES.md).
+
+## Repository layout
 
 ```
-docs/DESIGN.md                     the dialect abstraction + lowering pipeline
-docs/DSE.md                        cost model calibration + sweep results
-softhier_mlir/dialects/softhier.py the dialect (types + ops)
-softhier_mlir/transforms/          lowering passes (WIP)
-softhier_mlir/dse/                 workload IR, analytic cost model, calibration, sweep driver
-softhier_mlir/tools/softhier_opt.py the opt driver
-softhier_mlir/frontend/siglip.py   SigLIP/ViT encoder emitter (--fused: softhier.attention per layer)
-runtime/                           softhier-ops C library the generated code calls (sh_gemm, sh_attention, ...)
-tests/filecheck/                   FileCheck tests
-softhier_mlir/sim/trace.py         gvsoc trace (redmule/idma/cluster_registers) -> Perfetto JSON / PNG / utilisation; sim/viewer builds an HTML timeline
-tests/gvsoc/run.py                 on-simulator tests: gemm | rowops | fp16cvt | attention [--composed] | mesh | siglip | siglip-mlir [--fused] | mlir
-tests/gvsoc/ubench/                cost-model micro-benchmarks (docs/DSE.md)
+softhier_mlir/
+  dialects/softhier.py      the dialect: types and ops
+  transforms/               linalg-to-softhier, pipeline-gemm, distribute-summa
+  backend/emit_c.py         one library call per op; the generated main.c includes only runtime/sh_ops.h
+  frontend/                 SigLIP, SmolVLA (vision, VLM prefix, expert, end to end, TTT), RSSM world model
+  dse/                      workload IR, analytic cost model, calibration, sweep, tiling
+  sim/                      GVSoC build + run, HBM preload images, trace to Perfetto / PNG
+  tools/                    softhier-opt, softhier-translate
+runtime/                    softhier-ops, the C library generated code calls (SPMD: every op runs on all cores)
+examples/                   .mlir programs and the C generated from them
+tests/filecheck/            compiler tests, no simulator needed
+tests/gvsoc/                on-simulator tests: run.py, ttt.py, wm.py, micro-benchmarks
+docker/                     Dockerfile, simulator patches, smoke test
+docs/                       design, tutorial, ledgers with every measured number
 ```
 
-## Why this can work
+## Documentation
 
-Every SoftHier kernel (GEMM, FlatAttention, DeepSeek-MLA decode) is the same
-shape: **output-stationary SUMMA + in-place-accumulate RedMule + in-network iDMA
-broadcast/reduce + a double-buffered pipeline.** That regularity is what makes a
-compact dialect + a `mesh`-style distribution the right abstraction. Details and
-the staged lowering pipeline are in [`docs/DESIGN.md`](docs/DESIGN.md).
+| | |
+|---|---|
+| [`TUTORIAL.md`](docs/TUTORIAL.md) | generate and run a program; add a new op step by step |
+| [`DESIGN.md`](docs/DESIGN.md) | the dialect abstraction and the lowering pipeline |
+| [`DSE.md`](docs/DSE.md) | cost model, calibration, architecture sweeps |
+| [`SIMULATOR_NOTES.md`](docs/SIMULATOR_NOTES.md) | what the stock GVSoC model gets wrong and how it is fixed |
+| [`SMOLVLA.md`](docs/SMOLVLA.md), [`SMOLVLA_EXPERT.md`](docs/SMOLVLA_EXPERT.md), [`SMOLVLA_E2E.md`](docs/SMOLVLA_E2E.md) | the SmolVLA vision tower and prefix, the action expert, the chained inference |
+| [`FLOW_DATAFLOW.md`](docs/FLOW_DATAFLOW.md), [`XPANEL_MCAST.md`](docs/XPANEL_MCAST.md) | dataflow of the flow-matching step; the activation-multicast GEMM |
+| [`TTT.md`](docs/TTT.md), [`WORLD_MODEL.md`](docs/WORLD_MODEL.md) | backward pass and LoRA step; expert candidates and RSSM imagination |
+| [`docker/README.md`](docker/README.md) | the Docker image |
+
+## Status and limits
+
+Research code, under active development.
+
+- Numbers come from a simulator with ideal HBM, not from silicon or RTL.
+- fp16 only on the RedMulE path. Long fp16 accumulations lose accuracy; the connector GEMM (K = 12288) is the
+  largest error source in the SmolVLA chain.
+- `runtime/` depends on the allocator and linker script of the SDK variant in the GVSoC `softhier-deeploy`
+  branch, not on the public `softhier-sdk`.
+- SmolVLA at fp16 does not fit the chip's HBM in one program, so the inference is four chained programs.
 
 ## License
 
-Apache-2.0.
-
-### SmolVLA's VLM text prefix (16 Llama layers, GQA, RoPE, token-class attention mask)
-
-The prefix the action expert cross-attends to (connector + 16-layer SmolVLM2 text tower over image, language and
-state tokens) runs through `softhier.rmsnorm / rope / silu_mul / pixel_shuffle` and the masked grouped-query
-`softhier.attention` (`runtime/sh_llm.inc.c`); references, tolerances, the attention mask, the KV-cache layout
-and the simulated times are in [`docs/SMOLVLA.md`](docs/SMOLVLA.md).
-
-```bash
-python3 -m softhier_mlir.frontend.smolvla prepare-vlm --cams 3 --out /app/models/smolvla_base/vlm_c3.npz   # 241 tokens
-.venv/bin/python tests/gvsoc/run.py smolvla-vlm --npz /app/models/smolvla_base/vlm_c3.npz --all-layers
-.venv/bin/python tests/gvsoc/run.py llmops --cluster all                                                     # the ops alone
-```
-
-### One SmolVLA inference end to end + the cost table
-
-Vision per camera -> connector -> 16-layer prefix writing the KV cache -> 10-step expert flow reading it, chained as four
-gvsoc programs with an exact HBM hand-over (the fp16 weights, 674 MiB, exceed the chip's 512 MiB HBM). 1 camera x 256
-tokens: actions within 0.032 of lerobot, 119.1 ms simulated; 3 cameras: 0.067, 178.7 ms; 3 x 512x512 composed: 659 ms.
-Ledger [`docs/SMOLVLA_E2E.md`](docs/SMOLVLA_E2E.md); 32-configuration cost table `docs/dse/e2e_cost.{md,csv}`.
-
-```bash
-.venv/bin/python tests/gvsoc/run.py smolvla-e2e --npz /app/models/smolvla_base/e2e_c1_t256.npz --e2e-trace
-python -m softhier_mlir.dse.e2e_cost --collect
-```
-
-### Test-time adaptation: one LoRA step on the action expert (backward on SoftHier)
-
-Backward primitives (`runtime/sh_train.inc.c`: rmsnorm / silu_mul / softmax / attention backward, transposed-operand
-GEMMs, MSE, SGD / Adam on fp32 masters, data-parallel REDADD gradient sum) and the full 16-layer TTT step with LoRA r=16
-on q / o / down, every gradient checked against float64 torch on gvsoc; numbers and the deployment gaps in
-[`docs/TTT.md`](docs/TTT.md).
-
-```bash
-.venv/bin/python tests/gvsoc/ttt.py ops | layer | expert --layers 16 --profile | reduce | dp --layers 4
-```
+Apache-2.0, see [`LICENSE`](LICENSE). The simulator, SDK and toolchain are separate projects under their own
+licenses.

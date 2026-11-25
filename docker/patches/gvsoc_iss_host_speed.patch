@@ -1,0 +1,712 @@
+# gvsoc Snitch model, host-speed only: no simulated cycle changes (every ROI identical, traced runs
+# byte-identical). After the RedMulE model was vectorised, gdb sampling of gvsoc_launcher showed the
+# host time of the SoftHier platform inside the Snitch core model, on the path every offloaded FP
+# instruction takes (integer core -> FPU sequencer -> FP subsystem -> response):
+#   37 %  by-value copies of iss_insn_t (~900 B, with eight std::string arg names + a vector):
+#         up to 12 per FP instruction (Iss::handle_req 3x, sequencer::req / gen_entry / write_entry /
+#         read_entry / offload_event 6x, FP-ss handle_notif / get_latency / handle_event / acc_rsp 5x)
+#   32 %  snitch_fp_ss.cpp formatted the full instruction trace with sprintf for every instruction
+#         (iss_trace_save_args + iss_trace_dump) and then dropped it because no trace was active
+#    5 %  up to 26 strstr() on the decoder label per instruction (decode.cpp int_/fp_offload_exec on
+#         *every* integer instruction, snitch.cpp handle_result, snitch_fp_ss.cpp get_latency)
+# Changes (all marked [SoftHier-fast]):
+#   types.hpp      iss_insn_arg_t::name is a const char* (interned CSR name, iss_csr_name_cstr in
+#                  csr.cpp; it is only set by csr_decode and only read by the trace dump); new
+#                  iss_insn_t::label_class + iss_insn_label_class(): the original strstr predicates
+#                  evaluated once per decoded instruction (decode.cpp decode_insn) and cached
+#   insn_cache.hpp / decode.cpp   defined start values for name / label_class; cached label checks
+#   snitch.cpp     handle_req copies the instruction once straight into acc_req; handle_result reads
+#                  the response instruction through a pointer
+#   OffloadRsp.hpp insn is a pointer into the FP subsystem's copy (the integer core only reads it
+#                  synchronously inside the acc_rsp sync)
+#   snitch_fp_ss.cpp  one copy into acc_req.insn and all work on it (get_latency by reference);
+#                  iss_trace_save_args / iss_trace_dump only when trace.insn_trace.get_active()
+#                  (constant false in the optim build, exactly as the integer core's
+#                  iss_exec_insn_with_trace already does)
+#   sequencer.cpp  entries are generated in place in the ring buffer and read into acc_req: one
+#                  copy in, one copy out; the stagger register-index update for the trace is applied
+#                  to the outgoing copy as before, the ring buffer entry is untouched as before
+# The three libraries (integer core gen_isa_snitch_rv32imfdva_cpp_60335333, FP subsystem
+# gen_isa_snitch_fp_ss_rv32imfdva_cpp_61161152, pulp/snitch/sequencer) share the iss_insn_t /
+# OffloadReq / OffloadRsp layout and must be rebuilt together: install/models_fast/ (+ debug/) holds
+# the set built from the patched sources (fp-ss pending fix, zfh flh/fsh, nseq ISA tables) with
+# softhier-mlir/tools/iss_fast/gen_makefile.py; softhier_mlir/sim/gvsoc.py searches models_fast
+# before models_fix and models (SOFTHIER_STOCK_MODELS=1 disables both).
+# Measured 2026-10-08 (softhier-mlir docs/SIMULATOR_NOTES.md "Host speed of the Snitch ISS"):
+#   run (tests/gvsoc/run.py)                 ROI ns (before = after)   wall s before -> after
+#   gemm 1024x3072x768:256,256,256,1,0,all   520521                    47.6 -> 14.0
+#   rowops --rows 256 --cols 768 --cluster all  508504                 16.8 -> 10.2
+#   siglip-mlir --seq 256 --cluster all      4782253                   106.9 -> 28.1
+#   attention --cluster 0                    26819562                  56.7 -> 8.1
+#   mlir examples/siglip_encoder_layer.mlir  17851422                  424.7 -> 174.5
+#   (same host load for both columns; CPU time 1.7-2.9x lower; traced debug run byte-identical
+#   over the first 300 MB / 1.45 M lines of pe0 + fp_ss0 instruction dumps)
+# Apply in /app/install/softhier (paths relative to the checkout) on top of gvsoc_snitch_fp_ss_pending.patch:
+#   patch -p0 < gvsoc_iss_host_speed.patch
+diff -ru orig/core/models/cpu/iss/include/cores/snitch/OffloadRsp.hpp core/models/cpu/iss/include/cores/snitch/OffloadRsp.hpp
+--- core/models/cpu/iss/include/cores/snitch/OffloadRsp.hpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/include/cores/snitch/OffloadRsp.hpp	2026-10-08 18:40:02.467172003 +0000
+@@ -37,6 +37,8 @@
+     unsigned int fflags;
+     // PC of finished instruction
+     iss_reg_t pc;
+-    // Offloaded instruction info
+-    iss_insn_t insn;
++    // Offloaded instruction info. [SoftHier-fast] a pointer into the FP subsystem's copy
++    // (valid during the synchronous acc_rsp sync; the integer core only reads it there)
++    // instead of another by-value copy of the ~700-byte instruction.
++    iss_insn_t *insn;
+ };
+\ No newline at end of file
+diff -ru orig/core/models/cpu/iss/include/cores/snitch_fp_ss/OffloadRsp.hpp core/models/cpu/iss/include/cores/snitch_fp_ss/OffloadRsp.hpp
+--- core/models/cpu/iss/include/cores/snitch_fp_ss/OffloadRsp.hpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/include/cores/snitch_fp_ss/OffloadRsp.hpp	2026-10-08 18:40:02.464172003 +0000
+@@ -37,6 +37,8 @@
+     unsigned int fflags;
+     // PC of finished instruction
+     iss_reg_t pc;
+-    // Offloaded instruction info
+-    iss_insn_t insn;
++    // Offloaded instruction info. [SoftHier-fast] a pointer into the FP subsystem's copy
++    // (valid during the synchronous acc_rsp sync; the integer core only reads it there)
++    // instead of another by-value copy of the ~700-byte instruction.
++    iss_insn_t *insn;
+ };
+\ No newline at end of file
+diff -ru orig/core/models/cpu/iss/include/cores/snitch_fp_ss/class.hpp core/models/cpu/iss/include/cores/snitch_fp_ss/class.hpp
+--- core/models/cpu/iss/include/cores/snitch_fp_ss/class.hpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/include/cores/snitch_fp_ss/class.hpp	2026-10-08 18:40:02.453172003 +0000
+@@ -142,7 +142,7 @@
+     FIFODepth1 LSU_OPGROUP;
+ 
+     // Timing model of pipelined FPU
+-    int get_latency(iss_insn_t insn, iss_reg_t pc, int timestamp);
++    int get_latency(iss_insn_t &insn, iss_reg_t pc, int timestamp);   // [SoftHier-fast] was by value
+     void ssr_latency(int diff);
+ 
+ private:
+diff -ru orig/core/models/cpu/iss/include/insn_cache.hpp core/models/cpu/iss/include/insn_cache.hpp
+--- core/models/cpu/iss/include/insn_cache.hpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/include/insn_cache.hpp	2026-10-08 18:40:02.420172003 +0000
+@@ -72,6 +72,12 @@
+     insn->handler = iss_decode_pc_handler;
+     insn->fast_handler = iss_decode_pc_handler;
+     insn->addr = addr;
++    // [SoftHier-fast] plain-pointer arg names and the label-class cache need a defined start value
++    insn->label_class = 0;
++    for (int i = 0; i < ISS_MAX_DECODE_ARGS; i++)
++    {
++        insn->args[i].name = "";
++    }
+ #if defined(CONFIG_GVSOC_ISS_RI5KY)
+     insn->hwloop_handler = NULL;
+ #endif
+diff -ru orig/core/models/cpu/iss/include/isa/priv.hpp core/models/cpu/iss/include/isa/priv.hpp
+--- core/models/cpu/iss/include/isa/priv.hpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/include/isa/priv.hpp	2026-10-08 18:40:02.431172003 +0000
+@@ -28,7 +28,7 @@
+     // In case traces are active, convert the CSR number into a name
+ #ifdef VP_TRACE_ACTIVE
+     insn->args[2].flags = (iss_decoder_arg_flag_e)(insn->args[2].flags | ISS_DECODER_ARG_FLAG_DUMP_NAME);
+-    insn->args[2].name = iss_csr_name(iss, UIM_GET(0));
++    insn->args[2].name = iss_csr_name_cstr(iss, UIM_GET(0));   // [SoftHier-fast] interned, see csr.cpp
+ #endif
+ }
+ 
+diff -ru orig/core/models/cpu/iss/include/iss_core.hpp core/models/cpu/iss/include/iss_core.hpp
+--- core/models/cpu/iss/include/iss_core.hpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/include/iss_core.hpp	2026-10-08 18:40:02.427172003 +0000
+@@ -43,6 +43,8 @@
+ 
+ bool iss_csr_read(Iss *iss, iss_reg_t reg, iss_reg_t *value);
+ std::string iss_csr_name(Iss *iss, iss_reg_t reg);
++// [SoftHier-fast] same name as a stable C string (interned), for iss_insn_arg_t::name
++const char *iss_csr_name_cstr(Iss *iss, iss_reg_t reg);
+ bool iss_csr_write(Iss *iss, iss_reg_t reg, iss_reg_t value);
+ 
+ int iss_trace_pc_info(iss_addr_t addr, const char **func, const char **inline_func, const char **file, int *line);
+diff -ru orig/core/models/cpu/iss/include/types.hpp core/models/cpu/iss/include/types.hpp
+--- core/models/cpu/iss/include/types.hpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/include/types.hpp	2026-10-08 18:40:02.417172003 +0000
+@@ -30,6 +30,7 @@
+ #include <stdint.h>
+ #define __STDC_FORMAT_MACROS // This is needed for some old gcc versions
+ #include <inttypes.h>
++#include <string.h>   // [SoftHier-fast] strstr in iss_insn_label_class_compute
+ #include <vector>
+ #include <string>
+ 
+@@ -179,7 +180,11 @@
+ {
+     iss_decoder_arg_type_e type;
+     iss_decoder_arg_flag_e flags;
+-    std::string name;
++    // [SoftHier-fast] was std::string: an iss_insn_t is copied by value several times per
++    // offloaded Snitch FP instruction (core -> sequencer ring buffer -> FP subsystem), and the
++    // eight std::string copies per instruction dominated the host time. The name is only set by
++    // the CSR decoder (priv.hpp, interned in csr.cpp) and only read by the instruction trace.
++    const char *name;
+ 
+     union
+     {
+@@ -421,9 +426,57 @@
+ 
+     iss_decoder_insn_t *desc;
+ 
++    // [SoftHier-fast] cached label classification, see iss_insn_label_class() below
++    unsigned int label_class;
++
+ } iss_insn_t;
+ 
+ 
++// [SoftHier-fast] Instruction classes derived from the decoder label. The Snitch model used to
++// run up to 26 strstr() on insn->decoder_item->u.insn.label per instruction (decode.cpp offload
++// handlers, snitch.cpp handle_result, snitch_fp_ss.cpp get_latency). The expressions below are
++// exactly the original ones (substring matches included), evaluated once per decoded instruction
++// and cached in the instruction (copies carry the cache along).
++#define ISS_LABEL_VALID    (1 << 0)
++#define ISS_LABEL_FLSU     (1 << 1)  // flw fsw fld fsd
++#define ISS_LABEL_ILSU     (1 << 2)  // lw sw ld sd
++#define ISS_LABEL_FMA      (1 << 3)  // add sub mul mac
++#define ISS_LABEL_DIVSQRT  (1 << 4)  // div sqrt
++#define ISS_LABEL_NONCOMP  (1 << 5)  // sgnj min max
++#define ISS_LABEL_CONV     (1 << 6)  // fmv fcvt fcpka feq fle flt class
++#define ISS_LABEL_DOTP     (1 << 7)  // dotp sum
++
++static inline unsigned int iss_insn_label_class_compute(iss_insn_t *insn)
++{
++    const char *l = insn->decoder_item->u.insn.label;
++    unsigned int c = ISS_LABEL_VALID;
++    if (strstr(l, "flw") || strstr(l, "fsw") || strstr(l, "fld") || strstr(l, "fsd"))
++        c |= ISS_LABEL_FLSU;
++    if (strstr(l, "lw") || strstr(l, "sw") || strstr(l, "ld") || strstr(l, "sd"))
++        c |= ISS_LABEL_ILSU;
++    if (strstr(l, "add") || strstr(l, "sub") || strstr(l, "mul") || strstr(l, "mac"))
++        c |= ISS_LABEL_FMA;
++    if (strstr(l, "div") || strstr(l, "sqrt"))
++        c |= ISS_LABEL_DIVSQRT;
++    if (strstr(l, "sgnj") || strstr(l, "min") || strstr(l, "max"))
++        c |= ISS_LABEL_NONCOMP;
++    if (strstr(l, "fmv") || strstr(l, "fcvt") || strstr(l, "fcpka") || strstr(l, "feq") ||
++        strstr(l, "fle") || strstr(l, "flt") || strstr(l, "class"))
++        c |= ISS_LABEL_CONV;
++    if (strstr(l, "dotp") || strstr(l, "sum"))
++        c |= ISS_LABEL_DOTP;
++    insn->label_class = c;
++    return c;
++}
++
++static inline unsigned int iss_insn_label_class(iss_insn_t *insn)
++{
++    if (__builtin_expect(insn->label_class & ISS_LABEL_VALID, 1))
++        return insn->label_class;
++    return iss_insn_label_class_compute(insn);
++}
++
++
+ 
+ 
+ #define HWLOOP_NB_REGS 7
+diff -ru orig/core/models/cpu/iss/src/csr.cpp core/models/cpu/iss/src/csr.cpp
+--- core/models/cpu/iss/src/csr.cpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/src/csr.cpp	2026-10-08 18:40:02.478172003 +0000
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "cpu/iss/include/iss.hpp"
++#include <set>   // [SoftHier-fast] iss_csr_name_cstr
+ 
+ Csr::Csr(Iss &iss)
+     : iss(iss)
+@@ -1364,6 +1365,14 @@
+     return true;
+ }
+ 
++// [SoftHier-fast] iss_insn_arg_t::name is a plain pointer now (see types.hpp); CSR names are
++// interned in a process-wide set so that the pointer stays valid for the life of the process.
++const char *iss_csr_name_cstr(Iss *iss, iss_reg_t reg)
++{
++    static std::set<std::string> names;
++    return names.insert(iss_csr_name(iss, reg)).first->c_str();
++}
++
+ std::string iss_csr_name(Iss *iss, iss_reg_t reg)
+ {
+     CsrAbtractReg *csr = iss->csr.get_csr(reg);
+diff -ru orig/core/models/cpu/iss/src/snitch/decode.cpp core/models/cpu/iss/src/snitch/decode.cpp
+--- core/models/cpu/iss/src/snitch/decode.cpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/src/snitch/decode.cpp	2026-10-08 18:40:02.471172003 +0000
+@@ -106,10 +106,7 @@
+ 
+         // Record the memory addess for offloaded load/store instrution, 
+         // stall the following instruction which gets access to same memory block.
+-        bool lsu_label = strstr(insn->decoder_item->u.insn.label, "flw")
+-                    || strstr(insn->decoder_item->u.insn.label, "fsw")
+-                    || strstr(insn->decoder_item->u.insn.label, "fld")
+-                    || strstr(insn->decoder_item->u.insn.label, "fsd");
++        bool lsu_label = iss_insn_label_class(insn) & ISS_LABEL_FLSU;   // [SoftHier-fast] cached strstr
+         if (lsu_label)
+         {
+             iss->mem_map = REG_GET(0) + SIM_GET(0);
+@@ -174,10 +171,7 @@
+         iss_addr_t mem_map;
+         if(!insn->desc->tags[ISA_TAG_FP_OP_ID])
+         {
+-            bool lsu_label = strstr(insn->decoder_item->u.insn.label, "lw")
+-                    || strstr(insn->decoder_item->u.insn.label, "sw")
+-                    || strstr(insn->decoder_item->u.insn.label, "ld")
+-                    || strstr(insn->decoder_item->u.insn.label, "sd");
++            bool lsu_label = iss_insn_label_class(insn) & ISS_LABEL_ILSU;   // [SoftHier-fast] cached strstr
+             if (lsu_label)
+             {
+                 // Get memory address in the load/store instruction
+@@ -252,6 +246,13 @@
+     insn->resource_bandwidth = item->u.insn.resource_bandwidth;
+ 
+     insn->decoder_item = item;
++    // [SoftHier-fast] defined arg names (plain pointers now) and the label classification,
++    // computed once per decoded instruction instead of per execution
++    for (int i = 0; i < ISS_MAX_DECODE_ARGS; i++)
++    {
++        insn->args[i].name = "";
++    }
++    iss_insn_label_class_compute(insn);
+     insn->size = item->u.insn.size;
+     insn->nb_out_reg = 0;
+     insn->nb_in_reg = 0;
+diff -ru orig/core/models/cpu/iss/src/snitch/snitch.cpp core/models/cpu/iss/src/snitch/snitch.cpp
+--- core/models/cpu/iss/src/snitch/snitch.cpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/src/snitch/snitch.cpp	2026-10-08 18:40:02.472172003 +0000
+@@ -161,13 +161,16 @@
+     this->trace_iss.msg("Send offload request (opcode: 0x%lx, pc: 0x%lx)\n", opcode, pc);
+     
+     // Assign arguments to request.
+-    this->insn = *((iss_insn_t *)insn);
++    // [SoftHier-fast] one copy of the instruction straight into the request (was: a copy into
++    // this->insn plus a temporary OffloadReq built from it, i.e. three copies per instruction)
+     this->pc = pc;
+     this->is_write=is_write;
+     this->frm = this->csr.fcsr.frm;
+-
+-    // Assign arguments to request.
+-    this->acc_req = { .pc=pc, .insn=this->insn, .is_write=is_write, .frm =frm, .fmode=this->csr_fmode.value };
++    this->acc_req.pc = pc;
++    this->acc_req.insn = *insn;
++    this->acc_req.is_write = is_write;
++    this->acc_req.frm = this->frm;
++    this->acc_req.fmode = this->csr_fmode.value;
+ 
+     // Offload request if the port is connected
+     if (this->acc_req_itf.is_bound())
+@@ -180,7 +183,7 @@
+     // And the following instruction with data dependency will execute scoreboard_reg_check when loading the operands,
+     // which will call stall_load_dependency_account.
+     // Assign timestamp as the lower bound of latency, which will be updated to the exact value after the instruction is executed.
+-    if (!this->insn.out_regs_fp[0] & this->insn.out_regs[0] != 0xFF)
++    if (!insn->out_regs_fp[0] & insn->out_regs[0] != 0xFF)
+     {
+     #if defined(CONFIG_GVSOC_ISS_SCOREBOARD)
+         this->regfile.scoreboard_reg_set_timestamp(insn->out_regs[0], insn->latency, -1);
+@@ -196,8 +199,9 @@
+ {
+     Iss *_this = (Iss *)__this;
+ 
+-    // Assign arguments to request.
+-    _this->acc_req = { .pc=_this->pc, .insn=_this->insn, .is_write=_this->is_write, .frm =_this->frm, .fmode=_this->csr_fmode.value };
++    // Assign arguments to request. [SoftHier-fast] acc_req already holds the last request built
++    // by handle_req (pc / insn / is_write / frm); only the alt mode is re-read as before.
++    _this->acc_req.fmode = _this->csr_fmode.value;
+ 
+     // Offload request if the port is connected
+     if (_this->acc_req_itf.is_bound())
+@@ -212,24 +216,24 @@
+ {
+     Iss *_this = (Iss *)__this;
+ 
++    // [SoftHier-fast] result->insn is a pointer into the subsystem's copy (OffloadRsp.hpp)
++    iss_insn_t *insn = result->insn;
++
+     // Store dependent input integer register value when we receive the response from fp subsystem.
+-    if (!result->insn.out_regs_fp[0] & result->insn.out_regs[0] != 0xFF)
++    if (!insn->out_regs_fp[0] & insn->out_regs[0] != 0xFF)
+     {
+         _this->regfile.set_reg(result->rd, result->data);
+     }
+ 
+     // Set scoreboard valid when the instruction finishes execution.
+-    if (!result->insn.out_regs_fp[0] && result->insn.out_regs[0] != 0xFF)
++    if (!insn->out_regs_fp[0] && insn->out_regs[0] != 0xFF)
+     {
+         #if defined(CONFIG_GVSOC_ISS_SCOREBOARD)
+-        _this->regfile.scoreboard_reg_valid[result->insn.out_regs[0]] = true;
+-        #endif   
++        _this->regfile.scoreboard_reg_valid[insn->out_regs[0]] = true;
++        #endif
+     }
+     // Reset memory address when the instruction finishes execution.
+-    bool lsu_label = strstr(result->insn.decoder_item->u.insn.label, "flw")
+-                    || strstr(result->insn.decoder_item->u.insn.label, "fsw")
+-                    || strstr(result->insn.decoder_item->u.insn.label, "fld")
+-                    || strstr(result->insn.decoder_item->u.insn.label, "fsd");
++    bool lsu_label = iss_insn_label_class(insn) & ISS_LABEL_FLSU;   // [SoftHier-fast] cached strstr
+     if (lsu_label & result->pc==_this->mem_pc)
+     {
+         _this->mem_map = 0x0;
+@@ -253,11 +257,11 @@
+     // Assign results here because we use fp register value only for trace, not for later computation.
+     for (int i=0; i<ISS_NB_REGS; i++)
+     {
+-        _this->regfile.set_freg(i, *((iss_freg_t *)(result->insn.freg_addr)+i));
++        _this->regfile.set_freg(i, *((iss_freg_t *)(insn->freg_addr)+i));
+     }
+ 
+     // Output instruction trace for debugging.
+-    _this->trace_iss.msg("Get accelerator response (opcode: 0x%lx, pc: 0x%lx)\n", result->insn.opcode, result->pc);
++    _this->trace_iss.msg("Get accelerator response (opcode: 0x%lx, pc: 0x%lx)\n", insn->opcode, result->pc);
+     
+ }
+ 
+diff -ru orig/core/models/cpu/iss/src/snitch/snitch_fp_ss.cpp core/models/cpu/iss/src/snitch/snitch_fp_ss.cpp
+--- core/models/cpu/iss/src/snitch/snitch_fp_ss.cpp	2026-10-08 11:21:12.088271002 +0000
++++ core/models/cpu/iss/src/snitch/snitch_fp_ss.cpp	2026-10-08 18:40:02.477172003 +0000
+@@ -124,7 +124,11 @@
+     // Obtain arguments from request.
+     iss_reg_t pc = req->pc;
+     bool isRead = !req->is_write;
+-    iss_insn_t insn = req->insn;
++    // [SoftHier-fast] one copy into the subsystem's own request and work on that (was: a local
++    // copy, a by-value get_latency argument, a copy into acc_req.insn, a copy in handle_event and
++    // a copy into the response: five copies of the instruction per offload)
++    _this->acc_req.insn = req->insn;
++    iss_insn_t &insn = _this->acc_req.insn;
+     unsigned int frm = req->frm;
+     insn.fmode = req->fmode;
+ 
+@@ -172,7 +176,9 @@
+     _this->csr.fcsr.frm = frm;
+ 
+     // Get input information for trace
+-    if (!_this->ssr.ssr_enable)
++    // [SoftHier-fast] only when the instruction trace is active (it is the only consumer of
++    // saved_args; in the optim build get_active() is constant false and this compiles away)
++    if (_this->trace.insn_trace.get_active() && !_this->ssr.ssr_enable)
+     {
+         iss_trace_save_args(_this, &insn, _this->trace.saved_args, false);
+     }
+@@ -217,7 +223,7 @@
+     // Regard the instruction execution part into event queue,
+     // in order to realize the parallelism between master and slave.
+     _this->acc_req.pc = pc;
+-    _this->acc_req.insn = insn;
++    // [SoftHier-fast] acc_req.insn is `insn` itself (see above)
+     _this->trace_iss.msg(vp::Trace::LEVEL_TRACE, "Enqueue the finished offloaded instruction\n");
+     // Todo: Add insn.latency after stall_insn_dependency_account in corresponding handler function.
+     if (!_this->event->is_enqueued())
+@@ -262,7 +268,7 @@
+     
+     iss_reg_t pc = _this->acc_req.pc;
+     bool isRead = !_this->acc_req.is_write;
+-    iss_insn_t insn = _this->acc_req.insn;
++    iss_insn_t &insn = _this->acc_req.insn;   // [SoftHier-fast] was a copy
+     iss_opcode_t opcode = insn.opcode;
+ 
+     bool error;
+@@ -284,7 +290,10 @@
+     // Also process the dm_write_full and write computation result again after stall to data lane.
+     if (_this->ssr.ssr_enable)
+     {
+-        iss_trace_save_args(_this, &insn, _this->trace.saved_args, false);
++        if (_this->trace.insn_trace.get_active())   // [SoftHier-fast]
++        {
++            iss_trace_save_args(_this, &insn, _this->trace.saved_args, false);
++        }
+ 
+         // Reset for SSR clock events and settings
+         _this->ssr.dm_write_again();
+@@ -292,13 +301,19 @@
+         _this->ssr.dm1.dm_not_preload = false;
+         _this->ssr.dm2.dm_not_preload = false;
+     }
+-    iss_trace_dump(_this, &insn, pc);
++    // [SoftHier-fast] the dump formats the whole instruction with sprintf (and saves the output
++    // args) before handing the string to insn_trace.msg(), which drops it when the trace is off;
++    // the integer core (iss_exec_insn_with_trace) already guards it the same way.
++    if (_this->trace.insn_trace.get_active())
++    {
++        iss_trace_dump(_this, &insn, pc);
++    }
+     _this->trace_iss.msg(vp::Trace::LEVEL_TRACE, "Finish offload IO request (opcode: 0x%llx, pc: 0x%llx, isRead: %d)\n", opcode, pc, isRead);
+      
+     // Assign arguments to result.
+     data = _this->regfile.get_reg(rd);
+     fflags = _this->csr.fcsr.fflags;
+-    _this->acc_rsp = { .rd=rd, .error=error, .data=data, .fflags=fflags, .pc=pc, .insn=insn };
++    _this->acc_rsp = { .rd=rd, .error=error, .data=data, .fflags=fflags, .pc=pc, .insn=&insn };   // [SoftHier-fast] pointer
+     
+     // Send back response of the result
+     if (_this->acc_rsp_itf.is_bound())
+@@ -330,7 +345,7 @@
+ }
+ 
+ // Get called when we need to calculate the latency of instruction after considering pipeline registers in fpu.
+-int Iss::get_latency(iss_insn_t insn, iss_reg_t pc, int timestamp)
++int Iss::get_latency(iss_insn_t &insn, iss_reg_t pc, int timestamp)   // [SoftHier-fast] was by value
+ {
+     int rs1 = insn.in_regs[0];
+     int rs2 = insn.in_regs[1];
+@@ -349,33 +364,14 @@
+     }
+ 
+     // Determine operation groups dependent on the label of instruction
+-    bool fma_label = strstr(insn.decoder_item->u.insn.label, "add")
+-                    || strstr(insn.decoder_item->u.insn.label, "sub")
+-                    || strstr(insn.decoder_item->u.insn.label, "mul")
+-                    || strstr(insn.decoder_item->u.insn.label, "mac");
+-
+-    bool divsqrt_label = strstr(insn.decoder_item->u.insn.label, "div")
+-                        || strstr(insn.decoder_item->u.insn.label, "sqrt");
+-
+-    bool noncomp_label = strstr(insn.decoder_item->u.insn.label, "sgnj")
+-                        || strstr(insn.decoder_item->u.insn.label, "min")
+-                        || strstr(insn.decoder_item->u.insn.label, "max");
+-
+-    bool conv_label = strstr(insn.decoder_item->u.insn.label, "fmv")
+-                    || strstr(insn.decoder_item->u.insn.label, "fcvt")
+-                    || strstr(insn.decoder_item->u.insn.label, "fcpka")
+-                    || strstr(insn.decoder_item->u.insn.label, "feq")
+-                    || strstr(insn.decoder_item->u.insn.label, "fle")
+-                    || strstr(insn.decoder_item->u.insn.label, "flt")
+-                    || strstr(insn.decoder_item->u.insn.label, "class");
+-
+-    bool dotp_label = strstr(insn.decoder_item->u.insn.label, "dotp")
+-                    || strstr(insn.decoder_item->u.insn.label, "sum");
+-
+-    bool lsu_label = strstr(insn.decoder_item->u.insn.label, "flw")
+-                    || strstr(insn.decoder_item->u.insn.label, "fsw")
+-                    || strstr(insn.decoder_item->u.insn.label, "fld")
+-                    || strstr(insn.decoder_item->u.insn.label, "fsd");
++    // [SoftHier-fast] cached classification (22 strstr per instruction before), same predicates
++    unsigned int label_class = iss_insn_label_class(&insn);
++    bool fma_label = label_class & ISS_LABEL_FMA;
++    bool divsqrt_label = label_class & ISS_LABEL_DIVSQRT;
++    bool noncomp_label = label_class & ISS_LABEL_NONCOMP;
++    bool conv_label = label_class & ISS_LABEL_CONV;
++    bool dotp_label = label_class & ISS_LABEL_DOTP;
++    bool lsu_label = label_class & ISS_LABEL_FLSU;
+ 
+     int latency = insn.latency;
+     int latency_pipe = 0;
+diff -ru orig/core/models/cpu/iss/src/trace.cpp core/models/cpu/iss/src/trace.cpp
+--- core/models/cpu/iss/src/trace.cpp	2026-03-16 17:28:11.000000000 +0000
++++ core/models/cpu/iss/src/trace.cpp	2026-10-08 18:40:27.388044001 +0000
+@@ -367,7 +367,7 @@
+         {
+             if (insn_arg->flags & ISS_DECODER_ARG_FLAG_DUMP_NAME)
+             {
+-                buff += sprintf(buff, "%s", insn_arg->name.c_str());
++                buff += sprintf(buff, "%s", insn_arg->name);
+             }
+             else
+             {
+@@ -378,7 +378,7 @@
+         {
+             if (insn_arg->flags & ISS_DECODER_ARG_FLAG_DUMP_NAME)
+             {
+-                buff += sprintf(buff, "%s", insn_arg->name.c_str());
++                buff += sprintf(buff, "%s", insn_arg->name);
+             }
+             else
+             {
+diff -ru orig/pulp/pulp/snitch/sequencer.cpp pulp/pulp/snitch/sequencer.cpp
+--- pulp/pulp/snitch/sequencer.cpp	2026-03-16 17:28:11.000000000 +0000
++++ pulp/pulp/snitch/sequencer.cpp	2026-10-08 18:40:02.481172003 +0000
+@@ -78,6 +78,21 @@
+     BufferEntry() {}
+     BufferEntry(OffloadReq req, bool is_outer, int max_inst, int max_rpt, int stagger_max, unsigned int stagger_mask, int base_entry, int next_entry, FrepConfig config);
+ 
++    // [SoftHier-fast] the defaults of a freshly constructed entry, without touching req
++    // (entries are now generated in place in the ring buffer)
++    void reset_meta()
++    {
++        isn_sequence = true;
++        is_outer = false;
++        max_inst = -1;
++        max_rpt = -1;
++        stagger_max = 0;
++        stagger_mask = 0x0;
++        base_entry = -1;
++        next_entry = -1;
++        config = FrepConfig();
++    }
++
+     // Main content of the entry
+     OffloadReq req;      
+     // Whether the instruction is in frep sequence
+@@ -118,10 +133,15 @@
+ private:
+ 
+     // Functions for read/write logic
+-    void write_entry(BufferEntry entry);
++    // [SoftHier-fast] entries are generated in place and read into acc_req: one copy of the
++    // ~700-byte request on the way in and one on the way out (was six by-value copies plus
++    // BufferEntry temporaries per sequenced instruction).
++    void write_entry(BufferEntry *entry);
+     void update_entry(int index);
+-    BufferEntry read_entry(int index);
+-    BufferEntry gen_entry(OffloadReq *req, FrepConfig *frep_config);
++    void read_entry(int index);
++    void gen_entry(OffloadReq *req, FrepConfig *frep_config, BufferEntry *new_entry);
++    // Target of gen_entry when the buffer is full (the entry is dropped, as before)
++    BufferEntry dropped_entry;
+     // Functions determining the state of the buffer
+     bool isFull();
+     bool isEmpty();
+@@ -215,17 +235,14 @@
+     _this->trace.msg(vp::Trace::LEVEL_TRACE, "Sequencer receives acceleration request output handshaking signal: %d\n", _this->acc_req_ready_o);
+ 
+     // If the buffer has some entries, offload entry one by one each cycle
+-    BufferEntry offload_entry;
+     int buf_id = _this->read_id;
+ 
+     // The buffer is not empty and the subsystem is ready, offload the request from the buffer.
+     if (!_this->isEmpty() && _this->acc_req_ready_o)
+     {
+-        // Read out an entry from the buffer.
+-        offload_entry = _this->read_entry(buf_id);
+-
+-        // Output handshaking, between sequencer and fp subsystem
+-        _this->acc_req = offload_entry.req;
++        // Read out an entry from the buffer into acc_req (output handshaking, between
++        // sequencer and fp subsystem). [SoftHier-fast] was: copy to a local entry, then to acc_req.
++        _this->read_entry(buf_id);
+         _this->trace.msg("Offload to fp subsystem from buffer index %d (opcode: 0x%lx, pc: 0x%lx)\n", buf_id, _this->acc_req.insn.opcode, _this->acc_req.pc);
+ 
+         // Offload request if the port is connected
+@@ -304,7 +321,7 @@
+     // Obtain arguments from request.
+     iss_reg_t pc = req->pc;
+     bool isRead = !req->is_write;
+-    iss_insn_t insn = req->insn;
++    const iss_insn_t &insn = req->insn;   // [SoftHier-fast] was a copy
+     unsigned int frm = req->frm;
+     iss_opcode_t opcode = insn.opcode;
+ 
+@@ -353,11 +370,13 @@
+     
+ 
+     // 2. Instructions are sequenced from the FPU sequence buffer. Write a new entry into the buffer.
+-    BufferEntry new_entry;
+     if(!insn.desc->tags[ISA_TAG_FREP_ID] && !insn.desc->tags[ISA_TAG_NSEQ_ID])
+     {
+         // The buffer must have vacancy after rsp_state() function.
+-        new_entry = _this->gen_entry(req, &_this->frep_config);
++        // [SoftHier-fast] generate the entry in its ring buffer slot (or in a dropped scratch
++        // entry when the buffer is full, which write_entry reports as before).
++        BufferEntry *new_entry = _this->isFull() ? &_this->dropped_entry : &_this->RingBuffer[_this->write_id];
++        _this->gen_entry(req, &_this->frep_config, new_entry);
+         // Write in new requests into the buffer.
+         _this->write_entry(new_entry);
+ 
+@@ -447,9 +466,12 @@
+ 
+ 
+ // Get called when we need to generate new buffer entry according to new request and freg configuration.
+-BufferEntry sequencer::gen_entry(OffloadReq *req, FrepConfig *config)
++// [SoftHier-fast] fills *dst in place (metadata reset to the BufferEntry defaults first, request
++// copied once) instead of returning a fresh BufferEntry by value.
++void sequencer::gen_entry(OffloadReq *req, FrepConfig *config, BufferEntry *dst)
+ {
+-    BufferEntry new_entry;
++    BufferEntry &new_entry = *dst;
++    new_entry.reset_meta();
+ 
+     // Observe whether it's inside a sequence defined by a frep configuration
+     bool sequence = true;
+@@ -555,15 +577,15 @@
+             config->stagger_mask = 0x0;
+         }
+     }
+-
+-    return new_entry;
+ }
+ 
+ 
+ // Get called when there is a new entry that needs to be written into the buffer.
+-void sequencer::write_entry(BufferEntry entry)
++// [SoftHier-fast] the entry was generated in RingBuffer[write_id] already (or in dropped_entry when
++// the buffer is full); this only commits it.
++void sequencer::write_entry(BufferEntry *entry)
+ {
+-    if (this->isFull()) 
++    if (this->isFull())
+     {
+         this->acc_req_ready = false;
+         this->trace.msg("Sequence buffer is full and no longer accepts new instructions\n");
+@@ -571,7 +593,6 @@
+     else
+     {
+         // Write new entry to write_id
+-        this->RingBuffer[this->write_id] = entry;
+         this->trace.msg("Wrote IO request in buffer index %d (opcode: 0x%llx, pc: 0x%llx)\n", this->write_id, this->RingBuffer[this->write_id].req.insn.opcode, this->RingBuffer[this->write_id].req.pc);
+ 
+         // Update write_id for the next write operation
+@@ -582,18 +603,22 @@
+ 
+ 
+ // Get called when we read out an entry from the buffer.
+-BufferEntry sequencer::read_entry(int index)
++// [SoftHier-fast] copies the entry's request into acc_req (the register-index update for the
++// trace is applied to that copy, as it was to the returned copy before); the ring buffer entry
++// itself is left untouched, as before. Only called when the buffer is not empty.
++void sequencer::read_entry(int index)
+ {
+-    if (this->isEmpty()) 
++    if (this->isEmpty())
+     {
+         this->trace.msg("Sequence buffer is empty and no instruction can be read\n");
+         // Todo: write a return here to avoid accident happening.
+-        // For now return a dummy one to avoid gcc warning
+-        return BufferEntry();
++        return;
+     }
+     else
+     {
+-        BufferEntry entry = this->RingBuffer[index];
++        const BufferEntry &entry = this->RingBuffer[index];
++        OffloadReq &req = this->acc_req;
++        req = entry.req;
+         this->trace.msg("Read IO request in buffer index %d (opcode: 0x%llx, pc: 0x%llx)\n", index, this->RingBuffer[index].req.insn.opcode, this->RingBuffer[index].req.pc);
+ 
+         // Assign read_id to index of next instruction
+@@ -603,26 +628,24 @@
+         // Update register index for trace if this instruction's stagger_max>0
+         if (!entry.isn_sequence & entry.config.stagger_max > 0)
+         {
+-            int nb_args = entry.req.insn.decoder_item->u.insn.nb_args;
++            int nb_args = req.insn.decoder_item->u.insn.nb_args;
+             for (int i = 0; i < nb_args; i++)
+             {
+-                iss_decoder_arg_t *arg = &entry.req.insn.decoder_item->u.insn.args[i];
+-                iss_insn_arg_t *insn_arg = &entry.req.insn.args[i];
++                iss_decoder_arg_t *arg = &req.insn.decoder_item->u.insn.args[i];
++                iss_insn_arg_t *insn_arg = &req.insn.args[i];
+                 if ((arg->type == ISS_DECODER_ARG_TYPE_OUT_REG || arg->type == ISS_DECODER_ARG_TYPE_IN_REG) && (insn_arg->u.reg.index != 0 || arg->flags & ISS_DECODER_ARG_FLAG_FREG))
+                 {
+                     if (arg->type == ISS_DECODER_ARG_TYPE_OUT_REG)
+                     {
+-                        insn_arg->u.reg.index = entry.req.insn.out_regs[arg->u.reg.id];
++                        insn_arg->u.reg.index = req.insn.out_regs[arg->u.reg.id];
+                     }
+                     else if (arg->type == ISS_DECODER_ARG_TYPE_IN_REG)
+                     {
+-                        insn_arg->u.reg.index = entry.req.insn.in_regs[arg->u.reg.id];
++                        insn_arg->u.reg.index = req.insn.in_regs[arg->u.reg.id];
+                     }
+                 }
+             }
+         }
+-
+-        return entry;
+     }
+ }
+ 
