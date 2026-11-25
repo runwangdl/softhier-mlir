@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 300" width="980" height="300" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9198a1"/></marker></defs>
+<rect x="14" y="36" width="152" height="112" rx="8" fill="#231a33" stroke="#bc8cff" stroke-width="1.5"/>
+<text x="90.0" y="64" fill="#bc8cff" font-size="15" font-weight="600" text-anchor="middle">Model</text>
+<text x="90.0" y="90" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">linalg / frontends</text>
+<text x="90.0" y="108" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">SigLIP, SmolVLA,</text>
+<text x="90.0" y="126" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">RSSM, LoRA step</text>
+<path d="M170 92.0L214 92.0" stroke="#9198a1" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+<text x="192.0" y="24" fill="#e6edf3" font-size="11.5" font-weight="500" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">softhier-opt</text>
+<path d="M192.0 30L192.0 86.0" stroke="#3d444d" stroke-width="1"/>
+<rect x="218" y="36" width="152" height="112" rx="8" fill="#121d2f" stroke="#58a6ff" stroke-width="1.5"/>
+<text x="294.0" y="64" fill="#58a6ff" font-size="15" font-weight="600" text-anchor="middle">softhier dialect</text>
+<text x="294.0" y="90" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">xDSL IR</text>
+<text x="294.0" y="108" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">gemm, attention,</text>
+<text x="294.0" y="126" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">dma, barrier, ...</text>
+<path d="M374 92.0L418 92.0" stroke="#9198a1" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+<text x="396.0" y="24" fill="#e6edf3" font-size="11.5" font-weight="500" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">softhier-translate</text>
+<path d="M396.0 30L396.0 86.0" stroke="#3d444d" stroke-width="1"/>
+<rect x="422" y="36" width="152" height="112" rx="8" fill="#12261e" stroke="#3fb950" stroke-width="1.5"/>
+<text x="498.0" y="64" fill="#3fb950" font-size="15" font-weight="600" text-anchor="middle">C program</text>
+<text x="498.0" y="90" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">one sh_* call</text>
+<text x="498.0" y="108" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">per op</text>
+<text x="498.0" y="126" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">(SPMD main.c)</text>
+<path d="M578 92.0L622 92.0" stroke="#9198a1" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+<text x="600.0" y="24" fill="#e6edf3" font-size="11.5" font-weight="500" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">riscv32 gcc</text>
+<path d="M600.0 30L600.0 86.0" stroke="#3d444d" stroke-width="1"/>
+<rect x="626" y="36" width="152" height="112" rx="8" fill="#2a1a0c" stroke="#f0883e" stroke-width="1.5"/>
+<text x="702.0" y="64" fill="#f0883e" font-size="15" font-weight="600" text-anchor="middle">ELF</text>
+<text x="702.0" y="90" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">runtime/ softhier-ops</text>
+<text x="702.0" y="108" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">+ SoftHier SDK</text>
+<text x="702.0" y="126" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">(+ HBM preload image)</text>
+<path d="M782 92.0L826 92.0" stroke="#9198a1" stroke-width="1.5" fill="none" marker-end="url(#a)"/>
+<text x="804.0" y="24" fill="#e6edf3" font-size="11.5" font-weight="500" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">gapy run</text>
+<path d="M804.0 30L804.0 86.0" stroke="#3d444d" stroke-width="1"/>
+<rect x="830" y="36" width="152" height="112" rx="8" fill="#161b22" stroke="#3d444d" stroke-width="1.5"/>
+<text x="906.0" y="64" fill="#e6edf3" font-size="15" font-weight="600" text-anchor="middle">GVSoC</text>
+<text x="906.0" y="90" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">flex_cluster model</text>
+<text x="906.0" y="108" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">simulated ns, traces,</text>
+<text x="906.0" y="126" fill="#9198a1" font-size="12" font-weight="400" text-anchor="middle">on-device self-checks</text>
+<text x="192.0" y="170" fill="#9198a1" font-size="11.5" font-weight="600" text-anchor="middle">passes</text>
+<text x="192.0" y="188" fill="#9198a1" font-size="11.5" font-weight="400" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">linalg-to-softhier</text>
+<text x="192.0" y="204" fill="#9198a1" font-size="11.5" font-weight="400" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">pipeline-gemm</text>
+<text x="192.0" y="220" fill="#9198a1" font-size="11.5" font-weight="400" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">distribute-summa</text>
+<rect x="218" y="236" width="560" height="46" rx="8" fill="#161b22" stroke="#3d444d" stroke-width="1.5"/>
+<text x="234" y="256" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="start">Design-space exploration</text>
+<text x="234" y="273" fill="#9198a1" font-size="11.5" font-weight="400" text-anchor="start">workload IR  →  analytic cost model (calibrated on micro-benchmarks)  →  arch / tiling sweep</text>
+<path d="M278 234L278 154" stroke="#9198a1" stroke-width="1.5" fill="none" marker-end="url(#a)" stroke-dasharray="5 4"/>
+<text x="286" y="222" fill="#9198a1" font-size="11" font-weight="400" text-anchor="start">tiles, schedule</text>
+<path d="M906.0 154L906.0 259L784 259" stroke="#9198a1" stroke-width="1.5" fill="none" stroke-dasharray="5 4" marker-end="url(#a)"/>
+<text x="898.0" y="188" fill="#9198a1" font-size="11" font-weight="400" text-anchor="end">measured ns</text>
+</svg>
