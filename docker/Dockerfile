@@ -106,6 +106,9 @@ ENV SOFTHIER_CHROOT="" \
     PATH=$SOFTHIER_HOME/install/bin:$SOFTHIER_HOME/third_party/toolchain/install/bin:$PATH \
     PYTHONPATH=$SOFTHIER_HOME/install/python:$SOFTHIER_HOME/soft_hier/flex_cluster_utilities
 
+LABEL org.opencontainers.image.source=https://github.com/runwangdl/softhier-mlir \
+      org.opencontainers.image.description="softhier-mlir + SoftHier GVSoC (flex_cluster) + RISC-V toolchain" \
+      org.opencontainers.image.licenses=Apache-2.0
 COPY smoke.sh /usr/local/bin/smoke
 WORKDIR /app/softhier-mlir
 CMD ["bash"]
