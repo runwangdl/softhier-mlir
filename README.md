@@ -49,6 +49,7 @@ python tests/gvsoc/run.py siglip --cluster all --data device  # test inputs gene
 python -m softhier_mlir.frontend.siglip --layers 12 --no-test # the dialect module of a 12-layer encoder
 ```
 Simulator setup (aarch64 host, x86 toolchain chroot, ideal HBM) is described in `softhier_mlir/sim/gvsoc.py`.
+A Docker image with the simulator, the toolchain and this repo: [`docker/`](docker/README.md).
 
 **Docs:** [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — how to generate & run, and how to
 add a new op (step by step) · [`docs/DESIGN.md`](docs/DESIGN.md) — the dialect

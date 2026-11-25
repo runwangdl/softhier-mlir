@@ -1,0 +1,317 @@
+gvsoc RedMulE functional model: NEON fp16 matmul (host speed only; timing identical)
+=====================================================================================
+Date: 2026-10-08   Target: /app/install/softhier soft_hier/flex_cluster/light_redmule.cpp
+(the same file is mirrored to pulp/pulp/chips/flex_cluster/ and install/generators/pulp/chips/flex_cluster/)
+Base: working tree AFTER the earlier float_to_fp16 round-to-nearest-even fix (kept unchanged).
+Build: cmake --build build --target gen_pulp_chips_flex_cluster_light_redmule_cpp_219482712_{optim,debug}
+       (no CMake change: the fp16 code uses __attribute__((target("arch=armv8.2-a+fp16"))) on the
+       functions that need it, so the shared flags stay "-g -O3 -fPIC -fno-stack-protector").
+Installed .so: install/models/gen_pulp_..._219482712.so (+ debug/); previous builds kept as
+       .so.orig (pre-RNE fix) and .so.pre-neon (RNE fix only).
+
+What changed (only the arithmetic helpers at the bottom of the file + an fp8 LUT; no address
+generation / timing code touched):
+  * matmul_fp16: AArch64 NEON path (vfmaq_f16, 8 output columns per vector, 4x32 register block,
+    accumulator kept in fp16 lanes -> one fp16 rounding per MAC exactly like before), column tail
+    via zero-padded lanes, runtime HWCAP check (FPHP+ASIMDHP) with the original scalar code as
+    fallback; REDMULE_NO_NEON=1 in the environment forces the scalar path for A/B checks.
+  * matmul_{u,}int{8,16}: same loops, but accumulate a 64-column block in a local uint32 array so
+    GCC auto-vectorises; wrap-around per step == one wrap at the end, results bit-identical.
+  * fp8e4m3_fma: fp8->float through a 256-entry table built from the original converter.
+
+Semantics vs. the scalar model (fp16):
+  * Old: a*b exact in fp32, (+c) rounded to fp32, then rounded RNE to fp16 (double rounding).
+    New: fused a*b+c with ONE RNE rounding to fp16 (what FPnew's fp16 FMA does, so closer to RTL).
+    Measured against an exact (long double) FMA + single RNE rounding: the NEON result matched it in
+    100% of ~30k checked outputs, the old path differed in 0.01% (gemm --real data) to 0.13%
+    (random normal fp16 bits), by up to a few ulp after propagation through the accumulation.
+    On the integer-valued data of tests/gvsoc/run.py gemm the two are bit-identical.
+  * Subnormal / inf / NaN now follow IEEE fp16 (FPCR.FZ16 = 0, no flush).  The old fp16_to_float
+    read fp16 subnormals as ~0 (so a subnormal *accumulator* was zeroed on the next MAC) and read
+    inf/NaN as the finite value 2^16*(1.m); the new path keeps subnormals (|x| < 6.1e-5) and
+    propagates inf/NaN.  Only matters for data that overflows/underflows fp16.
+
+Host rounding mode (found by the siglip test, first NEON build failed H/G/OUT with errors up to 1.2):
+  the Snitch ISS (core/models/cpu/iss/include/isa_lib/int.h) emulates RISC-V rounding modes with
+  fesetround() and can leave the engine thread in RTZ/RDN/RUP.  The scalar path never noticed
+  (its final fp16 rounding is hand-written RNE; only the fp32 add was affected), vfmaq_f16 honours
+  FPCR, so P.V (softmax probabilities, 256-term accumulation) came out ~4 % low under RTZ.  The
+  kernel now saves FPCR, forces RMode=RN, FZ=FZ16=0, and restores it afterwards (verified against
+  the exact reference with the host set to FE_TOWARDZERO).
+
+Kernel measurement (standalone, host tile 128 x 2048 x 128 = 33.5 MMAC, same -O3 flags):
+    scalar model : 14.35 ns/MAC   (0.48 s per process_compute call; ~25 ns/MAC inside gvsoc)
+    NEON fp16    : 0.076 ns/MAC   (2.6 ms per call)  -> ~190x
+Simulation (tests/gvsoc/run.py gemm, host load ~7-9 from other agents' jobs):
+    1024x3072x768:256,256,256,1,0,all   roi 509224 ns (identical)   wall 71.6 s -> 40.7 s
+    512x768x768:256,256,256             roi 146466 ns (identical)   wall 14.6 s -> 10.4 s
+    gemm default set (7 shapes) + --real 2 shapes: all PASS, all ROI identical to the scalar path
+    siglip --seq 256 --cluster 0: 13/13 tensors PASS, OUT maxerr 0.0283 -> 0.0205, wall 242 s -> 228 s;
+      ROI 700522026 -> 700514592 ns (1e-5: data-dependent timing of the software softmax/LN/GELU
+      on the Snitch cores seeing slightly different fp16 values; RedMulE timing itself unchanged)
+    (remaining time is the rest of the platform: gdb sampling shows the Snitch ISS - iss_insn_s /
+     OffloadReq copies with std::string members in sequencer::offload_event, iss_trace_dump_insn -
+     not RedMulE arithmetic)
+
+--- a/soft_hier/flex_cluster/light_redmule.cpp
++++ b/soft_hier/flex_cluster/light_redmule.cpp
+@@ -34,6 +34,14 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <math.h>
++#include <algorithm>
++#include <type_traits>
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#include <sys/auxv.h>
++#include <asm/hwcap.h>
++#define REDMULE_FP16_TARGET __attribute__((target("arch=armv8.2-a+fp16")))
++#endif
+ 
+ /****************************************************
+ *                   Type Definition                 *
+@@ -1205,33 +1213,7 @@
+ *                   Function Implementation                 *
+ ************************************************************/
+ 
+-void matmul_uint16(uint16_t * z, uint16_t * y, uint16_t * x, uint16_t * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
+-    for (int i = 0; i < m_size; ++i)
+-    {
+-        for (int j = 0; j < k_size; ++j)
+-        {
+-            z[i * k_size + j] = y[i * k_size + j];
+-            for (int k = 0; k < n_size; ++k)
+-            {
+-                z[i * k_size + j] += x[i * n_size + k] * w[k * k_size + j];
+-            }
+-        }
+-    }
+-}
+ 
+-void matmul_int16(int16_t * z, int16_t * y, int16_t * x, int16_t * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
+-    for (int i = 0; i < m_size; ++i)
+-    {
+-        for (int j = 0; j < k_size; ++j)
+-        {
+-            z[i * k_size + j] = y[i * k_size + j];
+-            for (int k = 0; k < n_size; ++k)
+-            {
+-                z[i * k_size + j] += x[i * n_size + k] * w[k * k_size + j];
+-            }
+-        }
+-    }
+-}
+ 
+ 
+ // Convert float to FP16 (half-precision)
+@@ -1283,7 +1265,41 @@
+     return float_to_fp16(result);
+ }
+ 
+-void matmul_fp16(fp16 * z, fp16 * y, fp16 * x, fp16 * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
++/* ---------------------------------------------------------------------------------------------
++ * [SoftHier-perf] Host-side fast paths for the functional matmul.  Timing/behaviour of the
++ * model is untouched: only the arithmetic in process_compute() runs faster.
++ *
++ *  fp16 : one AArch64 NEON fp16 FMA (vfmaq_f16) per MAC lane, 8 output columns per vector,
++ *         accumulator kept in fp16 lanes -> still one fp16 rounding per MAC (what the fp16 FMA
++ *         units of the real RedMulE/FPnew do).  Difference to the scalar model: the FMA is fused
++ *         (one IEEE RNE rounding of the exact a*b+c) instead of double-rounded (a*b exact in fp32,
++ *         + c rounded to fp32, then rounded to fp16).  Inputs/outputs that are fp16 subnormal,
++ *         inf or NaN follow IEEE (FPCR.FZ16 = 0); the scalar converter treated subnormal inputs as
++ *         ~0 and inf/NaN inputs as 2^16*(1.m).  Scalar path is kept as a fallback (no fp16 CPU
++ *         support, or REDMULE_NO_NEON=1 in the environment for A/B checks).
++ *  ints : accumulate a row block in a local 32-bit array so GCC can auto-vectorise over j; the
++ *         per-step wrap-around of the original equals a single wrap at the end (modular
++ *         arithmetic), so results are bit-identical.
++ *  fp8  : fp8e4m3 -> float goes through a 256-entry table built with the original converter.
++ * ------------------------------------------------------------------------------------------- */
++
++static bool redmule_host_has_fp16(void) {
++    static int has = -1;
++    if (has < 0) {
++#if defined(__aarch64__)
++        unsigned long hw = getauxval(AT_HWCAP);
++        has = ((hw & HWCAP_FPHP) && (hw & HWCAP_ASIMDHP)) ? 1 : 0;
++#else
++        has = 0;
++#endif
++        const char *e = getenv("REDMULE_NO_NEON");
++        if (e && e[0] && e[0] != '0') has = 0;
++    }
++    return has == 1;
++}
++
++// Original scalar implementation (kept as fallback / reference).
++static void matmul_fp16_scalar(fp16 * z, fp16 * y, fp16 * x, fp16 * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
+     for (int i = 0; i < m_size; ++i)
+     {
+         for (int j = 0; j < k_size; ++j)
+@@ -1297,34 +1313,124 @@
+     }
+ }
+ 
+-
+-void matmul_uint8(uint8_t * z, uint8_t * y, uint8_t * x, uint8_t * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
+-    for (int i = 0; i < m_size; ++i)
+-    {
+-        for (int j = 0; j < k_size; ++j)
+-        {
+-            z[i * k_size + j] = y[i * k_size + j];
+-            for (int k = 0; k < n_size; ++k)
+-            {
+-                z[i * k_size + j] += x[i * n_size + k] * w[k * k_size + j];
+-            }
++#if defined(__aarch64__)
++// RI rows of z (row stride k_size) x CS*8 columns starting at j0, reduced over all n_size.
++// x points at row 0 of the block (row stride n_size).  All RI*CS accumulators stay in registers.
++template<int RI, int CS>
++REDMULE_FP16_TARGET static inline void
++redmule_fp16_block(fp16 *z, const fp16 *x, const fp16 *w, int n_size, int k_size, int j0)
++{
++    float16x8_t acc[RI][CS];
++    for (int r = 0; r < RI; ++r)
++        for (int c = 0; c < CS; ++c)
++            acc[r][c] = vreinterpretq_f16_u16(vld1q_u16(z + (size_t)r * k_size + j0 + c * 8));
++    for (int kk = 0; kk < n_size; ++kk) {
++        const fp16 *wr = w + (size_t)kk * k_size + j0;
++        float16x8_t b[CS];
++        for (int c = 0; c < CS; ++c) b[c] = vreinterpretq_f16_u16(vld1q_u16(wr + c * 8));
++        for (int r = 0; r < RI; ++r) {
++            float16x8_t a = vreinterpretq_f16_u16(vdupq_n_u16(x[(size_t)r * n_size + kk]));
++            for (int c = 0; c < CS; ++c) acc[r][c] = vfmaq_f16(acc[r][c], a, b[c]);   // acc + a*b, one RNE rounding
+         }
+     }
++    for (int r = 0; r < RI; ++r)
++        for (int c = 0; c < CS; ++c)
++            vst1q_u16(z + (size_t)r * k_size + j0 + c * 8, vreinterpretq_u16_f16(acc[r][c]));
+ }
+ 
+-void matmul_int8(int8_t * z, int8_t * y, int8_t * x, int8_t * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
+-    for (int i = 0; i < m_size; ++i)
+-    {
+-        for (int j = 0; j < k_size; ++j)
+-        {
+-            z[i * k_size + j] = y[i * k_size + j];
+-            for (int k = 0; k < n_size; ++k)
+-            {
+-                z[i * k_size + j] += x[i * n_size + k] * w[k * k_size + j];
++// Column tail (k_size - j0 < 8): run the same FMA on a zero-padded 8-lane copy (padding lanes
++// compute 0*0+0 and are discarded).
++REDMULE_FP16_TARGET static void
++redmule_fp16_tail(fp16 *z, const fp16 *x, const fp16 *w, int n_size, int k_size, int j0)
++{
++    const int nj = k_size - j0;
++    uint16_t tz[8] = {0}, tb[8] = {0};
++    memcpy(tz, z + j0, nj * sizeof(fp16));
++    float16x8_t acc = vreinterpretq_f16_u16(vld1q_u16(tz));
++    for (int kk = 0; kk < n_size; ++kk) {
++        memcpy(tb, w + (size_t)kk * k_size + j0, nj * sizeof(fp16));
++        float16x8_t a = vreinterpretq_f16_u16(vdupq_n_u16(x[kk]));
++        acc = vfmaq_f16(acc, a, vreinterpretq_f16_u16(vld1q_u16(tb)));
++    }
++    vst1q_u16(tz, vreinterpretq_u16_f16(acc));
++    memcpy(z + j0, tz, nj * sizeof(fp16));
++}
++
++// The Snitch ISS emulates RISC-V rounding modes with fesetround() on the host and can leave the
++// thread in RTZ/RDN/RUP; the hand-written converter of the scalar path ignores that, vfmaq_f16
++// does not.  Force IEEE RNE with fp16/fp32 flush-to-zero off for the duration of the kernel.
++static inline uint64_t redmule_fpcr_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
++static inline void     redmule_fpcr_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" : : "r"(v)); }
++#define REDMULE_FPCR_MASK ((3ull << 22) | (1ull << 24) | (1ull << 19))   // RMode, FZ, FZ16
++
++REDMULE_FP16_TARGET static void
++matmul_fp16_neon(fp16 *z, const fp16 *y, const fp16 *x, const fp16 *w, int m, int n, int k)
++{
++    const uint64_t fpcr_saved = redmule_fpcr_get();
++    redmule_fpcr_set(fpcr_saved & ~REDMULE_FPCR_MASK);
++    if (z != y) memmove(z, y, (size_t)m * k * sizeof(fp16));     // z = y (same buffer in the model)
++    const int k32 = k & ~31, k8 = k & ~7;
++    int i = 0;
++    for (; i + 4 <= m; i += 4) {                                  // 4 rows x 32 cols = 16 accumulators
++        fp16 *zi = z + (size_t)i * k; const fp16 *xi = x + (size_t)i * n;
++        int j = 0;
++        for (; j < k32; j += 32) redmule_fp16_block<4, 4>(zi, xi, w, n, k, j);
++        for (; j < k8;  j += 8)  redmule_fp16_block<4, 1>(zi, xi, w, n, k, j);
++        if (j < k) for (int r = 0; r < 4; ++r) redmule_fp16_tail(zi + (size_t)r * k, xi + (size_t)r * n, w, n, k, j);
++    }
++    for (; i < m; ++i) {
++        fp16 *zi = z + (size_t)i * k; const fp16 *xi = x + (size_t)i * n;
++        int j = 0;
++        for (; j < k32; j += 32) redmule_fp16_block<1, 4>(zi, xi, w, n, k, j);
++        for (; j < k8;  j += 8)  redmule_fp16_block<1, 1>(zi, xi, w, n, k, j);
++        if (j < k) redmule_fp16_tail(zi, xi, w, n, k, j);
++    }
++    redmule_fpcr_set(fpcr_saved);
++}
++#endif // __aarch64__
++
++void matmul_fp16(fp16 * z, fp16 * y, fp16 * x, fp16 * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
++#if defined(__aarch64__)
++    if (redmule_host_has_fp16()) { matmul_fp16_neon(z, y, x, w, m_size, n_size, k_size); return; }
++#endif
++    matmul_fp16_scalar(z, y, x, w, m_size, n_size, k_size);
++}
++
++// Integer kernels: z[i][j] = (T)(y[i][j] + sum_k x[i][k]*w[k][j]) with wrap-around == original.
++template<typename T>
++static void matmul_int_generic(T *z, const T *y, const T *x, const T *w, int m, int n, int k)
++{
++    typedef typename std::conditional<std::is_signed<T>::value, int32_t, uint32_t>::type P;
++    enum { JB = 64 };
++    uint32_t acc[JB];
++    for (int i = 0; i < m; ++i) {
++        for (int j0 = 0; j0 < k; j0 += JB) {
++            const int nj = std::min<int>(JB, k - j0);
++            for (int jj = 0; jj < nj; ++jj) acc[jj] = (uint32_t)(P)y[(size_t)i * k + j0 + jj];
++            for (int kk = 0; kk < n; ++kk) {
++                const P a = (P)x[(size_t)i * n + kk];
++                const T *wr = w + (size_t)kk * k + j0;
++                for (int jj = 0; jj < nj; ++jj) acc[jj] += (uint32_t)(a * (P)wr[jj]);
+             }
++            for (int jj = 0; jj < nj; ++jj) z[(size_t)i * k + j0 + jj] = (T)acc[jj];
+         }
+     }
+ }
++void matmul_uint16(uint16_t * z, uint16_t * y, uint16_t * x, uint16_t * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
++    matmul_int_generic<uint16_t>(z, y, x, w, m_size, n_size, k_size);
++}
++void matmul_int16(int16_t * z, int16_t * y, int16_t * x, int16_t * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
++    matmul_int_generic<int16_t>(z, y, x, w, m_size, n_size, k_size);
++}
++void matmul_uint8(uint8_t * z, uint8_t * y, uint8_t * x, uint8_t * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
++    matmul_int_generic<uint8_t>(z, y, x, w, m_size, n_size, k_size);
++}
++void matmul_int8(int8_t * z, int8_t * y, int8_t * x, int8_t * w, uint16_t m_size, uint16_t n_size, uint16_t k_size){
++    matmul_int_generic<int8_t>(z, y, x, w, m_size, n_size, k_size);
++}
++
++
++
+ 
+ // Constants for FP8-E4M3 format
+ #define FP8_EXP_MASK  0x78  // 0111 1000
+@@ -1382,11 +1488,19 @@
+     return sign | ((exponent << 3) & FP8_EXP_MASK) | (frac & FP8_FRAC_MASK);
+ }
+ 
++// [SoftHier-perf] 256-entry table of fp8e4m3_to_float (identical values, no powf per MAC).
++static float fp8e4m3_lut(fp8e4m3 v) {
++    static float lut[256];
++    static bool init = false;
++    if (!init) { for (int i = 0; i < 256; ++i) lut[i] = fp8e4m3_to_float((fp8e4m3)i); init = true; }
++    return lut[v];
++}
++
+ // Fused Multiply-Add for FP8
+ fp8e4m3 fp8e4m3_fma(fp8e4m3 a, fp8e4m3 b, fp8e4m3 c) {
+-    float fa = fp8e4m3_to_float(a);
+-    float fb = fp8e4m3_to_float(b);
+-    float fc = fp8e4m3_to_float(c);
++    float fa = fp8e4m3_lut(a);
++    float fb = fp8e4m3_lut(b);
++    float fc = fp8e4m3_lut(c);
+ 
+     float result = fa * fb + fc;
+     return float_to_fp8e4m3(result);

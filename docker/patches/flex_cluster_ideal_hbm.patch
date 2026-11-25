@@ -1,0 +1,50 @@
+--- soft_hier/flex_cluster/flex_cluster.py.orig	2026-09-23 13:02:57.319656007 +0000
++++ soft_hier/flex_cluster/flex_cluster.py	2026-09-23 13:04:31.858839009 +0000
+@@ -31,6 +31,20 @@
+ from pulp.chips.flex_cluster.hbm_ctrl import hbm_ctrl
+ import memory.dramsys
+ import math
++import os
++
++# --- DSE/aarch64 escape hatch -------------------------------------------------
++# DRAMSys ships as an x86-64-only .so; on an aarch64 host the Dramsys component
++# cannot be loaded and gvsoc segfaults at elaboration. Setting
++# SOFTHIER_IDEAL_HBM=1 swaps each HBM channel for gvsoc's plain `memory.memory`
++# model (ideal DRAM: fixed bandwidth, no refresh / bank conflicts / row policy).
++# Compute, TCDM, NoC and iDMA timing are untouched, so on-chip DSE knobs stay
++# meaningful; absolute HBM-bound numbers become optimistic.
++def _make_hbm_channel(parent, name, size, width_log2):
++    if os.environ.get('SOFTHIER_IDEAL_HBM', '0') == '1':
++        return memory.memory.Memory(parent, name, size=size, width_log2=width_log2)
++    return memory.dramsys.Dramsys(parent, name)
++# ------------------------------------------------------------------------------
+ 
+ GAPY_TARGET = True
+ 
+@@ -148,22 +162,22 @@
+         #HBM channels
+         hbm_chan_list_west = []
+         for hbm_ch in range(arch.hbm_chan_placement[0]):
+-            hbm_chan_list_west.append(memory.dramsys.Dramsys(self, f'west_hbm_chan_{hbm_ch}'))
++            hbm_chan_list_west.append(_make_hbm_channel(self, f'west_hbm_chan_{hbm_ch}', size=arch.hbm_node_addr_space * arch.num_node_per_ctrl, width_log2=int(math.log2(arch.noc_link_width // 8))))
+             pass
+ 
+         hbm_chan_list_north = []
+         for hbm_ch in range(arch.hbm_chan_placement[1]):
+-            hbm_chan_list_north.append(memory.dramsys.Dramsys(self, f'north_hbm_chan_{hbm_ch}'))
++            hbm_chan_list_north.append(_make_hbm_channel(self, f'north_hbm_chan_{hbm_ch}', size=arch.hbm_node_addr_space * arch.num_node_per_ctrl, width_log2=int(math.log2(arch.noc_link_width // 8))))
+             pass
+ 
+         hbm_chan_list_east = []
+         for hbm_ch in range(arch.hbm_chan_placement[2]):
+-            hbm_chan_list_east.append(memory.dramsys.Dramsys(self, f'east_hbm_chan_{hbm_ch}'))
++            hbm_chan_list_east.append(_make_hbm_channel(self, f'east_hbm_chan_{hbm_ch}', size=arch.hbm_node_addr_space * arch.num_node_per_ctrl, width_log2=int(math.log2(arch.noc_link_width // 8))))
+             pass
+ 
+         hbm_chan_list_south = []
+         for hbm_ch in range(arch.hbm_chan_placement[3]):
+-            hbm_chan_list_south.append(memory.dramsys.Dramsys(self, f'south_hbm_chan_{hbm_ch}'))
++            hbm_chan_list_south.append(_make_hbm_channel(self, f'south_hbm_chan_{hbm_ch}', size=arch.hbm_node_addr_space * arch.num_node_per_ctrl, width_log2=int(math.log2(arch.noc_link_width // 8))))
+             pass
+ 
+         #HBM controllers

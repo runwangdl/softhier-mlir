@@ -2,7 +2,7 @@
 
 All findings are from the `flex_cluster` target of the SoftHier GVSoC fork at
 `/app/install/softhier` (branch `bowwang-dev/softhier-deeploy`, 2026-10). Patches live in
-`AI_AGENT/SoftHier/dse/patches/` (not in this repo, because they belong to the simulator).
+`docker/patches/` (the image built from `docker/Dockerfile` applies all of them).
 As of 2026-10-08 none of them is fixed in the public upstream repos (`gvsoc/gvsoc`,
 `gvsoc/gvsoc-pulp`, `pulp-platform/softhier-sdk`); the flex_cluster chip models were even
 removed from `gvsoc-pulp` in 2026-01 and the public SDK (2026-06) only ships the runtime.

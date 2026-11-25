@@ -1,0 +1,40 @@
+--- /app/install/softhier/soft_hier/flex_cluster/light_redmule.cpp.orig	2026-10-08 12:20:44.259584003 +0000
++++ /app/install/softhier/soft_hier/flex_cluster/light_redmule.cpp	2026-10-08 12:20:44.282584003 +0000
+@@ -1235,22 +1235,33 @@
+ 
+ 
+ // Convert float to FP16 (half-precision)
++// [SoftHier-fix] IEEE round-to-nearest-even (the original truncated the mantissa, which biases
++// every FMA of a long fp16 accumulation toward zero: a 768-term dot product came out ~10% low).
+ fp16 float_to_fp16(float value) {
+     FloatBits floatBits;
+     floatBits.f = value;
+ 
+     uint16_t sign = floatBits.parts.sign << 15;
+     int32_t exponent = floatBits.parts.exponent - 127 + 15; // adjust bias from 127 to 15
+-    uint32_t mantissa = floatBits.parts.mantissa >> 13;     // reduce to 10 bits
++    uint32_t m = floatBits.parts.mantissa;
+ 
++    if (floatBits.parts.exponent == 0xFF) {                  // inf / nan
++        return sign | 0x7C00 | (m ? 0x200 : 0);
++    }
+     if (exponent <= 0) {
+         if (exponent < -10) return sign;   // too small
+-        mantissa = (floatBits.parts.mantissa | 0x800000) >> (1 - exponent);
+-        return sign | mantissa;
++        m |= 0x800000;
++        uint32_t shift = 14 - exponent;                      // 13 + (1 - exponent)
++        uint32_t r = m >> shift, rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
++        if (rem > half || (rem == half && (r & 1))) r++;    // may carry into the exponent: fine
++        return sign | r;
+     } else if (exponent >= 0x1F) {
+         return sign | 0x7C00;  // overflow to infinity
+     }
+-    return sign | (exponent << 10) | mantissa;
++    uint32_t r = ((uint32_t)exponent << 10) | (m >> 13), rem = m & 0x1FFF;
++    if (rem > 0x1000 || (rem == 0x1000 && (r & 1))) r++;    // carry propagates into exponent correctly
++    if (r >= 0x7C00) r = 0x7C00;
++    return sign | r;
+ }
+ 
+ // Convert FP16 to float

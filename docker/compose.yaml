@@ -1,0 +1,11 @@
+# docker compose -f docker/compose.yaml run --rm softhier        (from the repo root)
+services:
+  softhier:
+    image: softhier-mlir:dev
+    build: .
+    stdin_open: true
+    tty: true
+    working_dir: /app/softhier-mlir
+    volumes:
+      - ..:/app/softhier-mlir          # this checkout replaces the copy baked into the image
+      # - /path/to/models:/app/models  # smolvla_base checkpoint / prepared .npz (docs/SMOLVLA*.md)

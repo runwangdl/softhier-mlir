@@ -1,0 +1,26 @@
+# gvsoc Snitch FP-subsystem fix: wait for IO_REQ_PENDING memory responses before completing an
+# offloaded instruction (fixes fp32/fp16 scalar loads/stores to HBM / L3 / remote TCDM). Apply in
+# /app/install/softhier/core/models/cpu/iss, rebuild targets gen_isa_snitch_fp_ss_rv32imfdva_cpp_*_{optim,debug}
+# with SYSTEMC_HOME=third_party/systemc_install (plain `make build` fails on DRAMSys), then copy the two .so
+# into install/models/ and install/models/debug/. Found 2026-10-08.
+--- src/snitch/snitch_fp_ss.cpp.orig	2026-10-08 11:21:12.071271002 +0000
++++ src/snitch/snitch_fp_ss.cpp	2026-10-08 11:21:12.088271002 +0000
+@@ -246,6 +246,18 @@
+ {
+     Iss *_this = (Iss *)__this;
+ 
++    // [SoftHier-fix] The offloaded instruction is executed synchronously in
++    // handle_notif, but a memory access to HBM / instruction memory / remote
++    // TCDM answers asynchronously (IO_REQ_PENDING) and leaves the subsystem
++    // stalled until Lsu::data_response. Completing the instruction before that
++    // returns a stale register value (flw) and lets the next offloaded access
++    // reuse the single in-flight IoReq, corrupting its address. Wait here.
++    if (_this->exec.is_stalled())
++    {
++        _this->event->enqueue(1);
++        return;
++    }
++
+     _this->acc_req_ready = true;
+     
+     iss_reg_t pc = _this->acc_req.pc;
